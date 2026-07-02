@@ -149,7 +149,7 @@ CLI: `beater dev` · `beater agent run <name> "<prompt>"` · `beater agent resum
 | # | Slice | Proves | Status |
 |---|---|---|---|
 | M0 | scaffold, pinned deps, this doc | — | **done** |
-| M1 | `beater dev`: TS route in embedded V8, source-mapped errors, hot reload | the runtime | in progress |
-| M2 | durable agent loop + Python tool + kill-9 resume | **the thesis** | — |
-| M3 | `/mcp` endpoint (inspector-compatible) + crawl layer (robots/sitemap/llms.txt/.well-known) | ecosystem | — |
-| M4 | streaming React SSR | the web half | — |
+| M1 | `beater dev`: TS route in embedded V8, source-mapped errors, hot reload | the runtime | **done** |
+| M2 | durable agent loop + Python tool + kill-9 resume | **the thesis** | code done; live-API gate pending |
+| M3 | `/mcp` endpoint (inspector-verified) + crawl layer (robots/sitemap/llms.txt/.well-known) | ecosystem | **done** |
+| M4 | React SSR (renderToString; streaming is the upgrade path) | the web half | **done** |

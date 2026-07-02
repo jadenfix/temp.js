@@ -53,6 +53,64 @@
     Promise.resolve().then(cb);
   };
 
+  globalThis.performance ??= { now: () => Date.now() };
+
+  // Minimal UTF-8 TextEncoder — enough for react-dom/server's renderToString
+  // path. Full web-streams support arrives with streaming SSR.
+  if (!globalThis.TextEncoder) {
+    globalThis.TextEncoder = class TextEncoder {
+      get encoding() {
+        return "utf-8";
+      }
+      encode(input = "") {
+        const out = [];
+        for (let i = 0; i < input.length; i++) {
+          let c = input.codePointAt(i);
+          if (c > 0xffff) i++;
+          if (c < 0x80) out.push(c);
+          else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+          else if (c < 0x10000)
+            out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+          else
+            out.push(
+              0xf0 | (c >> 18),
+              0x80 | ((c >> 12) & 63),
+              0x80 | ((c >> 6) & 63),
+              0x80 | (c & 63),
+            );
+        }
+        return new Uint8Array(out);
+      }
+      encodeInto(src, dest) {
+        const bytes = this.encode(src);
+        const written = Math.min(bytes.length, dest.length);
+        dest.set(bytes.subarray(0, written));
+        return { read: src.length, written };
+      }
+    };
+  }
+
+  // Page SSR: render the default-export component to HTML (M4).
+  globalThis.__beaterRenderPage = async (specifier, request) => {
+    const [mod, React, ReactDOMServer] = await Promise.all([
+      import(specifier),
+      import("react"),
+      import("react-dom/server"),
+    ]);
+    const Component = mod.default;
+    if (typeof Component !== "function") {
+      throw new Error(`page route must export a default component: ${specifier}`);
+    }
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Component, { request }),
+    );
+    return {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: "<!DOCTYPE html>" + html,
+    };
+  };
+
   // Agent Access Layer: read a route module's optional `agent` metadata
   // export ({title, description, crawl}) for llms.txt / sitemap generation.
   globalThis.__beaterRouteMeta = async (specifier) => {
