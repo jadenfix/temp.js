@@ -29,7 +29,7 @@ The work below is not just about matching Node/Next request handling. The end st
 **Goal:** make [A] actually true: prove the M2 live gate end to end, record the evidence, and flip the docs from "pending live gate" to "done" only after A3-A5 pass.
 
 **Primary PR sequence:**
-- [ ] Add the slow-tool fixtures for A2 with the smallest possible example-app surface.
+- [x] Add the slow-tool fixtures for A2 with the smallest possible example-app surface.
 - [ ] Run and record A3 happy path with the live Anthropic API.
 - [ ] Run and record A4 crash/resume idempotent proof.
 - [ ] Run and record A5 non-idempotent `needs_review` proof.
@@ -99,6 +99,7 @@ The work below is not just about matching Node/Next request handling. The end st
 | Agent Access Layer | /robots.txt, /sitemap.xml, /llms.txt, /.well-known/beater.json generated from the route table; `export const agent = {crawl: false}` excludes a route from sitemap + llms.txt; remote deployments can override the advertised public base URL |
 | Agent config pipeline | `agent.ts` (via `beater:agent` shim) evaluates in a one-shot isolate → JSON config → Rust registry; Python TOOL metadata loads through embedded CPython |
 | Durability machinery (code) | SQLite journal with started/completed/failed lifecycle + attempts; resume logic for dangling LLM calls and idempotent-only tool re-runs; `needs_review` parking |
+| M2 crash/resume fixtures | `slow_summarize.py` and `slow_summarize_once.py` are declared from `examples/hello/agents/support/agent.ts`; `scripts/m2-live-gate.sh` drives A3-A5 once `ANTHROPIC_API_KEY` is present |
 | Streaming SSR | `scripts/streaming-ssr-gate.sh` starts `beater dev`, reads the raw HTTP socket, and proved shell marker at 0.026s before Suspense-delayed marker at 0.489s while `/api/health` returned in 0.002s |
 
 ---
@@ -117,9 +118,11 @@ echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.zshenv
 
 Once the key is present and `./target/debug/beater` is built, `scripts/m2-live-gate.sh` runs A3-A5 and writes transcripts under `examples/hello/.beater/m2-gate/<timestamp>/`.
 
-### A2. Test fixture: a slow tool (needed to kill -9 deterministically mid-tool)
+### A2. Test fixture: slow tools for deterministic kill -9
 
-Add `examples/hello/agents/support/tools/slow_summarize.py` — same as `summarize_numbers` but with `time.sleep(15)` inside `run()`, declared in `agent.ts` as `pyTool("slow_summarize", "./tools/slow_summarize.py", { idempotent: true })`. Add a second variant (or a flag) declared `{ idempotent: false }` for the needs_review test.
+**Done.** `examples/hello/agents/support/tools/slow_summarize.py` waits before returning and is declared in `agent.ts` as `pyTool("slow_summarize", "./tools/slow_summarize.py", { idempotent: true })`. `slow_summarize_once.py` covers the non-idempotent path with `idempotent: false`. These fixtures are also included in the `beater new` hello template.
+
+A3-A5 are still pending because the live gate requires `ANTHROPIC_API_KEY`.
 
 ### A3. Gate 1 — happy path (TS agent → Rust loop → Python tool → LLM)
 
