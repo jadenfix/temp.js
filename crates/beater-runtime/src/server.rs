@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,12 +23,14 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::config::AppConfig;
+use crate::loader;
 use crate::router::{RouteKind, RouteTable, Segment};
 use crate::worker::{self, RouteBody, RouteMeta, WorkerMsg};
 use crate::{crawl, mcp};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const CLIENT_MODULE_PREFIX: &str = "/_beater/client/";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -39,6 +42,7 @@ struct DevState {
     agents: Arc<Vec<String>>,
     base_url: String,
     mcp_access: mcp::AccessConfig,
+    app_dir: PathBuf,
 }
 
 pub async fn serve(
@@ -96,6 +100,7 @@ pub async fn serve(
         agents: Arc::new(agents),
         base_url,
         mcp_access,
+        app_dir: config.app_dir.clone(),
     };
 
     spawn_reloader(config.app_dir.clone(), state.clone());
@@ -315,6 +320,9 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
     let method = req.method().as_str().to_uppercase();
     let head = method == "HEAD";
     let path = req.uri().path().to_string();
+    if path.starts_with(CLIENT_MODULE_PREFIX) {
+        return client_module_response(&state.app_dir, &method, &path);
+    }
     let query: HashMap<String, String> = req
         .uri()
         .query()
@@ -448,6 +456,76 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
     }
 }
 
+fn client_module_response(app_dir: &Path, method: &str, path: &str) -> Result<Response<Body>> {
+    if method != "GET" && method != "HEAD" {
+        return Ok(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "client modules are GET-only".to_string(),
+        ));
+    }
+
+    let Some(route_path) = client_module_route_path(path) else {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "client module not found".to_string(),
+        ));
+    };
+    let Some(module_path) = find_client_module(app_dir, &route_path) else {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "client module not found".to_string(),
+        ));
+    };
+
+    let code = loader::transpile_client_module(&module_path)
+        .with_context(|| format!("transpile client module {}", module_path.display()))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/javascript; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(if method == "HEAD" {
+            Body::empty()
+        } else {
+            Body::from(code)
+        })
+        .map_err(Into::into)
+}
+
+fn client_module_route_path(path: &str) -> Option<PathBuf> {
+    let rel = path
+        .strip_prefix(CLIENT_MODULE_PREFIX)?
+        .strip_suffix(".js")?;
+    if rel.is_empty() {
+        return None;
+    }
+
+    let mut route_path = PathBuf::new();
+    for segment in rel.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('\\')
+            || segment.contains(':')
+        {
+            return None;
+        }
+        route_path.push(segment);
+    }
+    Some(route_path)
+}
+
+fn find_client_module(app_dir: &Path, route_path: &Path) -> Option<PathBuf> {
+    let routes_dir = app_dir.join("app").join("routes");
+    ["ts", "tsx", "js", "jsx", "mjs"]
+        .into_iter()
+        .map(|ext| {
+            routes_dir
+                .join(route_path)
+                .with_extension(format!("client.{ext}"))
+        })
+        .find(|path| path.is_file())
+}
+
 #[cfg(test)]
 fn route_response(route_resp: worker::RouteResponse) -> Result<Response<Body>, axum::http::Error> {
     let worker::RouteResponse {
@@ -492,7 +570,7 @@ fn apply_route_security_headers(response: &mut Response<Body>) {
     headers
         .entry("content-security-policy")
         .or_insert(HeaderValue::from_static(
-            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'",
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'",
         ));
     headers
         .entry("x-content-type-options")
@@ -531,11 +609,16 @@ fn text_response(status: StatusCode, body: String) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     use axum::body::Body;
     use axum::http::{HeaderValue, Response, StatusCode};
 
-    use super::{apply_route_security_headers, route_response, route_response_body, text_response};
+    use super::{
+        apply_route_security_headers, client_module_response, client_module_route_path,
+        find_client_module, route_response, route_response_body, text_response,
+    };
     use crate::worker;
 
     #[test]
@@ -572,7 +655,7 @@ mod tests {
             .get("content-security-policy")
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        assert!(csp.contains("script-src 'none'"));
+        assert!(csp.contains("script-src 'self'"));
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("object-src 'none'"));
     }
@@ -607,8 +690,93 @@ mod tests {
                 .get("content-security-policy")
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
-                .contains("script-src 'none'")
+                .contains("script-src 'self'")
         );
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "beater-client-module-{name}-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn write(&self, rel: &str, contents: &str) {
+            let path = self.path.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn client_module_route_paths_are_normalized() {
+        assert_eq!(
+            client_module_route_path("/_beater/client/index.js").as_deref(),
+            Some(Path::new("index"))
+        );
+        assert_eq!(
+            client_module_route_path("/_beater/client/dashboard/settings.js").as_deref(),
+            Some(Path::new("dashboard/settings"))
+        );
+        assert!(client_module_route_path("/_beater/client/../secret.js").is_none());
+        assert!(client_module_route_path("/_beater/client/index.ts").is_none());
+    }
+
+    #[test]
+    fn finds_adjacent_route_client_module() {
+        let app = TempDir::new("find");
+        app.write(
+            "app/routes/index.client.ts",
+            "document.body.dataset.ready = 'true';",
+        );
+
+        let found = find_client_module(app.path(), Path::new("index")).unwrap();
+
+        assert_eq!(found, app.path().join("app/routes/index.client.ts"));
+    }
+
+    #[tokio::test]
+    async fn client_module_response_serves_transpiled_javascript() {
+        let app = TempDir::new("serve");
+        app.write(
+            "app/routes/index.client.ts",
+            "const count: number = 1;\ndocument.body.dataset.count = String(count);\n",
+        );
+
+        let response =
+            client_module_response(app.path(), "GET", "/_beater/client/index.js").unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("document.body.dataset.count"));
+        assert!(!body.contains(": number"));
     }
 
     #[tokio::test]

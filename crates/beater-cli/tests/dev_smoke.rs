@@ -68,7 +68,26 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         home.contains("content-security-policy: default-src 'self'"),
         "{home}"
     );
+    assert!(home.contains("script-src 'self'"), "{home}");
     assert!(home.contains("x-content-type-options: nosniff"), "{home}");
+    assert!(
+        home.contains(r#"<script type="module" src="/_beater/client/index.js"></script>"#),
+        "{home}"
+    );
+    assert!(home.contains("data-beater-counter"), "{home}");
+
+    let client =
+        http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
+    assert!(client.starts_with("HTTP/1.1 200"), "{client}");
+    assert!(
+        client.contains("content-type: application/javascript"),
+        "{client}"
+    );
+    assert!(
+        client.contains("root.dataset.state = \"hydrated\""),
+        "{client}"
+    );
+    assert!(!client.contains(": number"), "{client}");
 
     let missing = http_request(port, "GET", "/not-a-route", None).expect("GET /not-a-route");
     assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");

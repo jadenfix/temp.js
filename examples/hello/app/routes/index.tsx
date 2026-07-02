@@ -437,6 +437,45 @@ a {
   line-height: 1.45;
 }
 
+.client-island {
+  display: grid;
+  gap: 14px;
+}
+
+.counter-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.counter-button {
+  display: inline-grid;
+  min-width: 54px;
+  min-height: 42px;
+  place-items: center;
+  border: 1px solid #1f342f;
+  border-radius: 8px;
+  background: #20332e;
+  color: #f7f8f1;
+  cursor: pointer;
+  font: inherit;
+  font-size: 18px;
+  font-weight: 820;
+}
+
+.counter-button:focus-visible {
+  outline: 3px solid rgba(8, 127, 115, 0.34);
+  outline-offset: 2px;
+}
+
+.client-state {
+  margin: 0;
+  color: #4d5549;
+  font-size: 13px;
+  font-weight: 720;
+}
+
 @media (max-width: 980px) {
   .topbar,
   .grid,
@@ -721,6 +760,14 @@ export default function Home({ request }: { request: PageRequest }) {
                   one support agent, and Python tools that prove the polyglot loop.
                 </p>
               </section>
+
+              <section className="panel mini client-island" data-beater-counter data-count="0">
+                <h3 className="section-title">Client island</h3>
+                <div className="counter-strip">
+                  <button className="counter-button" type="button" data-beater-increment>0</button>
+                  <p className="client-state" data-beater-count>server rendered</p>
+                </div>
+              </section>
             </aside>
           </section>
 
@@ -741,6 +788,7 @@ export default function Home({ request }: { request: PageRequest }) {
             </div>
           </section>
         </main>
+        <script type="module" src="/_beater/client/index.js" />
       </body>
     </html>
   );
