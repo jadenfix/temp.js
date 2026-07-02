@@ -25,7 +25,7 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         .arg("dev")
         .arg(&app)
         .arg("--host")
-        .arg("0.0.0.0")
+        .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
         .env_remove("ANTHROPIC_API_KEY")
@@ -99,6 +99,33 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
 
     let mcp_get = http_request(port, "GET", "/mcp", None).expect("GET /mcp");
     assert!(mcp_get.starts_with("HTTP/1.1 405"), "{mcp_get}");
+}
+
+#[test]
+fn dev_server_refuses_remote_mcp_without_bearer_token() {
+    let port = free_port();
+    let workspace = workspace();
+    let app = workspace.join("examples/hello");
+    let output = Command::new(beater_bin(&workspace))
+        .arg("dev")
+        .arg(&app)
+        .arg("--host")
+        .arg("0.0.0.0")
+        .arg("--port")
+        .arg(port.to_string())
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("BEATER_BASE_URL")
+        .env_remove("BEATER_MCP_TOKEN")
+        .env_remove("BEATER_MCP_TRUSTED_ORIGINS")
+        .output()
+        .expect("run beater dev");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to bind 0.0.0.0") && stderr.contains("BEATER_MCP_TOKEN"),
+        "{stderr}"
+    );
 }
 
 #[test]
