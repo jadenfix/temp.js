@@ -1,7 +1,3 @@
-# Build-time config. PYO3_PYTHON selects the CPython that gets *linked into*
-# the beater binary (pyo3 embedding). Runtime packages come from the app's
-# venv via site.addsitedir — see ARCHITECTURE.md §4. Machine-specific for now;
-# `beater doctor` reports the linked interpreter. Without this, macOS builds
-# pick up Xcode's Python3.framework stub (3.9, no usable dylib) and fail to link.
-[env]
-PYO3_PYTHON = "/opt/homebrew/bin/python3.11"
+# Build-time Python is selected with the PYO3_PYTHON environment variable.
+# Do not pin a machine-specific interpreter here. See README.md for macOS/Linux
+# setup and use `beater doctor` to inspect the embedded interpreter + venv.

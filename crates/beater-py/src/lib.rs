@@ -19,43 +19,89 @@ use tokio::sync::Semaphore;
 /// thread, so unbounded fan-out would only pile up blocked threads.
 static PY_PERMITS: Semaphore = Semaphore::const_new(4);
 
+#[derive(Debug, Clone)]
+pub struct PythonRuntime {
+    pub version: String,
+    pub executable: String,
+    pub major: u32,
+    pub minor: u32,
+}
+
 /// Interpreter version + executable, for `beater doctor`.
 pub fn python_info() -> Result<String> {
+    let runtime = python_runtime()?;
+    Ok(format!(
+        "{} ({})",
+        runtime
+            .version
+            .split_whitespace()
+            .next()
+            .unwrap_or(&runtime.version),
+        runtime.executable
+    ))
+}
+
+pub fn python_runtime() -> Result<PythonRuntime> {
     Python::attach(|py| {
         let sys = py.import("sys")?;
         let version: String = sys.getattr("version")?.extract()?;
         let executable: String = sys.getattr("executable")?.extract()?;
-        Ok(format!(
-            "{} ({executable})",
-            version.split_whitespace().next().unwrap_or(&version)
-        ))
+        let version_info = sys.getattr("version_info")?;
+        let major: u32 = version_info.getattr("major")?.extract()?;
+        let minor: u32 = version_info.getattr("minor")?.extract()?;
+        Ok(PythonRuntime {
+            version,
+            executable,
+            major,
+            minor,
+        })
     })
+}
+
+pub fn expected_venv_site_packages(venv: &Path) -> Result<PathBuf> {
+    let runtime = python_runtime()?;
+    Ok(venv
+        .join("lib")
+        .join(format!("python{}.{}", runtime.major, runtime.minor))
+        .join("site-packages"))
+}
+
+pub fn check_venv(venv: &Path) -> Result<PathBuf> {
+    let runtime = python_runtime()?;
+    let site_packages = expected_venv_site_packages(venv)?;
+    if !venv.is_dir() {
+        bail!(
+            "missing venv at {}; create it with `python{}.{} -m venv {}`",
+            venv.display(),
+            runtime.major,
+            runtime.minor,
+            venv.display()
+        );
+    }
+    if !site_packages.is_dir() {
+        bail!(
+            "venv at {} has no {} — the embedded interpreter is python{}.{}; \
+             recreate the venv with a matching version (e.g. `python{}.{} -m venv {}`)",
+            venv.display(),
+            site_packages.display(),
+            runtime.major,
+            runtime.minor,
+            runtime.major,
+            runtime.minor,
+            venv.display(),
+        );
+    }
+    Ok(site_packages)
 }
 
 /// Attach a venv's site-packages to the embedded interpreter.
 ///
 /// This is the *runtime* half of Python setup — the linked libpython is fixed
-/// at build time, so the venv must match its minor version. Missing venvs are
-/// tolerated (stdlib-only tools work without one).
+/// at build time, so the venv must match its minor version. Callers that want
+/// stdlib-only tools should skip this when no venv exists.
 pub fn attach_venv(venv: &Path) -> Result<()> {
+    let site_packages = check_venv(venv)?;
     Python::attach(|py| {
-        let sys = py.import("sys")?;
-        let version_info = sys.getattr("version_info")?;
-        let major: u32 = version_info.getattr("major")?.extract()?;
-        let minor: u32 = version_info.getattr("minor")?.extract()?;
-        let site_packages = venv
-            .join("lib")
-            .join(format!("python{major}.{minor}"))
-            .join("site-packages");
-        if !site_packages.is_dir() {
-            bail!(
-                "venv at {} has no {} — the embedded interpreter is python{major}.{minor}; \
-                 recreate the venv with a matching version (e.g. `python{major}.{minor} -m venv {}`)",
-                venv.display(),
-                site_packages.display(),
-                venv.display(),
-            );
-        }
         py.import("site")?
             .call_method1("addsitedir", (site_packages.to_string_lossy().as_ref(),))?;
         tracing::info!("attached venv site-packages: {}", site_packages.display());

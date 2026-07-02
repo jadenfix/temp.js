@@ -158,7 +158,7 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 - [x] CI: GitHub Actions running fmt + clippy + tests on macOS and Linux, with the rusty_v8 archive cached
 
 ### Portability (currently: works on this Mac)
-- [ ] **Python discovery**: `.cargo/config.toml` hardcodes `PYO3_PYTHON=/opt/homebrew/bin/python3.11`. Replace with documented per-platform setup + a `beater doctor` check that explains mismatches. Linux build verified.
+- [x] **Python discovery**: `.cargo/config.toml` no longer hardcodes `PYO3_PYTHON`; README documents macOS/Linux setup; `beater doctor` reports embedded Python + venv mismatches; remote macOS/Linux CI is green.
 - [ ] **Concurrency**: one isolate = requests serialize; one dev server = one app. Either ship the isolate pool (the channel protocol is already pool-shaped) or document the limitation prominently.
 - [x] **Port/host binding**: `beater dev --host <ip>` and `[app] host = "..."`; the no-key integration test binds `0.0.0.0` and curls through localhost.
 - [ ] `beater new <app>` scaffolding command (copy of examples/hello) — the first-five-minutes experience.
@@ -173,13 +173,13 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 
 ### Security floor (currently: dev-mode assumptions everywhere)
 - [ ] /mcp has no auth — fine on localhost, must be stated loudly + bearer-token option before anyone binds 0.0.0.0
-- [ ] Python tools run with full process privileges — document the trust model (tools are first-party code until the wasm sandbox tier lands)
-- [ ] Journal stores full prompts/results in plaintext SQLite — document; add redaction hooks later
+- [x] Python tools run with full process privileges — trust model documented in `docs/security.md` (tools are first-party code until the wasm sandbox tier lands)
+- [x] Journal stores full prompts/results in plaintext SQLite — documented in `docs/security.md`; redaction hooks remain later work
 
 ### Docs
-- [ ] README quickstart actually runnable start-to-finish by a stranger (install Rust, install Python 3.11+, cargo build, beater dev)
-- [ ] `docs/tools.md`: the pyTool/rustTool contract (TOOL dict, run(), idempotency rules)
-- [ ] CHANGELOG + versioning policy (deno_core pin-bump cadence)
+- [x] README quickstart actually runnable start-to-finish by a stranger (install Rust, install Python 3.11+, cargo build, beater dev)
+- [x] `docs/tools.md`: the pyTool/rustTool contract (TOOL dict, run(), idempotency rules)
+- [x] CHANGELOG + versioning policy (deno_core pin-bump cadence)
 
 ---
 

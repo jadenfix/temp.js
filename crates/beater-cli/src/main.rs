@@ -97,9 +97,34 @@ fn main() -> Result<()> {
 fn doctor(app: &std::path::Path) -> Result<()> {
     println!("beater doctor");
     println!("  app dir: {}", app.display());
+    match beater_runtime::AppConfig::load(app) {
+        Ok(config) => {
+            println!("  app:     {}", config.name);
+            println!("  bind:    {}:{}", config.host, config.port);
+            match &config.python_venv {
+                Some(venv) => {
+                    println!("  venv:    {}", venv.display());
+                    match beater_py::check_venv(venv) {
+                        Ok(site_packages) => {
+                            println!("  venv ok: {}", site_packages.display());
+                        }
+                        Err(e) => {
+                            println!("  venv:    MISMATCH — {e}");
+                        }
+                    }
+                }
+                None => println!("  venv:    none configured (stdlib-only Python tools)"),
+            }
+        }
+        Err(e) => println!("  app:     UNAVAILABLE — {e:#}"),
+    }
     match beater_py::python_info() {
         Ok(info) => println!("  python:  {info}"),
         Err(e) => println!("  python:  UNAVAILABLE — {e}"),
+    }
+    match std::env::var("PYO3_PYTHON") {
+        Ok(path) => println!("  shell:   PYO3_PYTHON={path}"),
+        Err(_) => println!("  shell:   PYO3_PYTHON not set"),
     }
     println!("  v8:      {}", beater_runtime::v8_version());
     Ok(())
