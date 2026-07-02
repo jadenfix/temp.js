@@ -253,6 +253,7 @@ dependencies = [
  "bytes",
  "deno_ast",
  "deno_core",
+ "deno_error",
  "notify",
  "serde",
  "serde_json",

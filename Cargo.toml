@@ -18,6 +18,7 @@ rust-version = "1.94"
 # JS engine (pin exact — deno_core moves fast; bump deliberately)
 deno_core = "=0.406.0"
 deno_ast = { version = "0.53", features = ["transpiling"] }
+deno_error = "0.7"
 
 # async + http
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }

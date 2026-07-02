@@ -38,6 +38,10 @@ fn default_port() -> u16 {
 
 impl AppConfig {
     pub fn load(app_dir: &Path) -> Result<Self> {
+        // file:// module specifiers require absolute paths
+        let app_dir = &app_dir
+            .canonicalize()
+            .with_context(|| format!("app dir not found: {}", app_dir.display()))?;
         let path = app_dir.join("beater.toml");
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("no beater.toml at {}", path.display()))?;
