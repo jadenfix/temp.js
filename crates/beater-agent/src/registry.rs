@@ -4,14 +4,52 @@
 //! (ARCHITECTURE.md §5).
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+pub const DEFAULT_BEATBOX_URL: &str = "http://127.0.0.1:7300";
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct BeatboxConfig {
+    pub url: String,
+    pub api_key: Option<String>,
+}
+
+impl fmt::Debug for BeatboxConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeatboxConfig")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl Default for BeatboxConfig {
+    fn default() -> Self {
+        Self {
+            url: DEFAULT_BEATBOX_URL.to_string(),
+            api_key: None,
+        }
+    }
+}
+
+impl BeatboxConfig {
+    fn client(&self) -> beatbox_client::Client {
+        let client = beatbox_client::Client::new(&self.url);
+        match &self.api_key {
+            Some(api_key) => client.with_api_key(api_key),
+            None => client,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
@@ -30,7 +68,7 @@ fn default_model() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct ToolDecl {
-    pub kind: String, // "python" | "rust" | "remote_mcp" | "browser"
+    pub kind: String, // "python" | "rust" | "remote_mcp" | "browser" | "sandbox"
     pub name: String,
     #[serde(default)]
     pub path: Option<String>,
@@ -60,6 +98,26 @@ pub struct ToolDecl {
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub secrets: Value,
+    #[serde(default)]
+    pub lane: Option<beatbox_client::Lane>,
+    #[serde(default)]
+    pub source: Option<SandboxSourceDecl>,
+    #[serde(default)]
+    pub policy: Option<Value>,
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SandboxSourceDecl {
+    Path { path: String },
+    Wat { text: String },
+    WasmWat { text: String },
+    WasmBase64 { bytes: String },
+    WasmBytesBase64 { bytes: String },
+    Inline { code: String },
+    ModuleRef { sha256: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +151,15 @@ pub enum ToolImpl {
     RustBuiltin,
     RemoteMcp { config: RemoteMcpTool },
     Browser { config: BrowserTool },
+    Sandbox(Box<SandboxTool>),
+}
+
+pub struct SandboxTool {
+    beatbox: BeatboxConfig,
+    lane: beatbox_client::Lane,
+    source: beatbox_client::Source,
+    policy: beatbox_client::Policy,
+    entrypoint: Option<String>,
 }
 
 pub struct ToolEntry {
@@ -127,12 +194,21 @@ impl ToolNeedsReview {
 #[derive(Default)]
 pub struct ToolCallContext {
     pub tool_use_id: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 impl ToolRegistry {
     /// Build from an agent's tool declarations. Python tool metadata comes
     /// from each file's module-level TOOL dict.
     pub fn build(agent_dir: &Path, decls: &[ToolDecl]) -> Result<Self> {
+        Self::build_with_beatbox(agent_dir, decls, &BeatboxConfig::default())
+    }
+
+    pub fn build_with_beatbox(
+        agent_dir: &Path,
+        decls: &[ToolDecl],
+        beatbox: &BeatboxConfig,
+    ) -> Result<Self> {
         let mut tools = Vec::new();
         for decl in decls {
             match decl.kind.as_str() {
@@ -187,6 +263,39 @@ impl ToolRegistry {
                         input_schema,
                         idempotent: decl.idempotent,
                         imp: ToolImpl::Browser { config },
+                    });
+                }
+                "sandbox" => {
+                    let lane = decl.lane.clone().unwrap_or(beatbox_client::Lane::Wasm);
+                    if !matches!(lane, beatbox_client::Lane::Wasm) {
+                        bail!(
+                            "sandbox tool {} requested lane {lane:?}; beater.js M3 enables only beatbox wasm",
+                            decl.name
+                        );
+                    }
+                    let source = sandbox_source(agent_dir, decl)
+                        .with_context(|| format!("loading sandbox source for {}", decl.name))?;
+                    let policy = sandbox_policy(decl.policy.as_ref())
+                        .with_context(|| format!("parsing sandbox policy for {}", decl.name))?;
+                    let description = decl.description.clone().unwrap_or_else(|| {
+                        format!("Run {} through beatbox's sandboxed wasm lane.", decl.name)
+                    });
+                    let input_schema = decl
+                        .input_schema
+                        .clone()
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    tools.push(ToolEntry {
+                        name: decl.name.clone(),
+                        description,
+                        input_schema,
+                        idempotent: decl.idempotent,
+                        imp: ToolImpl::Sandbox(Box::new(SandboxTool {
+                            beatbox: beatbox.clone(),
+                            lane,
+                            source,
+                            policy,
+                            entrypoint: decl.entrypoint.clone(),
+                        })),
                     });
                 }
                 other => bail!("unknown tool kind {other:?} for tool {}", decl.name),
@@ -260,8 +369,261 @@ impl ToolRegistry {
             ToolImpl::RustBuiltin => execute_builtin(name, input),
             ToolImpl::RemoteMcp { config } => config.execute(input, context).await,
             ToolImpl::Browser { config } => config.execute(input, context).await,
+            ToolImpl::Sandbox(sandbox) => {
+                execute_sandbox(
+                    &sandbox.beatbox,
+                    sandbox.lane.clone(),
+                    sandbox.source.clone(),
+                    sandbox.policy.clone(),
+                    sandbox.entrypoint.clone(),
+                    input.clone(),
+                    context.idempotency_key.clone(),
+                )
+                .await
+            }
         }
     }
+}
+
+fn sandbox_source(agent_dir: &Path, decl: &ToolDecl) -> Result<beatbox_client::Source> {
+    if decl.path.is_some() && decl.source.is_some() {
+        bail!(
+            "sandbox tool {} cannot declare both source and path",
+            decl.name
+        );
+    }
+    match decl.source.as_ref() {
+        Some(SandboxSourceDecl::Path { path }) => sandbox_source_path(agent_dir, path),
+        Some(SandboxSourceDecl::Wat { text }) | Some(SandboxSourceDecl::WasmWat { text }) => {
+            Ok(beatbox_client::Source::WasmWat { text: text.clone() })
+        }
+        Some(SandboxSourceDecl::WasmBase64 { bytes })
+        | Some(SandboxSourceDecl::WasmBytesBase64 { bytes }) => {
+            Ok(beatbox_client::Source::WasmBytesBase64 {
+                bytes: bytes.clone(),
+            })
+        }
+        Some(SandboxSourceDecl::Inline { code }) => {
+            Ok(beatbox_client::Source::Inline { code: code.clone() })
+        }
+        Some(SandboxSourceDecl::ModuleRef { .. }) => {
+            bail!("module_ref sandbox sources are not supported by the pinned beatbox M3 API")
+        }
+        None => {
+            let path = decl
+                .path
+                .as_deref()
+                .with_context(|| format!("sandbox tool {} has no source or path", decl.name))?;
+            sandbox_source_path(agent_dir, path)
+        }
+    }
+}
+
+fn sandbox_source_path(agent_dir: &Path, path: &str) -> Result<beatbox_client::Source> {
+    let path = agent_dir.join(path.trim_start_matches("./"));
+    let agent_dir = agent_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing agent dir {}", agent_dir.display()))?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing sandbox source {}", path.display()))?;
+    if !path.starts_with(&agent_dir) {
+        bail!(
+            "sandbox source {} escapes agent directory {}",
+            path.display(),
+            agent_dir.display()
+        );
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("reading sandbox source {}", path.display()))?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("wat") {
+        let text = String::from_utf8(bytes)
+            .with_context(|| format!("sandbox WAT source {} is not UTF-8", path.display()))?;
+        Ok(beatbox_client::Source::WasmWat { text })
+    } else {
+        Ok(beatbox_client::Source::WasmBytesBase64 {
+            bytes: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+}
+
+fn sandbox_policy(value: Option<&Value>) -> Result<beatbox_client::Policy> {
+    let Some(value) = value else {
+        return Ok(beatbox_client::Policy::default());
+    };
+    if !value.is_object() {
+        bail!("sandbox policy must be an object");
+    }
+    validate_policy_overlay(value)?;
+    let mut merged = serde_json::to_value(beatbox_client::Policy::default())?;
+    merge_json(&mut merged, value);
+    Ok(serde_json::from_value(merged)?)
+}
+
+fn validate_policy_overlay(value: &Value) -> Result<()> {
+    validate_object_keys(
+        value,
+        "policy",
+        &[
+            "fs",
+            "net",
+            "env",
+            "secrets",
+            "limits",
+            "determinism",
+            "double_jail",
+        ],
+    )?;
+    if let Some(fs) = value.get("fs") {
+        validate_object_keys(fs, "policy.fs", &["workspace", "mounts"])?;
+        if let Some(mounts) = fs.get("mounts") {
+            for (index, mount) in mounts.as_array().into_iter().flatten().enumerate() {
+                validate_object_keys(
+                    mount,
+                    &format!("policy.fs.mounts[{index}]"),
+                    &["host", "guest", "mode"],
+                )?;
+            }
+        }
+    }
+    if let Some(net) = value.get("net") {
+        validate_object_keys(net, "policy.net", &["kind", "allow_domains", "allow_ports"])?;
+    }
+    if let Some(secrets) = value.get("secrets") {
+        for (index, secret) in secrets.as_array().into_iter().flatten().enumerate() {
+            validate_object_keys(
+                secret,
+                &format!("policy.secrets[{index}]"),
+                &["name", "value_ref", "expose"],
+            )?;
+        }
+    }
+    if let Some(limits) = value.get("limits") {
+        validate_object_keys(
+            limits,
+            "policy.limits",
+            &[
+                "wall_ms",
+                "cpu_ms",
+                "memory_bytes",
+                "output_bytes",
+                "pids",
+                "disk_bytes",
+                "fuel",
+            ],
+        )?;
+    }
+    if let Some(determinism) = value.get("determinism") {
+        validate_object_keys(
+            determinism,
+            "policy.determinism",
+            &["kind", "seed", "epoch_ms"],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_object_keys(value: &Value, path: &str, allowed: &[&str]) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            bail!("unknown {path}.{key}");
+        }
+    }
+    Ok(())
+}
+
+fn merge_json(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(key) {
+                    Some(base_value) => merge_json(base_value, value),
+                    None => {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+async fn execute_sandbox(
+    beatbox: &BeatboxConfig,
+    lane: beatbox_client::Lane,
+    source: beatbox_client::Source,
+    policy: beatbox_client::Policy,
+    entrypoint: Option<String>,
+    input: Value,
+    idempotency_key: Option<String>,
+) -> Result<String> {
+    let request = beatbox_client::ExecuteRequest {
+        lane,
+        source,
+        entrypoint,
+        input,
+        stdin: String::new(),
+        policy,
+        idempotency_key,
+    };
+    let client = beatbox.client();
+    let result = if request.idempotency_key.is_some() {
+        execute_sandbox_job(&client, &request).await?
+    } else {
+        client.execute(&request).await?
+    };
+    Ok(serde_json::to_string(&result)?)
+}
+
+async fn execute_sandbox_job(
+    client: &beatbox_client::Client,
+    request: &beatbox_client::ExecuteRequest,
+) -> Result<beatbox_client::ExecutionResult> {
+    let job = client.create_job(request).await?;
+    let deadline = Instant::now()
+        .checked_add(job_poll_timeout(request.policy.limits.wall_ms))
+        .ok_or_else(|| anyhow!("sandbox job timeout overflow"))?;
+    loop {
+        let record = client.get_job(&job.job_id).await?;
+        match record.status {
+            beatbox_client::JobStatus::Queued | beatbox_client::JobStatus::Running => {
+                if Instant::now() >= deadline {
+                    let _ = client.cancel_job(&job.job_id).await;
+                    bail!(
+                        "sandbox job {} did not finish before local poll timeout",
+                        job.job_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            beatbox_client::JobStatus::Succeeded => {
+                return record.result.ok_or_else(|| {
+                    anyhow!("sandbox job {} succeeded without a result", job.job_id)
+                });
+            }
+            beatbox_client::JobStatus::Failed => {
+                if let Some(error) = record.error {
+                    bail!(
+                        "sandbox job {} failed: {}: {}",
+                        job.job_id,
+                        error.code,
+                        error.message
+                    );
+                }
+                bail!("sandbox job {} failed without an error body", job.job_id);
+            }
+            beatbox_client::JobStatus::Canceled => {
+                bail!("sandbox job {} was canceled", job.job_id);
+            }
+        }
+    }
+}
+
+fn job_poll_timeout(wall_ms: u64) -> Duration {
+    Duration::from_millis(wall_ms.saturating_add(5_000).max(5_000))
 }
 
 pub struct RemoteMcpTool {
@@ -1122,6 +1484,7 @@ mod tests {
                 &json!({"url": "https://shop.example/cart", "task": "verify checkout"}),
                 &ToolCallContext {
                     tool_use_id: Some("toolu_browser".to_string()),
+                    ..ToolCallContext::default()
                 },
             )
             .await
@@ -1148,6 +1511,7 @@ mod tests {
                 &json!({"url": "https://evil.example/cart", "task": "verify checkout"}),
                 &ToolCallContext {
                     tool_use_id: Some("toolu_browser_reject".to_string()),
+                    ..ToolCallContext::default()
                 },
             )
             .await
@@ -1177,6 +1541,7 @@ mod tests {
                 }),
                 &ToolCallContext {
                     tool_use_id: Some("toolu_browser_timeout".to_string()),
+                    ..ToolCallContext::default()
                 },
             )
             .await
@@ -1288,6 +1653,7 @@ mod tests {
                 &json!({"email": "a@example.com"}),
                 &ToolCallContext {
                     tool_use_id: Some("toolu_ambiguous".to_string()),
+                    ..ToolCallContext::default()
                 },
             )
             .await
@@ -1329,6 +1695,7 @@ mod tests {
                     &json!({"email": "a@example.com"}),
                     &ToolCallContext {
                         tool_use_id: Some("toolu_provider_error".to_string()),
+                        ..ToolCallContext::default()
                     },
                 )
                 .await
@@ -1378,6 +1745,7 @@ mod tests {
                 &json!({"email": "a@example.com"}),
                 &ToolCallContext {
                     tool_use_id: Some("toolu_123".to_string()),
+                    ..ToolCallContext::default()
                 },
             )
             .await
@@ -1425,6 +1793,7 @@ mod tests {
                 &json!({"email": "a@example.com"}),
                 &ToolCallContext {
                     tool_use_id: Some("expected-id".to_string()),
+                    ..ToolCallContext::default()
                 },
             )
             .await
