@@ -46,6 +46,8 @@ pub struct RouteResponse {
     pub headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    pub body_chunks: Vec<String>,
 }
 
 #[op2(async(lazy), fast)]

@@ -3,6 +3,7 @@
 //! generated crawl layer (robots.txt, sitemap.xml, llms.txt, .well-known).
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use axum::routing::{Router, get, post};
 use beater_agent::ToolRegistry;
+use bytes::Bytes;
+use futures_util::stream;
 use serde_json::json;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
@@ -385,15 +388,33 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
         .map_err(|_| anyhow::anyhow!("js worker dropped the request (reloading?)"))?;
 
     match result {
-        Ok(route_resp) => {
-            let mut builder = Response::builder().status(route_resp.status);
-            for (k, v) in &route_resp.headers {
-                builder = builder.header(k, v);
-            }
-            Ok(builder.body(Body::from(route_resp.body))?)
-        }
+        Ok(route_resp) => Ok(route_response(route_resp)?),
         // JS error: readable, source-mapped stack in the dev response
         Err(stack) => Ok(text_response(StatusCode::INTERNAL_SERVER_ERROR, stack)),
+    }
+}
+
+fn route_response(route_resp: worker::RouteResponse) -> Result<Response<Body>, axum::http::Error> {
+    let uses_body_chunks = !route_resp.body_chunks.is_empty();
+    let mut builder = Response::builder().status(route_resp.status);
+    for (k, v) in &route_resp.headers {
+        if uses_body_chunks && k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    builder.body(route_response_body(route_resp))
+}
+
+fn route_response_body(route_resp: worker::RouteResponse) -> Body {
+    if route_resp.body_chunks.is_empty() {
+        Body::from(route_resp.body)
+    } else {
+        let chunks = route_resp
+            .body_chunks
+            .into_iter()
+            .map(|chunk| Ok::<Bytes, Infallible>(Bytes::from(chunk)));
+        Body::from_stream(stream::iter(chunks))
     }
 }
 
@@ -436,10 +457,13 @@ fn text_response(status: StatusCode, body: String) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use axum::body::Body;
     use axum::http::{HeaderValue, Response, StatusCode};
 
-    use super::{apply_route_security_headers, text_response};
+    use super::{apply_route_security_headers, route_response, route_response_body, text_response};
+    use crate::worker;
 
     #[test]
     fn route_security_headers_are_added_by_default() {
@@ -512,5 +536,76 @@ mod tests {
                 .unwrap_or_default()
                 .contains("script-src 'none'")
         );
+    }
+
+    #[tokio::test]
+    async fn route_response_body_prefers_chunks_over_body() {
+        let body = route_response_body(worker::RouteResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: "fallback".to_string(),
+            body_chunks: vec!["hello ".to_string(), "stream".to_string()],
+        });
+
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"hello stream");
+    }
+
+    #[tokio::test]
+    async fn route_response_body_uses_body_when_no_chunks() {
+        let body = route_response_body(worker::RouteResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: "plain body".to_string(),
+            body_chunks: Vec::new(),
+        });
+
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"plain body");
+    }
+
+    #[tokio::test]
+    async fn route_response_drops_content_length_for_chunked_body() {
+        let mut headers = HashMap::new();
+        headers.insert("content-length".to_string(), "999".to_string());
+        headers.insert(
+            "content-type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        );
+
+        let response = route_response(worker::RouteResponse {
+            status: 200,
+            headers,
+            body: "fallback".to_string(),
+            body_chunks: vec!["hello ".to_string(), "stream".to_string()],
+        })
+        .unwrap();
+
+        assert!(response.headers().get("content-length").is_none());
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"hello stream");
+    }
+
+    #[tokio::test]
+    async fn route_response_preserves_content_length_for_plain_body() {
+        let mut headers = HashMap::new();
+        headers.insert("content-length".to_string(), "10".to_string());
+
+        let response = route_response(worker::RouteResponse {
+            status: 200,
+            headers,
+            body: "plain body".to_string(),
+            body_chunks: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(response.headers().get("content-length").unwrap(), "10");
     }
 }
