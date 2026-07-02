@@ -1,78 +1,168 @@
 # Beater Connect Architecture
 
-Beater Connect is the bridge between ordinary websites and agent-native
-interaction.
+Beater Connect is the agent access layer for `beater.js`. It provides a single
+registry for agent-readable resources and agent-callable actions, then generates
+the discovery, API, crawl, and policy surfaces required for safe agent
+interoperability.
 
-## Product Role
+The crate is intentionally independent from the HTTP runtime. `beater-runtime`
+can serve the generated surfaces, but the registry and generators remain usable
+by other hosts and future adapters.
 
-Beater has two existing anchors:
+## Goals
 
-- `beater.js`: build and serve agent-ready apps.
-- `beater-agents`: observe, replay, evaluate, and improve agent behavior.
+- Define resources and actions once, with typed schemas and policy metadata.
+- Generate consistent agent-facing surfaces from that single source of truth.
+- Keep public crawl content separate from authenticated user operations.
+- Make action safety explicit through auth, scopes, confirmation requirements,
+  dry-run support, and idempotency requirements.
+- Provide a stable foundation for future MCP transport, OpenAPI, OAuth consent,
+  receipts, and Beater Agents trace export.
 
-Beater Connect sits between them. It describes what agents can read, search, and
-safely do inside an app, then generates the public and authenticated surfaces
-needed for interoperability.
+## Non-Goals
 
-## Surfaces
+- This crate does not execute actions.
+- This crate does not implement OAuth or user consent screens.
+- This crate does not provide the live MCP JSON-RPC transport.
+- This crate does not persist receipts or traces.
 
-One registry emits:
+Those concerns belong in `beater-runtime`, an auth layer, and `beater-agents`.
 
-| Surface | Purpose |
-| --- | --- |
-| `/.well-known/beater.json` | Beater manifest and endpoint discovery. |
-| `/.well-known/agent-card.json` | A2A-style discovery for agent clients. |
-| `/openapi.json` | Standard HTTP API contract. |
-| `/mcp` | Tool/resource/prompt metadata for MCP transport integration. |
-| `/llms.txt` | Curated LLM navigation file. |
-| `/robots.txt` | Crawler policy and sitemap pointer. |
-| `/sitemap.xml` | Crawlable URL inventory. |
+## System Context
 
-## Registry Types
+`beater.js` owns application routing, request handling, and local development.
+`beater-agents` owns observability, replay, evaluation, and longer-term agent
+governance.
 
-`Resource` describes agent-readable data: docs, products, support articles,
-orders, tickets, or any other object with stable URLs.
+Beater Connect sits between them:
 
-`Action` describes agent-callable operations: search, draft, add to cart, book a
-demo, create a ticket, send a message, purchase, delete, or publish.
+```text
+application code
+  -> Beater Connect registry
+  -> generated crawl/API/agent surfaces
+  -> runtime transport and auth
+  -> Beater Agents traces, receipts, and evals
+```
 
-`Policy` is carried directly on actions through:
+This separation lets the framework expose agent capabilities without coupling
+the registry to a specific server implementation.
 
-- `Auth`
-- scopes
+## Registry Model
+
+### Resource
+
+A `Resource` describes data an agent can read. Examples include documentation,
+product catalogs, support articles, public records, tickets, and orders.
+
+Resources carry stable identifiers, human-readable descriptions, canonical
+paths, optional markdown paths, visibility, tags, and freshness metadata.
+
+### Action
+
+An `Action` describes an operation an agent can request. Examples include
+searching, drafting, adding an item to a cart, booking a demo, creating a
+support ticket, sending a message, purchasing, publishing, or deleting.
+
+Actions carry:
+
+- stable operation ID
+- HTTP method and path
+- input and output schemas
+- auth policy and scopes
 - side-effect level
 - confirmation requirement
 - dry-run support
 - idempotency requirement
 
-`Receipt` is not implemented yet, but the registry is designed so every action
-call can be traced and signed later with input/output hashes, approval state,
-actor identity, and Beater Agents trace IDs.
+### Schema
 
-## Side-Effect Model
+The MVP schema model is deliberately small: object schemas with named fields,
+basic JSON types, descriptions, and required fields. The crate emits these as
+JSON Schema-compatible structures for OpenAPI and MCP metadata.
 
-The side-effect ladder is intentionally blunt:
+The model can be replaced or extended later with a richer schema backend without
+changing the top-level registry concepts.
+
+## Generated Surfaces
+
+| Surface | Purpose |
+| --- | --- |
+| `/.well-known/beater.json` | Canonical Beater discovery manifest. |
+| `/.well-known/agent-card.json` | Agent discovery metadata for task-capable clients. |
+| `/openapi.json` | HTTP API contract for resources and actions. |
+| `/mcp` metadata | Tool, resource, and prompt catalog for MCP integration. |
+| `/llms.txt` | Curated LLM-readable site and action map. |
+| `/robots.txt` | Crawler policy with pointers to discovery files. |
+| `/sitemap.xml` | Public crawlable URL inventory. |
+
+The current crate generates static metadata for these surfaces. Runtime
+integration will decide how each file or endpoint is served.
+
+## Safety Model
+
+Agent-facing operations must expose their risk level explicitly. Beater Connect
+uses a simple side-effect ladder:
 
 ```text
 read -> draft -> write -> send -> purchase -> delete
 ```
 
-Default policy:
+Default behavior:
 
-- `read`: allowed when auth passes.
-- `draft`: safe to preview.
-- `write`: confirmation recommended.
-- `send`: confirmation required.
-- `purchase`: confirmation and spending limits required.
-- `delete`: confirmation and elevated scope required.
+| Level | Default Safety Requirement |
+| --- | --- |
+| `read` | Allowed when auth policy passes. |
+| `draft` | Previewable and non-committing. |
+| `write` | Idempotency required; confirmation recommended by the host. |
+| `send` | Confirmation required. |
+| `purchase` | Confirmation and spending limits required. |
+| `delete` | Confirmation and elevated scope required. |
 
-The generator exposes this metadata to every surface so hosts can present clear
-approval UI.
+The generator includes this metadata in the manifest, OpenAPI extension fields,
+and MCP catalog metadata so hosts can present clear approval and review flows.
 
-## Next Milestones
+## Idempotency
 
-1. Add a live MCP JSON-RPC adapter backed by this registry.
-2. Add OAuth/consent screens and action approval tokens.
-3. Add receipt storage and Beater Agents trace export.
-4. Add adapters for `beater.js`, Next.js, Express, Remix, and plain Rust Axum.
-5. Add structured search resources and markdown extraction for crawl views.
+Any mutating action requires an idempotency key. The OpenAPI generator exposes
+this as a required `Idempotency-Key` header for mutating operations.
+
+The crate does not enforce idempotency by itself. Enforcement belongs in the
+runtime action executor and receipt store.
+
+## Receipts and Traceability
+
+Receipts are not implemented in this crate. The registry is designed so action
+execution can later emit durable records containing:
+
+- user and client identity
+- action ID and version
+- input and output hashes
+- approval state
+- idempotency key
+- timestamps
+- Beater Agents trace ID
+
+This gives agents an auditable path from discovery to authorization to execution
+to evaluation.
+
+## Integration Path
+
+The intended integration path is incremental:
+
+1. Use `beater-connect` as the canonical registry for resources and actions.
+2. Have `beater-runtime` serve the generated crawl and discovery surfaces.
+3. Replace hand-built MCP tool/resource metadata with registry-backed metadata.
+4. Add live MCP JSON-RPC dispatch through runtime action handlers.
+5. Add OAuth consent, approval tokens, and receipt persistence.
+6. Export execution traces and receipts to `beater-agents`.
+
+The current PR implements step 1 and static generation needed by steps 2 and 3.
+
+## Compatibility
+
+The crate is designed to be usable outside `beater.js`. Future adapters can map
+the same registry model onto Next.js, Express, Remix, Axum, Rails, Django, or a
+sidecar process for existing applications.
+
+That adapter work should not change the core registry contract unless a concrete
+integration exposes a missing primitive.
