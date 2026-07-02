@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use axum::routing::{Router, get, post};
 use beater_agent::ToolRegistry;
 use serde_json::json;
@@ -284,13 +284,15 @@ async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
 // ---- route dispatch ---------------------------------------------------------
 
 async fn handle(State(state): State<DevState>, req: Request<Body>) -> Response<Body> {
-    match handle_inner(state, req).await {
+    let mut response = match handle_inner(state, req).await {
         Ok(resp) => resp,
         Err(e) => text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("beater internal error: {e:#}"),
         ),
-    }
+    };
+    apply_route_security_headers(&mut response);
+    response
 }
 
 async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Body>> {
@@ -392,10 +394,120 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
     }
 }
 
+fn apply_route_security_headers(response: &mut Response<Body>) {
+    let headers = response.headers_mut();
+    headers
+        .entry("content-security-policy")
+        .or_insert(HeaderValue::from_static(
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'",
+        ));
+    headers
+        .entry("x-content-type-options")
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry("referrer-policy")
+        .or_insert(HeaderValue::from_static("no-referrer"));
+    headers
+        .entry("x-frame-options")
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry("cross-origin-opener-policy")
+        .or_insert(HeaderValue::from_static("same-origin"));
+    headers
+        .entry("cross-origin-resource-policy")
+        .or_insert(HeaderValue::from_static("same-origin"));
+    headers
+        .entry("permissions-policy")
+        .or_insert(HeaderValue::from_static(
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()",
+        ));
+}
+
 fn text_response(status: StatusCode, body: String) -> Response<Body> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .body(Body::from(body))
         .expect("static response")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Response, StatusCode};
+
+    use super::{apply_route_security_headers, text_response};
+
+    #[test]
+    fn route_security_headers_are_added_by_default() {
+        let mut response = Response::builder()
+            .status(200)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("test response should build: {error}"));
+
+        apply_route_security_headers(&mut response);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            headers.get("referrer-policy"),
+            Some(&HeaderValue::from_static("no-referrer"))
+        );
+        assert_eq!(
+            headers.get("x-frame-options"),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+        assert_eq!(
+            headers.get("cross-origin-opener-policy"),
+            Some(&HeaderValue::from_static("same-origin"))
+        );
+        assert_eq!(
+            headers.get("cross-origin-resource-policy"),
+            Some(&HeaderValue::from_static("same-origin"))
+        );
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(csp.contains("script-src 'none'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("object-src 'none'"));
+    }
+
+    #[test]
+    fn route_security_headers_do_not_override_explicit_route_headers() {
+        let mut response = Response::builder()
+            .status(200)
+            .header("content-security-policy", "default-src 'none'")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("test response should build: {error}"));
+
+        apply_route_security_headers(&mut response);
+        assert_eq!(
+            response.headers().get("content-security-policy"),
+            Some(&HeaderValue::from_static("default-src 'none'"))
+        );
+    }
+
+    #[test]
+    fn handler_security_headers_are_added_to_error_responses() {
+        let mut response = text_response(StatusCode::NOT_FOUND, "no route".to_string());
+        apply_route_security_headers(&mut response);
+
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .contains("script-src 'none'")
+        );
+    }
 }
