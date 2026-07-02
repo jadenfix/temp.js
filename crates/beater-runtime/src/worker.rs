@@ -21,6 +21,8 @@ pub enum WorkerMsg {
         method: String,
         /// JSON-serialized request object passed to the handler.
         request_json: String,
+        /// Page routes render their default export as React SSR.
+        page: bool,
         reply: oneshot::Sender<Result<RouteResponse, String>>,
     },
     /// Read a route module's optional `export const agent = {...}` metadata.
@@ -93,9 +95,10 @@ async fn worker_main(mut rx: mpsc::Receiver<WorkerMsg>) {
                 specifier,
                 method,
                 request_json,
+                page,
                 reply,
             } => {
-                let result = dispatch(&mut runtime, &specifier, &method, &request_json).await;
+                let result = dispatch(&mut runtime, &specifier, &method, &request_json, page).await;
                 let _ = reply.send(result);
             }
             WorkerMsg::RouteMeta { specifier, reply } => {
@@ -112,13 +115,22 @@ async fn dispatch(
     specifier: &str,
     method: &str,
     request_json: &str,
+    page: bool,
 ) -> Result<RouteResponse, String> {
-    let code = format!(
-        "globalThis.__beaterDispatch({}, {}, {})",
-        serde_json::Value::String(specifier.to_string()),
-        serde_json::Value::String(method.to_string()),
-        request_json,
-    );
+    let code = if page {
+        format!(
+            "globalThis.__beaterRenderPage({}, {})",
+            serde_json::Value::String(specifier.to_string()),
+            request_json,
+        )
+    } else {
+        format!(
+            "globalThis.__beaterDispatch({}, {}, {})",
+            serde_json::Value::String(specifier.to_string()),
+            serde_json::Value::String(method.to_string()),
+            request_json,
+        )
+    };
     let promise = runtime
         .execute_script("beater:dispatch", code)
         .map_err(|e| format_js_error(&e))?;

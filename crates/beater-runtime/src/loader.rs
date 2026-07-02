@@ -15,6 +15,31 @@ use deno_error::JsErrorBox;
 
 pub struct BeaterModuleLoader;
 
+/// Bare specifiers served from vendored, checked-in ESM bundles — the whole
+/// "npm resolution" story for the framework's own JS (ARCHITECTURE.md §8).
+fn vendor_specifier(specifier: &str) -> Option<&'static str> {
+    match specifier {
+        "react" => Some("beater:vendor/react"),
+        "react/jsx-runtime" | "react/jsx-dev-runtime" => Some("beater:vendor/react-jsx-runtime"),
+        "react-dom/server" => Some("beater:vendor/react-dom-server"),
+        _ => None,
+    }
+}
+
+fn vendor_source(specifier: &str) -> Option<&'static str> {
+    match specifier {
+        "beater:agent" => Some(include_str!("beater_agent.js")),
+        "beater:vendor/react" => Some(include_str!("../assets/vendor/react.mjs")),
+        "beater:vendor/react-jsx-runtime" => {
+            Some(include_str!("../assets/vendor/react-jsx-runtime.mjs"))
+        }
+        "beater:vendor/react-dom-server" => {
+            Some(include_str!("../assets/vendor/react-dom-server.mjs"))
+        }
+        _ => None,
+    }
+}
+
 impl ModuleLoader for BeaterModuleLoader {
     fn resolve(
         &self,
@@ -22,6 +47,9 @@ impl ModuleLoader for BeaterModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> ModuleResolveResponse {
+        if let Some(mapped) = vendor_specifier(specifier) {
+            return ModuleSpecifier::parse(mapped).map_err(JsErrorBox::from_err);
+        }
         resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
     }
 
@@ -38,12 +66,8 @@ impl ModuleLoader for BeaterModuleLoader {
 fn load_sync(specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
     // framework-provided modules under the beater: scheme
     if specifier.scheme() == "beater" {
-        let source = match specifier.as_str() {
-            "beater:agent" => include_str!("beater_agent.js"),
-            other => {
-                return Err(JsErrorBox::generic(format!("unknown beater module {other}")));
-            }
-        };
+        let source = vendor_source(specifier.as_str())
+            .ok_or_else(|| JsErrorBox::generic(format!("unknown beater module {specifier}")))?;
         return Ok(ModuleSource::new(
             ModuleType::JavaScript,
             ModuleSourceCode::String(deno_core::FastString::from_static(source)),

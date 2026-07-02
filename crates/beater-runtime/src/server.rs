@@ -268,10 +268,11 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
         }
     };
 
-    if kind == RouteKind::Page {
+    let page = kind == RouteKind::Page;
+    if page && method != "GET" && method != "HEAD" {
         return Ok(text_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "page routes (React SSR) land in M4; API routes under app/routes/api work today".to_string(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "page routes are GET-only".to_string(),
         ));
     }
 
@@ -302,6 +303,7 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
         specifier,
         method,
         request_json,
+        page,
         reply: reply_tx,
     };
     state
