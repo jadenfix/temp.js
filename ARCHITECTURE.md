@@ -83,6 +83,37 @@ The tool registry is served at `POST /mcp` per spec 2025-11-25 (Streamable HTTP)
 
 Consuming remote MCP servers as tool sources is a planned follow-up (the registry is impl-agnostic).
 
+## 6b. The Agent Access Layer (agent-ready sites by default)
+
+There are two distinct problems in making a site agent-friendly, and MCP only solves the second:
+
+1. **Crawl layer** — *can an agent understand what's on this site?* This is plain web primitives: robots.txt, sitemap.xml, llms.txt, clean markdown views, JSON-LD.
+2. **Action layer** — *can an agent safely do things?* This is MCP (§6), with auth, scopes, and idempotency.
+
+Every other framework treats the crawl layer as hand-maintained files or plugins. beater generates it, because the framework already owns the two sources of truth it derives from: the **route table** and the **tool/agent registry**. Zero-config outputs:
+
+| Endpoint | Derived from | Milestone |
+|---|---|---|
+| `/robots.txt` | crawl policy + sitemap pointer | M3 |
+| `/sitemap.xml` | route table (lastmod = file mtime) | M3 |
+| `/llms.txt` | route table + per-route `agent` metadata | M3 |
+| `/.well-known/beater.json` | manifest: MCP endpoint, sitemap, llms.txt, auth requirements | M3 |
+| markdown views (`Accept: text/markdown` / `.md`) | rendered routes | post-SSR |
+| MCP `resources/list` / `resources/read` | route table → clean markdown | post-SSR |
+| JSON-LD (schema.org) in pages | per-route `agent.schema` | later |
+
+Routes opt in to richer description with one export (all fields optional; `crawl` defaults true for GET pages):
+
+```ts
+export const agent = {
+  title: "Product catalog",
+  description: "Browse and compare products.",
+  crawl: true,
+};
+```
+
+The end state (post-MVP): a single `defineAction({name, input, auth, confirm, handler})` on a route exposes the same action to humans (HTML form), agents (MCP tool), APIs (OpenAPI), and crawlers (metadata) — with dry-run previews, idempotency keys, and human confirmation for destructive scopes. The journal (§5) already gives every agent-initiated action an audit trail.
+
 ## 7. Developer experience
 
 ```
@@ -120,5 +151,5 @@ CLI: `beater dev` · `beater agent run <name> "<prompt>"` · `beater agent resum
 | M0 | scaffold, pinned deps, this doc | — | **done** |
 | M1 | `beater dev`: TS route in embedded V8, source-mapped errors, hot reload | the runtime | in progress |
 | M2 | durable agent loop + Python tool + kill-9 resume | **the thesis** | — |
-| M3 | `/mcp` endpoint (inspector-compatible) | ecosystem | — |
+| M3 | `/mcp` endpoint (inspector-compatible) + crawl layer (robots/sitemap/llms.txt/.well-known) | ecosystem | — |
 | M4 | streaming React SSR | the web half | — |

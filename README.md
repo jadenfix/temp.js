@@ -20,7 +20,7 @@ Pre-alpha, built in the open. Current milestone progress:
 - [x] **M0** — scaffold, pinned deps, architecture contract
 - [ ] **M1** — `beater dev`: TS routes in embedded V8, source-mapped errors, hot reload
 - [ ] **M2** — durable agent loop + embedded-Python tool + kill-9 resume (the thesis proof)
-- [ ] **M3** — MCP server endpoint (spec 2025-11-25)
+- [ ] **M3** — MCP server endpoint (spec 2025-11-25) + agent-ready crawl layer (robots.txt, sitemap.xml, llms.txt, .well-known manifest — auto-generated from the route table)
 - [ ] **M4** — streaming React SSR
 
 ## Quickstart (target DX)
