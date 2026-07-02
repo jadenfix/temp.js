@@ -75,8 +75,17 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Dev { app, port } => beater_runtime::dev(&app, port),
         Command::Agent { command } => match command {
-            AgentCommand::Run { app, name, prompt } => beater_agent::run(&app, &name, &prompt),
-            AgentCommand::Resume { app, run_id } => beater_agent::resume(&app, &run_id),
+            AgentCommand::Run { app, name, prompt } => {
+                let config = beater_runtime::load_agent_config(&app, &name)?;
+                let venv = beater_runtime::AppConfig::load(&app)?.python_venv;
+                beater_agent::run(&app, &name, config, venv, &prompt)
+            }
+            AgentCommand::Resume { app, run_id } => {
+                let venv = beater_runtime::AppConfig::load(&app)?.python_venv;
+                beater_agent::resume(&app, &run_id, venv, |agent| {
+                    beater_runtime::load_agent_config(&app, agent)
+                })
+            }
             AgentCommand::Runs { app } => beater_agent::list_runs(&app),
         },
         Command::Doctor { app } => doctor(&app),

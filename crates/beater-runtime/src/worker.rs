@@ -39,6 +39,7 @@ async fn op_beater_sleep(ms: f64) {
     tokio::time::sleep(std::time::Duration::from_millis(ms.max(0.0) as u64)).await;
 }
 
+// generated struct is pub; used by worker + agent_config isolates
 extension!(beater_ext, ops = [op_beater_sleep]);
 
 pub struct WorkerHandle {
@@ -119,7 +120,7 @@ async fn dispatch(
 }
 
 /// Render a JS exception with its (source-mapped) stack for dev output.
-fn format_js_error(err: &JsError) -> String {
+pub(crate) fn format_js_error(err: &JsError) -> String {
     match &err.stack {
         Some(stack) if !stack.is_empty() => stack.clone(),
         _ => err.exception_message.clone(),

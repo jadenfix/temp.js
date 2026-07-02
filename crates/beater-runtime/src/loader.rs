@@ -36,6 +36,21 @@ impl ModuleLoader for BeaterModuleLoader {
 }
 
 fn load_sync(specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
+    // framework-provided modules under the beater: scheme
+    if specifier.scheme() == "beater" {
+        let source = match specifier.as_str() {
+            "beater:agent" => include_str!("beater_agent.js"),
+            other => {
+                return Err(JsErrorBox::generic(format!("unknown beater module {other}")));
+            }
+        };
+        return Ok(ModuleSource::new(
+            ModuleType::JavaScript,
+            ModuleSourceCode::String(deno_core::FastString::from_static(source)),
+            specifier,
+            None,
+        ));
+    }
     let path = specifier
         .to_file_path()
         .map_err(|_| JsErrorBox::generic(format!("not a loadable specifier: {specifier}")))?;

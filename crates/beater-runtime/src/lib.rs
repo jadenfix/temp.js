@@ -1,12 +1,14 @@
 //! The beater.js host runtime: axum HTTP server, file-based router,
 //! deno_core (V8) worker thread, TS/TSX transpiling module loader, hot reload.
 
+mod agent_config;
 mod config;
 mod loader;
 mod router;
 mod server;
 mod worker;
 
+pub use agent_config::load_agent_config;
 pub use config::AppConfig;
 pub use router::{Route, RouteKind, RouteTable};
 
