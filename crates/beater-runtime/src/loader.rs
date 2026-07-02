@@ -148,7 +148,7 @@ fn parse_package_import(specifier: &str) -> Option<PackageImport<'_>> {
         let mut parts = specifier.splitn(3, '/');
         let scope = parts.next()?;
         let name = parts.next()?;
-        if scope.len() <= 1 || name.is_empty() {
+        if scope.len() <= 1 || !valid_package_segment(&scope[1..]) || !valid_package_segment(name) {
             return None;
         }
         let package_len = scope.len() + 1 + name.len();
@@ -167,7 +167,19 @@ fn parse_package_import(specifier: &str) -> Option<PackageImport<'_>> {
     if package.is_empty() {
         return None;
     }
+    if !valid_package_segment(package) {
+        return None;
+    }
     Some(PackageImport { package, subpath })
+}
+
+fn valid_package_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment
+            .chars()
+            .any(|ch| matches!(ch, '\\' | '\0') || ch.is_control())
 }
 
 fn resolve_package_dir(package_dir: &Path, subpath: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -249,7 +261,7 @@ fn resolve_export_target(package_dir: &Path, value: &Value) -> anyhow::Result<Op
 }
 
 fn is_active_export_condition(condition: &str) -> bool {
-    matches!(condition, "import" | "module" | "browser" | "default")
+    matches!(condition, "node" | "import" | "module" | "default")
 }
 
 fn resolve_package_relative(package_dir: &Path, raw: &str) -> anyhow::Result<PathBuf> {
@@ -588,6 +600,9 @@ mod tests {
         );
         assert!(parse_package_import("./local").is_none());
         assert!(parse_package_import("https://example.test/mod.js").is_none());
+        assert!(parse_package_import("@scope/../pkg").is_none());
+        assert!(parse_package_import("@scope/./pkg").is_none());
+        assert!(parse_package_import("../pkg").is_none());
     }
 
     #[test]
@@ -694,6 +709,89 @@ mod tests {
     }
 
     #[test]
+    fn package_import_uses_server_conditions() {
+        let app = TempDir::new("package-server-conditions");
+        app.write(
+            "app/routes/api/schema.ts",
+            "import withNode from 'with-node';\nimport withBrowser from 'with-browser';\n",
+        );
+        app.write(
+            "node_modules/with-node/package.json",
+            r#"{
+  "name": "with-node",
+  "type": "module",
+  "exports": {
+    ".": {
+      "browser": "./browser.js",
+      "node": "./node.js",
+      "import": "./import.js",
+      "default": "./default.js"
+    }
+  }
+}"#,
+        );
+        app.write(
+            "node_modules/with-node/browser.js",
+            "export default 'browser';\n",
+        );
+        app.write("node_modules/with-node/node.js", "export default 'node';\n");
+        app.write(
+            "node_modules/with-node/import.js",
+            "export default 'import';\n",
+        );
+        app.write(
+            "node_modules/with-node/default.js",
+            "export default 'default';\n",
+        );
+        app.write(
+            "node_modules/with-browser/package.json",
+            r#"{
+  "name": "with-browser",
+  "type": "module",
+  "exports": {
+    ".": {
+      "browser": "./browser.js",
+      "import": "./import.js",
+      "default": "./default.js"
+    }
+  }
+}"#,
+        );
+        app.write(
+            "node_modules/with-browser/browser.js",
+            "export default 'browser';\n",
+        );
+        app.write(
+            "node_modules/with-browser/import.js",
+            "export default 'import';\n",
+        );
+        app.write(
+            "node_modules/with-browser/default.js",
+            "export default 'default';\n",
+        );
+        let referrer =
+            ModuleSpecifier::from_file_path(app.path().join("app/routes/api/schema.ts")).unwrap();
+
+        let with_node = resolve_package_import("with-node", referrer.as_str())
+            .unwrap()
+            .unwrap();
+        let with_browser = resolve_package_import("with-browser", referrer.as_str())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            with_node,
+            ModuleSpecifier::from_file_path(app.path().join("node_modules/with-node/node.js"))
+                .unwrap()
+        );
+        assert_eq!(
+            with_browser,
+            ModuleSpecifier::from_file_path(app.path().join("node_modules/with-browser/import.js"))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn package_import_reports_missing_node_modules_package() {
         let app = TempDir::new("package-missing");
         app.write("app/routes/api/schema.ts", "import { z } from 'zod';\n");
@@ -726,6 +824,29 @@ mod tests {
         assert!(
             error.to_string().contains("points outside its package"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn package_import_rejects_scoped_package_name_escape() {
+        let app = TempDir::new("package-scoped-name-escape");
+        app.write(
+            "app/routes/api/schema.ts",
+            "import value from '@scope/../fixture/private.js';\n",
+        );
+        fs::create_dir_all(app.path().join("node_modules/@scope")).unwrap();
+        app.write("node_modules/fixture/package.json", r#"{"name":"fixture"}"#);
+        app.write(
+            "node_modules/fixture/private.js",
+            "export default 'private';\n",
+        );
+        let referrer =
+            ModuleSpecifier::from_file_path(app.path().join("app/routes/api/schema.ts")).unwrap();
+
+        assert!(
+            resolve_package_import("@scope/../fixture/private.js", referrer.as_str())
+                .unwrap()
+                .is_none()
         );
     }
 }
