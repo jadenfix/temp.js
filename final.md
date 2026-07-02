@@ -8,7 +8,7 @@ This is the honest completion contract: what is verified today, the exact gap be
 
 ---
 
-## Working model: 2 goal-oriented agents
+## Working model: 3 goal-oriented agents
 
 This file is also the coordination contract for finishing `beater.js` in parallel. Each agent should work in small, reviewable PRs; run the relevant tests before publishing; request or perform an independent review; merge only after the slice is verified; then update this file if the completion evidence changed.
 
@@ -57,9 +57,27 @@ The work below is not just about matching Node/Next request handling. The end st
 
 **Do not claim done unless:** the tests prove the requirement they are attached to, CI or local equivalents are green, and any docs marked complete have been checked from a clean-user perspective.
 
+### Agent 3 — Phase C thesis owner
+
+**Owner:** this Codex thread when working in `codex/agent3-*` branches.
+
+**Goal:** pay down [C] in dependency order with one reviewable PR per vertical slice, starting with the minimum Node/Next replacement path: streaming SSR, hydration, RSC, npm/node-compat, isolate pool, and deploy.
+
+**Primary PR sequence:**
+- [x] Add streaming React SSR over the worker chunk channel and prove shell-before-delayed-subtree delivery.
+- [ ] Add client hydration with a per-route client bundle.
+- [ ] Add RSC flight protocol over the same chunk channel.
+- [ ] Add npm/node-compat adoption wedge.
+- [ ] Add isolate pool behind the existing worker protocol.
+- [ ] Add `beater build` deploy story.
+
+**Likely touched files:** `crates/beater-runtime/**`, `crates/beater-cli/**`, `examples/hello/app/**`, `README.md`, `ARCHITECTURE.md`, `final.md`, and focused scripts under `scripts/**`.
+
+**Do not claim Phase C done unless:** every [C] table item has direct evidence, the relevant e2e gate exists and passes locally or in CI, and the PR has independent subagent review before merge.
+
 ### Coordination rules
 
-- Branches: use `codex/agent1-<slice>` and `codex/agent2-<slice>` so PR ownership is obvious.
+- Branches: use `codex/agent1-<slice>`, `codex/agent2-<slice>`, and `codex/agent3-<slice>` so PR ownership is obvious.
 - PR size: one vertical slice per PR; avoid bundling unrelated roadmap items.
 - Review: every PR gets an independent subagent review before merge; fix or explicitly document any finding.
 - Merge order: Agent 1 has priority on files needed for [A]. Agent 2 should avoid editing `examples/hello/agents/support/**` while Agent 1 is proving M2.
@@ -81,6 +99,7 @@ The work below is not just about matching Node/Next request handling. The end st
 | Agent Access Layer | /robots.txt, /sitemap.xml, /llms.txt, /.well-known/beater.json generated from the route table; `export const agent = {crawl: false}` excludes a route from sitemap + llms.txt; remote deployments can override the advertised public base URL |
 | Agent config pipeline | `agent.ts` (via `beater:agent` shim) evaluates in a one-shot isolate → JSON config → Rust registry; Python TOOL metadata loads through embedded CPython |
 | Durability machinery (code) | SQLite journal with started/completed/failed lifecycle + attempts; resume logic for dangling LLM calls and idempotent-only tool re-runs; `needs_review` parking |
+| Streaming SSR | `scripts/streaming-ssr-gate.sh` starts `beater dev`, reads the raw HTTP socket, and proved shell marker at 0.026s before Suspense-delayed marker at 0.489s while `/api/health` returned in 0.002s |
 
 ---
 
@@ -193,7 +212,7 @@ The through-line is not just parity with Node/Next; it is an agent-native runtim
 
 | # | Item | Done when |
 |---|---|---|
-| 1 | **Streaming SSR** — renderToReadableStream over the chunked worker channel (needs ReadableStream shim or deno_web) | `curl -N /` shows the shell chunk arrive before a Suspense-delayed subtree chunk |
+| 1 | **Streaming SSR** — renderToReadableStream over the chunked worker channel | **done:** `scripts/streaming-ssr-gate.sh` proved the shell chunk arrived before the Suspense-delayed subtree chunk |
 | 2 | **Client hydration** — per-route client bundle (`/_beater/client.js`) | a counter button on index.tsx works in a browser |
 | 3 | **RSC** — flight protocol over the same chunked channel | server components with client islands render + hydrate |
 | 4 | **npm/node-compat** — the adoption wedge (Deno-style compat layer, not a reimplementation) | `import { z } from "zod"` works in a route |
