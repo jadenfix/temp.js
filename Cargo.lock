@@ -271,6 +271,7 @@ dependencies = [
  "deno_ast",
  "deno_core",
  "deno_error",
+ "futures-util",
  "notify",
  "serde",
  "serde_json",

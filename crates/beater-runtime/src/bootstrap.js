@@ -104,10 +104,12 @@
     const html = ReactDOMServer.renderToString(
       React.createElement(Component, { request }),
     );
+    const bodyChunks = ["<!DOCTYPE html>", html];
     return {
       status: 200,
       headers: { "content-type": "text/html; charset=utf-8" },
-      body: "<!DOCTYPE html>" + html,
+      body: bodyChunks.join(""),
+      body_chunks: bodyChunks,
     };
   };
 
@@ -144,10 +146,21 @@
         `route handler must return { status, headers?, body? }, got: ${fmt(resp)}`,
       );
     }
+    let bodyChunks = [];
+    if (resp.body_chunks !== undefined) {
+      if (
+        !Array.isArray(resp.body_chunks) ||
+        !resp.body_chunks.every((chunk) => typeof chunk === "string")
+      ) {
+        throw new Error("route handler body_chunks must be an array of strings");
+      }
+      bodyChunks = resp.body_chunks;
+    }
     return {
       status: resp.status,
       headers: resp.headers ?? {},
       body: resp.body == null ? "" : String(resp.body),
+      body_chunks: bodyChunks,
     };
   };
 })(Deno.core);
