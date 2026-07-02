@@ -45,7 +45,30 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
     let home = http_request(port, "GET", "/", None).expect("GET /");
     assert!(home.starts_with("HTTP/1.1 200"), "{home}");
     assert!(home.contains("content-type: text/html"), "{home}");
-    assert!(home.contains("<h1>beater.js</h1>"), "{home}");
+    assert!(
+        home.contains("<h1 class=\"brand-title\">beater.js</h1>"),
+        "{home}"
+    );
+    assert!(
+        home.contains("Build the web UI and the agent loop in one place."),
+        "{home}"
+    );
+    assert!(
+        home.contains("content-security-policy: default-src 'self'"),
+        "{home}"
+    );
+    assert!(home.contains("x-content-type-options: nosniff"), "{home}");
+
+    let missing = http_request(port, "GET", "/not-a-route", None).expect("GET /not-a-route");
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+    assert!(
+        missing.contains("content-security-policy: default-src 'self'"),
+        "{missing}"
+    );
+    assert!(
+        missing.contains("x-content-type-options: nosniff"),
+        "{missing}"
+    );
 
     let init = http_request(
         port,

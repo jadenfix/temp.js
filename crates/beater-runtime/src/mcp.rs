@@ -7,6 +7,8 @@
 //! No sessions (`MCP-Session-Id` is a MAY), no SSE — every request gets a
 //! single JSON object back.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use axum::body::Body;
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -14,6 +16,7 @@ use axum::http::header::{
     WWW_AUTHENTICATE,
 };
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
+use deno_core::url::{Host, Url};
 use serde_json::{Value, json};
 
 use beater_agent::ToolRegistry;
@@ -54,7 +57,7 @@ impl AccessConfig {
             trusted_origins: trusted_origins
                 .into_iter()
                 .filter_map(non_empty)
-                .map(normalize_origin)
+                .filter_map(canonical_origin)
                 .collect(),
         }
     }
@@ -70,10 +73,15 @@ impl AccessConfig {
     /// Origin MUST be validated when present. Browser callers are limited to
     /// loopback origins plus explicitly trusted remote operator origins.
     pub fn origin_allowed(&self, headers: &HeaderMap) -> bool {
-        let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok()) else {
+        let Some(origin) = headers.get(ORIGIN) else {
             return true; // non-browser clients (curl, inspector CLI) send no Origin
         };
-        let origin = normalize_origin(origin);
+        let Ok(origin) = origin.to_str() else {
+            return false;
+        };
+        let Some(origin) = canonical_origin(origin) else {
+            return false;
+        };
         is_loopback_origin(&origin)
             || self
                 .trusted_origins
@@ -107,24 +115,50 @@ fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn normalize_origin(origin: impl AsRef<str>) -> String {
-    origin.as_ref().trim().trim_end_matches('/').to_string()
+fn canonical_origin(origin: impl AsRef<str>) -> Option<String> {
+    let url = parse_origin(origin.as_ref())?;
+    let host = match url.host()? {
+        Host::Domain(host) => host.to_string(),
+        Host::Ipv4(addr) => addr.to_string(),
+        Host::Ipv6(addr) => format!("[{addr}]"),
+    };
+    Some(format!(
+        "{}://{}{}",
+        url.scheme(),
+        host,
+        url.port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default()
+    ))
+}
+
+fn parse_origin(origin: &str) -> Option<Url> {
+    let url = Url::parse(origin.trim().trim_end_matches('/')).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    url.host()?;
+    Some(url)
 }
 
 fn is_loopback_origin(origin: &str) -> bool {
-    let Ok(url) = deno_core::url::Url::parse(origin) else {
+    let Some(url) = parse_origin(origin) else {
         return false;
     };
-    if !matches!(url.scheme(), "http" | "https") {
-        return false;
+    match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(addr)) => addr == Ipv4Addr::LOCALHOST,
+        Some(Host::Ipv6(addr)) => addr == Ipv6Addr::LOCALHOST,
+        None => false,
     }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub async fn handle_post(
@@ -318,7 +352,7 @@ fn with_cors(
 #[cfg(test)]
 mod tests {
     use axum::http::header::{AUTHORIZATION, ORIGIN};
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use beater_agent::ToolRegistry;
 
@@ -332,6 +366,12 @@ mod tests {
 
         headers.insert(ORIGIN, "http://localhost.evil.test".parse().unwrap());
         assert!(!AccessConfig::default().origin_allowed(&headers));
+
+        headers.insert(ORIGIN, "http://127.0.0.1.evil.test".parse().unwrap());
+        assert!(!AccessConfig::default().origin_allowed(&headers));
+
+        headers.insert(ORIGIN, "http://[::1]:3000".parse().unwrap());
+        assert!(AccessConfig::default().origin_allowed(&headers));
     }
 
     #[test]
@@ -342,6 +382,27 @@ mod tests {
         assert!(access.origin_allowed(&headers));
 
         headers.insert(ORIGIN, "https://evil.example.com".parse().unwrap());
+        assert!(!access.origin_allowed(&headers));
+    }
+
+    #[test]
+    fn origin_policy_rejects_malformed_and_non_origin_shapes() {
+        let access = AccessConfig::default();
+        for origin in [
+            "null",
+            "file:///tmp/app.html",
+            "http://localhost/path",
+            "http://localhost?x=1",
+            "http://user@localhost",
+            "ftp://localhost",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(ORIGIN, origin.parse().unwrap());
+            assert!(!access.origin_allowed(&headers), "{origin}");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_bytes(b"\xff").unwrap());
         assert!(!access.origin_allowed(&headers));
     }
 
