@@ -10,7 +10,17 @@ APP="${BEATER_APP:-examples/hello}"
 BIN="${BEATER_BIN:-./target/debug/beater}"
 JOURNAL="$APP/.beater/journal.db"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="${M2_GATE_OUT:-$APP/.beater/m2-gate/$STAMP}"
+RUN_LABEL="$STAMP-pid$$"
+OUT="${M2_GATE_OUT:-$APP/.beater/m2-gate/$RUN_LABEL}"
+EVIDENCE="$OUT/evidence.md"
+
+A3_RUN_ID=""
+A4_RUN_ID=""
+A4_CRASHED_SEQ=""
+A4_CRASHED_TOOL_USE_ID=""
+A5_RUN_ID=""
+A5_CRASHED_SEQ=""
+A5_CRASHED_TOOL_USE_ID=""
 
 fail() {
   echo "error: $*" >&2
@@ -159,7 +169,8 @@ run_happy_path() {
   assert_count_at_least_one \
     "SELECT COUNT(*) FROM steps WHERE run_id='$run_id' AND kind='tool_call' AND status='completed' AND tool_name='summarize_numbers'" \
     "A3 did not complete summarize_numbers"
-  sql "SELECT seq,kind,status,attempt,tool_name FROM steps WHERE run_id='$run_id'" | tee "$OUT/a3-steps.tsv"
+  sql "SELECT seq,kind,status,attempt,tool_name,tool_use_id FROM steps WHERE run_id='$run_id'" | tee "$OUT/a3-steps.tsv"
+  A3_RUN_ID="$run_id"
   echo "A3 run: $run_id"
 }
 
@@ -195,7 +206,7 @@ run_crash_resume() {
   "$BIN" agent runs --app "$APP" | tee "$runs_before_log"
   "$BIN" agent resume --app "$APP" "$run_id" | tee "$resume_log"
   "$BIN" agent runs --app "$APP" | tee "$runs_after_log"
-  sql "SELECT seq,kind,status,attempt,tool_name FROM steps WHERE run_id='$run_id'" | tee "$steps_log"
+  sql "SELECT seq,kind,status,attempt,tool_name,tool_use_id FROM steps WHERE run_id='$run_id'" | tee "$steps_log"
 
   local status
   status="$(run_status "$run_id")"
@@ -211,17 +222,82 @@ run_crash_resume() {
     grep -q "needs review" "$resume_log" || fail "$gate resume log did not explain needs_review"
   fi
 
+  case "$gate" in
+    a4)
+      A4_RUN_ID="$run_id"
+      A4_CRASHED_SEQ="$crashed_seq"
+      A4_CRASHED_TOOL_USE_ID="$crashed_tool_use_id"
+      ;;
+    a5)
+      A5_RUN_ID="$run_id"
+      A5_CRASHED_SEQ="$crashed_seq"
+      A5_CRASHED_TOOL_USE_ID="$crashed_tool_use_id"
+      ;;
+  esac
+
   echo "$gate run: $run_id"
+}
+
+write_evidence() {
+  cat >"$EVIDENCE" <<EOF
+# M2 live gate evidence
+
+Generated: $STAMP
+
+App: \`$APP\`
+Binary: \`$BIN\`
+Journal: \`$JOURNAL\`
+Output: \`$OUT\`
+Messages API base: \`${ANTHROPIC_BASE_URL:-https://api.anthropic.com}\`
+
+## A3 happy path
+
+- Run ID: \`$A3_RUN_ID\`
+- Transcript: \`a3-happy.log\`
+- Journal steps: \`a3-steps.tsv\`
+- Verified: run status is \`completed\` and \`summarize_numbers\` completed.
+
+## A4 idempotent crash/resume
+
+- Run ID: \`$A4_RUN_ID\`
+- Interrupted tool: \`slow_summarize\`
+- Interrupted step: \`$A4_CRASHED_SEQ\`
+- Tool use ID: \`$A4_CRASHED_TOOL_USE_ID\`
+- Killed-run transcript: \`a4-run.log\`
+- Run before resume: \`a4-runs-before-resume.log\`
+- Resume transcript: \`a4-resume.log\`
+- Run after resume: \`a4-runs-after-resume.log\`
+- Journal steps: \`a4-steps.tsv\`
+- Verified: resume completed the run, exactly one LLM call existed before the first tool call, and only the interrupted idempotent tool was retried with \`attempt=2\`.
+
+## A5 non-idempotent crash/resume
+
+- Run ID: \`$A5_RUN_ID\`
+- Interrupted tool: \`slow_summarize_once\`
+- Interrupted step: \`$A5_CRASHED_SEQ\`
+- Tool use ID: \`$A5_CRASHED_TOOL_USE_ID\`
+- Killed-run transcript: \`a5-run.log\`
+- Run before resume: \`a5-runs-before-resume.log\`
+- Resume transcript: \`a5-resume.log\`
+- Run after resume: \`a5-runs-after-resume.log\`
+- Journal steps: \`a5-steps.tsv\`
+- Verified: resume parked the run as \`needs_review\`, did not retry the non-idempotent tool, and did not execute any additional steps after the interrupted tool call.
+
+EOF
 }
 
 need sqlite3
 need sed
 need grep
 need tee
+need find
 
 [[ -x "$BIN" ]] || fail "missing executable $BIN; run: cargo build -p beater-cli"
 [[ -n "${ANTHROPIC_API_KEY:-}" ]] || fail "ANTHROPIC_API_KEY is not set"
 [[ -d "$APP" ]] || fail "missing app directory: $APP"
+if [[ -d "$OUT" ]] && find "$OUT" -mindepth 1 -print -quit | grep -q .; then
+  fail "output directory already contains files: $OUT"
+fi
 
 mkdir -p "$OUT"
 echo "writing transcripts to $OUT"
@@ -238,4 +314,6 @@ run_crash_resume \
   "use slow_summarize_once by name on numbers 3,1,4,1,5; do not use summarize_numbers" \
   "needs_review"
 
+write_evidence
+echo "wrote evidence manifest to $EVIDENCE"
 echo "M2 live gate passed"

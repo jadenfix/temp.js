@@ -30,6 +30,7 @@ The work below is not just about matching Node/Next request handling. The end st
 
 **Primary PR sequence:**
 - [x] Add the slow-tool fixtures for A2 with the smallest possible example-app surface.
+- [x] Make `scripts/m2-live-gate.sh` self-recording: raw transcripts plus `evidence.md`.
 - [ ] Run and record A3 happy path with the live Anthropic API.
 - [ ] Run and record A4 crash/resume idempotent proof.
 - [ ] Run and record A5 non-idempotent `needs_review` proof.
@@ -99,7 +100,7 @@ The work below is not just about matching Node/Next request handling. The end st
 | Agent Access Layer | /robots.txt, /sitemap.xml, /llms.txt, /.well-known/beater.json generated from the route table; `export const agent = {crawl: false}` excludes a route from sitemap + llms.txt; remote deployments can override the advertised public base URL |
 | Agent config pipeline | `agent.ts` (via `beater:agent` shim) evaluates in a one-shot isolate → JSON config → Rust registry; Python TOOL metadata loads through embedded CPython |
 | Durability machinery (code) | SQLite journal with started/completed/failed lifecycle + attempts; resume logic for dangling LLM calls and idempotent-only tool re-runs; `needs_review` parking |
-| M2 crash/resume fixtures | `slow_summarize.py` and `slow_summarize_once.py` are declared from `examples/hello/agents/support/agent.ts`; `scripts/m2-live-gate.sh` drives A3-A5 once `ANTHROPIC_API_KEY` is present |
+| M2 crash/resume fixtures | `slow_summarize.py` and `slow_summarize_once.py` are declared from `examples/hello/agents/support/agent.ts`; `scripts/m2-live-gate.sh` drives A3-A5 once `ANTHROPIC_API_KEY` is present and writes raw transcripts plus `evidence.md` |
 | Streaming SSR | `scripts/streaming-ssr-gate.sh` starts `beater dev`, reads the raw HTTP socket, and proved shell marker at 0.026s before Suspense-delayed marker at 0.489s while `/api/health` returned in 0.002s |
 | Client hydration | `/_beater/client/index.js` serves `app/routes/index.client.ts`; the hello page loads it as a module and `scripts/client-hydration-gate.cjs` verifies the counter increments in a browser |
 | RSC transport foundation | `/_beater/rsc/index.flight` serves `app/routes/index.server.tsx` as `text/x-component` frames over the worker stream channel; `scripts/rsc-flight-gate.cjs` verifies the browser renders the server island and the client counter still hydrates |
@@ -118,13 +119,13 @@ The only external input needed. Install once:
 echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.zshenv
 ```
 
-Once the key is present and `./target/debug/beater` is built, `scripts/m2-live-gate.sh` runs A3-A5 and writes transcripts under `examples/hello/.beater/m2-gate/<timestamp>/`.
+Once the key is present and `./target/debug/beater` is built, `scripts/m2-live-gate.sh` runs A3-A5 and writes transcripts plus an `evidence.md` manifest under `examples/hello/.beater/m2-gate/<timestamp-pid>/`.
 
 ### A2. Test fixture: slow tools for deterministic kill -9
 
 **Done.** `examples/hello/agents/support/tools/slow_summarize.py` waits before returning and is declared in `agent.ts` as `pyTool("slow_summarize", "./tools/slow_summarize.py", { idempotent: true })`. `slow_summarize_once.py` covers the non-idempotent path with `idempotent: false`. These fixtures are also included in the `beater new` hello template.
 
-A3-A5 are still pending because the live gate requires `ANTHROPIC_API_KEY`.
+A3-A5 are still pending until the live gate is run with `ANTHROPIC_API_KEY` against the real Anthropic Messages API.
 
 ### A3. Gate 1 — happy path (TS agent → Rust loop → Python tool → LLM)
 
@@ -163,9 +164,9 @@ Same kill -9 flow, but prompt for `slow_summarize_once` and wait for `tool_name=
 
 ### A6. Close-out
 
-- [ ] Record the three gate transcripts in this file (or a `docs/m2-gate.md`)
+- [ ] Run `scripts/m2-live-gate.sh` with the live key and preserve `examples/hello/.beater/m2-gate/<timestamp-pid>/evidence.md` plus the referenced raw logs.
 - [ ] Flip M2 to **done** in README.md + ARCHITECTURE.md §9
-- [ ] Delete the slow-tool fixtures or keep them under `examples/hello` as living tests
+- [x] Keep the slow-tool fixtures under `examples/hello` as living crash/resume fixtures
 
 **When A3–A5 pass, the MVP is end-to-end done**: every claim in the manifesto's vertical slice is demonstrated, not asserted.
 
@@ -244,6 +245,6 @@ Phase C progress so far:
 
 ## TL;DR
 
-- **To be e2e done (MVP):** install `ANTHROPIC_API_KEY`, add one slow-tool fixture, run the three A3–A5 gates, flip the docs. Everything else is already built and verified.
+- **To be e2e done (MVP):** install `ANTHROPIC_API_KEY`, run `scripts/m2-live-gate.sh`, preserve the emitted `evidence.md` + raw logs, then flip README.md/ARCHITECTURE.md/final.md from pending to done. Everything else is already built and verified.
 - **To ship v0.1:** tests + CI, portable Python config, isolate-pool-or-documented-limits, `beater new`.
 - **To kill Node/Next:** pay off punts 1–5 and 11 first, while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.
