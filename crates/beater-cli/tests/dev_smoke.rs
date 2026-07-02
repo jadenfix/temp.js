@@ -18,17 +18,9 @@ impl Drop for ChildGuard {
 #[test]
 fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
     let port = free_port();
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
+    let workspace = workspace();
     let app = workspace.join("examples/hello");
-    let beater = std::env::var("CARGO_BIN_EXE_beater").unwrap_or_else(|_| {
-        workspace
-            .join("target/debug/beater")
-            .to_string_lossy()
-            .into_owned()
-    });
+    let beater = beater_bin(&workspace);
     let child = Command::new(beater)
         .arg("dev")
         .arg(&app)
@@ -81,6 +73,40 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
 
     let mcp_get = http_request(port, "GET", "/mcp", None).expect("GET /mcp");
     assert!(mcp_get.starts_with("HTTP/1.1 405"), "{mcp_get}");
+}
+
+#[test]
+fn doctor_reports_python_v8_and_venv_diagnostics() {
+    let workspace = workspace();
+    let app = workspace.join("examples/hello");
+    let output = Command::new(beater_bin(&workspace))
+        .arg("doctor")
+        .arg(&app)
+        .output()
+        .expect("run beater doctor");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("beater doctor"), "{stdout}");
+    assert!(stdout.contains("python:"), "{stdout}");
+    assert!(stdout.contains("venv:"), "{stdout}");
+    assert!(stdout.contains("v8:"), "{stdout}");
+}
+
+fn workspace() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+fn beater_bin(workspace: &std::path::Path) -> String {
+    std::env::var("CARGO_BIN_EXE_beater").unwrap_or_else(|_| {
+        workspace
+            .join("target/debug/beater")
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 fn free_port() -> u16 {

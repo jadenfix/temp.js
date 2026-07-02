@@ -26,11 +26,15 @@ Pre-alpha, built in the open. Current milestone progress:
 ## Quickstart (target DX)
 
 ```sh
-beater dev examples/hello                 # serve routes with hot reload
-beater dev examples/hello --host 0.0.0.0  # bind for containers/VMs
-beater agent run support "summarize 3,1,4,1,5"
-beater agent resume <run_id>              # crash-safe: picks up mid-loop
-beater doctor                             # verify Python/venv/V8 wiring
+python3.11 -m venv examples/hello/.venv   # optional: enables third-party Python packages
+export PYO3_PYTHON=$(command -v python3.11)
+cargo build --workspace
+
+./target/debug/beater dev examples/hello                 # serve routes with hot reload
+./target/debug/beater dev examples/hello --host 0.0.0.0  # bind for containers/VMs
+./target/debug/beater agent run --app examples/hello support "summarize 3,1,4,1,5"
+./target/debug/beater agent resume --app examples/hello <run_id>
+./target/debug/beater doctor examples/hello              # verify Python/venv/V8 wiring
 ```
 
 ## Build from source
@@ -39,9 +43,25 @@ beater doctor                             # verify Python/venv/V8 wiring
 cargo build --workspace      # first build downloads a prebuilt V8; takes a while
 ```
 
-Requires: Rust (pinned via rust-toolchain.toml) and CPython with a shared library for the embedded interpreter. If your Python is not the local default in `.cargo/config.toml`, set `PYO3_PYTHON=$(which python3.11)` before building.
+Requires: Rust (pinned via rust-toolchain.toml) and CPython 3.11+ with a shared library for the embedded interpreter. Set `PYO3_PYTHON` before building so PyO3 links the intended interpreter:
+
+```sh
+# macOS with Homebrew
+brew install python@3.11
+export PYO3_PYTHON="$(brew --prefix python@3.11)/bin/python3.11"
+
+# Linux
+python3.11 -m venv examples/hello/.venv
+export PYO3_PYTHON="$(command -v python3.11)"
+```
 
 Agent tests and local mock runs can point at a non-Anthropic endpoint with `ANTHROPIC_BASE_URL`; production runs still require `ANTHROPIC_API_KEY`.
+
+More docs:
+
+- [Tool contract](docs/tools.md)
+- [Security and trust model](docs/security.md)
+- [Changelog and versioning policy](CHANGELOG.md)
 
 ## License
 
