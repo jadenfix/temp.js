@@ -23,6 +23,18 @@ pub enum WorkerMsg {
         request_json: String,
         reply: oneshot::Sender<Result<RouteResponse, String>>,
     },
+    /// Read a route module's optional `export const agent = {...}` metadata.
+    RouteMeta {
+        specifier: String,
+        reply: oneshot::Sender<Result<Option<RouteMeta>, String>>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteMeta {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub crawl: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +98,10 @@ async fn worker_main(mut rx: mpsc::Receiver<WorkerMsg>) {
                 let result = dispatch(&mut runtime, &specifier, &method, &request_json).await;
                 let _ = reply.send(result);
             }
+            WorkerMsg::RouteMeta { specifier, reply } => {
+                let result = route_meta(&mut runtime, &specifier).await;
+                let _ = reply.send(result);
+            }
         }
     }
     tracing::debug!("js worker shutting down");
@@ -117,6 +133,24 @@ async fn dispatch(
     let response: RouteResponse = deno_core::serde_v8::from_v8(scope, local)
         .map_err(|e| format!("route response did not match {{ status, headers, body }}: {e}"))?;
     Ok(response)
+}
+
+async fn route_meta(runtime: &mut JsRuntime, specifier: &str) -> Result<Option<RouteMeta>, String> {
+    let code = format!(
+        "globalThis.__beaterRouteMeta({})",
+        serde_json::Value::String(specifier.to_string()),
+    );
+    let promise = runtime
+        .execute_script("beater:route-meta", code)
+        .map_err(|e| format_js_error(&e))?;
+    let resolved = runtime.resolve(promise);
+    let global = runtime
+        .with_event_loop_promise(resolved, PollEventLoopOptions::default())
+        .await
+        .map_err(format_core_error)?;
+    deno_core::scope!(scope, runtime);
+    let local = v8::Local::new(scope, global);
+    deno_core::serde_v8::from_v8(scope, local).map_err(|e| format!("bad agent metadata: {e}"))
 }
 
 /// Render a JS exception with its (source-mapped) stack for dev output.

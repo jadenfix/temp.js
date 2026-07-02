@@ -1,5 +1,6 @@
 //! The dev server: axum in front, JS worker behind a swappable channel,
-//! notify-based hot reload that replaces the whole isolate.
+//! notify-based hot reload, plus the agent surfaces — /mcp and the
+//! generated crawl layer (robots.txt, sitemap.xml, llms.txt, .well-known).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,14 +10,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request, Response, StatusCode};
-use axum::routing::Router;
+use axum::http::{HeaderMap, Request, Response, StatusCode};
+use axum::routing::{Router, get, post};
+use beater_agent::ToolRegistry;
 use serde_json::json;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::config::AppConfig;
-use crate::router::{RouteKind, RouteTable};
-use crate::worker::{self, WorkerMsg};
+use crate::router::{RouteKind, RouteTable, Segment};
+use crate::worker::{self, RouteMeta, WorkerMsg};
+use crate::{crawl, mcp};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -25,9 +28,18 @@ const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 struct DevState {
     routes: Arc<RwLock<RouteTable>>,
     worker_tx: Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    registry: Arc<ToolRegistry>,
+    app_name: String,
+    agents: Arc<Vec<String>>,
+    base_url: String,
 }
 
-pub async fn serve(config: AppConfig, port: u16) -> Result<()> {
+pub async fn serve(
+    config: AppConfig,
+    port: u16,
+    registry: ToolRegistry,
+    agents: Vec<String>,
+) -> Result<()> {
     let table = RouteTable::scan(&config.app_dir)?;
     if table.is_empty() {
         tracing::warn!("no routes found under {}/app/routes", config.app_dir.display());
@@ -35,16 +47,30 @@ pub async fn serve(config: AppConfig, port: u16) -> Result<()> {
     for route in table.iter() {
         tracing::info!("route {} -> {}", route.pattern, route.file.display());
     }
+    for tool in registry.entries() {
+        tracing::info!("tool  {} (mcp)", tool.name);
+    }
 
     let worker = worker::spawn()?;
     let state = DevState {
         routes: Arc::new(RwLock::new(table)),
         worker_tx: Arc::new(RwLock::new(worker.tx)),
+        registry: Arc::new(registry),
+        app_name: config.name.clone(),
+        agents: Arc::new(agents),
+        base_url: format!("http://127.0.0.1:{port}"),
     };
 
     spawn_reloader(config.app_dir.clone(), state.clone());
 
-    let app = Router::new().fallback(handle).with_state(state);
+    let app = Router::new()
+        .route("/mcp", post(handle_mcp_post).get(handle_mcp_get))
+        .route("/robots.txt", get(handle_robots))
+        .route("/sitemap.xml", get(handle_sitemap))
+        .route("/llms.txt", get(handle_llms))
+        .route("/.well-known/beater.json", get(handle_well_known))
+        .fallback(handle)
+        .with_state(state);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -109,6 +135,103 @@ fn spawn_reloader(app_dir: PathBuf, state: DevState) {
         }
     });
 }
+
+// ---- agent access layer ----------------------------------------------------
+
+async fn handle_mcp_post(
+    State(state): State<DevState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    mcp::handle_post(&state.registry, &headers, &body).await
+}
+
+async fn handle_mcp_get() -> Response<Body> {
+    mcp::handle_get()
+}
+
+async fn handle_robots(State(state): State<DevState>) -> Response<Body> {
+    text_response(StatusCode::OK, crawl::robots_txt(&state.base_url))
+}
+
+/// Static (non-parameterized) routes with their `agent` metadata resolved
+/// through the isolate — the shared input for sitemap.xml and llms.txt.
+async fn crawlable_routes(state: &DevState) -> Vec<(String, PathBuf, Option<RouteMeta>)> {
+    let targets: Vec<(String, PathBuf, Option<String>)> = {
+        let table = state.routes.read().await;
+        table
+            .iter()
+            .filter(|r| !r.segments.iter().any(|s| matches!(s, Segment::Param(_))))
+            .map(|r| {
+                let spec = deno_core::ModuleSpecifier::from_file_path(&r.file)
+                    .ok()
+                    .map(|s| s.to_string());
+                (r.pattern.clone(), r.file.clone(), spec)
+            })
+            .collect()
+    };
+    let mut routes = Vec::new();
+    for (pattern, file, spec) in targets {
+        let meta = match spec {
+            Some(spec) => route_meta(state, spec).await,
+            None => None,
+        };
+        routes.push((pattern, file, meta));
+    }
+    routes
+}
+
+async fn handle_sitemap(State(state): State<DevState>) -> Response<Body> {
+    let routes = crawlable_routes(&state).await;
+    let xml = crawl::sitemap_xml(&state.base_url, &routes);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(xml))
+        .expect("static response")
+}
+
+async fn handle_llms(State(state): State<DevState>) -> Response<Body> {
+    let routes: Vec<(String, Option<RouteMeta>)> = crawlable_routes(&state)
+        .await
+        .into_iter()
+        .map(|(pattern, _, meta)| (pattern, meta))
+        .collect();
+    text_response(
+        StatusCode::OK,
+        crawl::llms_txt(&state.app_name, &state.base_url, &routes, &state.agents),
+    )
+}
+
+async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
+    let manifest = crawl::well_known(&state.app_name, &state.base_url, &state.agents);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(manifest.to_string()))
+        .expect("static response")
+}
+
+async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state
+        .worker_tx
+        .read()
+        .await
+        .send(WorkerMsg::RouteMeta { specifier, reply: reply_tx })
+        .await
+        .ok()?;
+    match tokio::time::timeout(REQUEST_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(meta))) => meta,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!("route meta failed: {e}");
+            None
+        }
+        _ => None,
+    }
+}
+
+// ---- route dispatch ---------------------------------------------------------
 
 async fn handle(State(state): State<DevState>, req: Request<Body>) -> Response<Body> {
     match handle_inner(state, req).await {

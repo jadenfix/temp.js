@@ -53,6 +53,19 @@
     Promise.resolve().then(cb);
   };
 
+  // Agent Access Layer: read a route module's optional `agent` metadata
+  // export ({title, description, crawl}) for llms.txt / sitemap generation.
+  globalThis.__beaterRouteMeta = async (specifier) => {
+    const mod = await import(specifier);
+    const meta = mod.agent;
+    if (!meta || typeof meta !== "object") return null;
+    return {
+      title: typeof meta.title === "string" ? meta.title : null,
+      description: typeof meta.description === "string" ? meta.description : null,
+      crawl: meta.crawl !== false,
+    };
+  };
+
   // Route dispatch: called from Rust with (specifier, method, request).
   // API routes export per-method handlers (GET, POST, ...) or a default.
   globalThis.__beaterDispatch = async (specifier, method, request) => {

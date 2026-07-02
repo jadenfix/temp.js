@@ -260,7 +260,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "beater-agent",
+ "beater-py",
  "bytes",
+ "chrono",
  "deno_ast",
  "deno_core",
  "deno_error",

@@ -6,7 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+beater-agent.workspace = true
+beater-py.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 axum.workspace = true
 bytes.workspace = true
 deno_core.workspace = true

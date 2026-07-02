@@ -84,6 +84,25 @@ impl ToolRegistry {
         Ok(Self { tools })
     }
 
+    pub fn empty() -> Self {
+        Self { tools: Vec::new() }
+    }
+
+    /// Merge another registry in; first declaration wins on name collision.
+    pub fn extend(&mut self, other: ToolRegistry) {
+        for tool in other.tools {
+            if self.get(&tool.name).is_some() {
+                tracing::warn!("duplicate tool {} across agents — keeping the first", tool.name);
+            } else {
+                self.tools.push(tool);
+            }
+        }
+    }
+
+    pub fn entries(&self) -> &[ToolEntry] {
+        &self.tools
+    }
+
     pub fn get(&self, name: &str) -> Option<&ToolEntry> {
         self.tools.iter().find(|t| t.name == name)
     }

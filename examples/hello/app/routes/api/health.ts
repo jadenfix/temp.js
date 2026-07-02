@@ -1,4 +1,12 @@
 // M1: runs inside beater's embedded V8 — no Node, no Deno.
+
+// Agent Access Layer metadata: enriches /llms.txt and /sitemap.xml.
+export const agent = {
+  title: "Health check",
+  description: "Liveness endpoint returning runtime status as JSON.",
+  crawl: true,
+};
+
 interface HealthReport {
   ok: boolean;
   runtime: string;
