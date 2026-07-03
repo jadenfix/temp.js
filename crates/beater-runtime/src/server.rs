@@ -209,7 +209,12 @@ async fn handle_mcp_options(State(state): State<DevState>, headers: HeaderMap) -
 }
 
 async fn handle_robots(State(state): State<DevState>) -> Response<Body> {
-    text_response(StatusCode::OK, crawl::robots_txt(&state.base_url))
+    let routes: Vec<(String, Option<RouteMeta>)> = crawlable_routes(&state)
+        .await
+        .into_iter()
+        .map(|(pattern, _, meta)| (pattern, meta))
+        .collect();
+    text_response(StatusCode::OK, crawl::robots_txt(&state.base_url, &routes))
 }
 
 /// Static page routes with their `agent` metadata resolved through the isolate

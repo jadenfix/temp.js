@@ -70,7 +70,8 @@ The work below is not just about matching Node/Next request handling. The end st
 - [x] Add RSC flight protocol over the same chunk channel.
 - [x] Add npm/node-compat adoption wedge.
 - [ ] Add isolate pool behind the existing worker protocol.
-- [ ] Add `beater build` deploy story.
+- [x] Add `beater build` runnable host-bundle foundation.
+- [ ] Prove the deploy story with a Linux container image and `docker run` cold-start gate.
 
 **Likely touched files:** `crates/beater-runtime/**`, `crates/beater-cli/**`, `examples/hello/app/**`, `README.md`, `ARCHITECTURE.md`, `final.md`, and focused scripts under `scripts/**`.
 
@@ -231,6 +232,7 @@ Phase C progress so far:
 - Route-scoped client modules can now live beside page routes as `*.client.ts` files and are served from `/_beater/client/<route>.js`; the hello page uses this to prove same-origin browser code can hydrate a counter without Node/npm. Full React hydration and bundling are still open.
 - Route-scoped server components can now live beside page routes as `*.server.tsx` files and stream `text/x-component` flight frames from `/_beater/rsc/<route>.flight`; this proves the transport and browser island path, not full official React Flight manifests.
 - Server routes can now import local ESM packages from `node_modules` with bare specifiers. This is the adoption wedge for real integrations and shared validation libraries without adding a Node sidecar; CommonJS, Node built-ins, install hooks, and client dependency bundling remain broader compatibility work.
+- `beater build --out <dir>` now emits a runnable host-platform bundle with `bin/beater`, copied app assets, `run.sh`, `beater-build.json`, `.dockerignore`, and a non-root Dockerfile. Runtime state and common local credential files are excluded; symlinked app files and symlinked outputs are refused. `build_creates_runnable_bundle_and_refuses_unsafe_output` starts the generated launcher and hits `/api/health`; the Docker cold-start gate remains open.
 
 | # | Item | Done when |
 |---|---|---|
@@ -244,7 +246,7 @@ Phase C progress so far:
 | 8 | **MCP consume + sessions** — use remote MCP servers as tool sources; add session/auth plumbing for remote management; adopt the next MCP spec when released | an agent uses a third-party MCP server's tool via config only, with scoped credentials and resumable error handling |
 | 9 | **Agentic browsing** — reuse beater-agents' CDP/Playwright crates as a tool provider | an agent completes a real browsing task from a pyTool-style declaration, with browser sessions cleaned up after crashes |
 | 10 | **defineAction** — one definition → HTML form + MCP tool + OpenAPI + crawler metadata (§6b end state) | a form posts for humans AND appears in tools/list with auth + confirm semantics |
-| 11 | **Deploy story** — `beater build` → single container (binary + assets + venv) | `docker run` of the built image serves the app cold in <1s |
+| 11 | **Deploy story** — `beater build` → single container (binary + assets + venv) | **partial:** host-platform bundle exists and is locally boot-tested through `run.sh`; done requires `docker run` of a target-OS image serving the app cold in <1s |
 | 12 | **Observability** — OTLP out of the agent loop into beater-agents | a run's trace appears in the beater-agents dashboard |
 | 13 | **Free-threaded Python** — pyo3 on 3.14t once ML wheels are reliable | two Python tools execute truly in parallel under load |
 | 14 | **C++ tools** — via cxx on the Rust builtin path | a C++ function is callable as a tool with schema |
@@ -257,4 +259,4 @@ Phase C progress so far:
 
 - **To be e2e done (MVP):** install `ANTHROPIC_API_KEY`, run `scripts/m2-live-gate.sh`, preserve the emitted `evidence.md` + raw logs, then flip README.md/ARCHITECTURE.md/final.md from pending to done. Everything else is already built and verified.
 - **To ship v0.1:** tests + CI, portable Python config, isolate-pool-or-documented-limits, `beater new`.
-- **To kill Node/Next:** pay off punts 1–5 and 11 first, while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.
+- **To kill Node/Next:** pay off punts 1–5 and finish the remaining Docker proof for 11, while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.
