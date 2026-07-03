@@ -99,6 +99,7 @@ The work below is not just about matching Node/Next request handling. The end st
 | MCP server (2025-11-25) | official MCP inspector completes initialize + tools/list + tools/call; bogus Origin → 403; GET → 405; bearer-token mode returns 401 without `Authorization`; trusted remote browser origins get preflight/CORS support |
 | MCP tools/call idempotency isolation | runtime tests prove repeated `/mcp tools/call` requests with JSON-RPC id `1` generate unique `beater:mcp:<uuid>` remote tool ids and matching idempotency keys |
 | Python-over-MCP | `summarize_numbers` (a `.py` file) executes in embedded CPython when called by an external MCP client |
+| Python tool path containment | registry tests reject relative and absolute Python tool paths outside the agent directory before loading, then re-check containment before execute after symlink replacement |
 | Agent Access Layer | /robots.txt, /sitemap.xml, /llms.txt, /.well-known/beater.json generated from the route table; `export const agent = {crawl: false}` excludes a route from sitemap + llms.txt; remote deployments can override the advertised public base URL |
 | Agent config pipeline | `agent.ts` (via `beater:agent` shim) evaluates in a one-shot isolate → JSON config → Rust registry; Python TOOL metadata loads through embedded CPython |
 | Durability machinery (code) | SQLite journal with started/completed/failed lifecycle + attempts; resume logic for dangling LLM calls and idempotent-only tool re-runs; `needs_review` parking |
