@@ -146,6 +146,8 @@ fn dev_server_refuses_remote_mcp_without_bearer_token() {
         .arg("0.0.0.0")
         .arg("--port")
         .arg(port.to_string())
+        .arg("--base-url")
+        .arg("https://hello.example.test")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("BEATER_BASE_URL")
         .env_remove("BEATER_MCP_TOKEN")

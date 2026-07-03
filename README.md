@@ -36,7 +36,7 @@ cargo build --workspace
 ./target/debug/beater new my-app                         # scaffold from the hello template
 python3.11 -m venv my-app/.venv                          # optional: enables third-party Python packages
 ./target/debug/beater dev my-app                         # serve routes with hot reload
-./target/debug/beater dev my-app --host 0.0.0.0          # bind for containers/VMs
+BEATER_MCP_TOKEN=dev-token ./target/debug/beater dev my-app --host 0.0.0.0 --base-url https://hello.example.com
 export ANTHROPIC_API_KEY=sk-ant-...                     # required for live agent runs
 ./target/debug/beater agent run --app my-app support "summarize 3,1,4,1,5"
 ./target/debug/beater agent resume --app my-app <run_id>
