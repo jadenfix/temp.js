@@ -143,3 +143,36 @@ default at 1). In that model, cross-request blast radius is the recurring danger
 - The recurring footnote in every issue — uncommitted `defineAction` / `/openapi.json`
   discovery work touching `server.rs`, `crawl.rs`, `worker.rs`, `loader.rs` — overlaps
   families B, D, and E. **#43** should be fixed as part of that work, not after.
+
+---
+
+## Second sweep — new issues filed post-#54 (#56, #73–#77)
+
+A second multi-agent review sweep of `main` (after #54 merged) found bugs the first
+sweep missed. Each was verified against the tree or refuted; only survivors were
+filed. They map onto the same five families above.
+
+| Issue | Sev | Family | One-line |
+|---|---|---|---|
+| #73 | Med | A (durability) | `remote_mcp` malformed-after-HTTP-200 → `is_error` not `needs_review` (duplicate side effect); `ToolCallContext.idempotency_key` ignored on the wire |
+| #74 | Med | D (HTTP) | unchecked `content-length` on full bodies truncates responses; identical route patterns shadow nondeterministically; RSC-flight renders with empty request context |
+| #75 | Med | C/E (crawl/contract) | API routes published in `sitemap.xml`+`llms.txt`; `0.0.0.0` base_url advertised; `robots.txt` ignores `crawl:false`; security headers skipped on agent routes |
+| #76 | Med | B (isolate) | no SSR/RSC backpressure (unbounded channel + constant `desiredSize`) → memory DoS; unbounded `cancelledTimers` set |
+| #77 | Med | E (contract) | beater-connect `public(false)` resources leak into `llms.txt`/`openapi.json`/mcp catalog; `agent-card.json` not A2A-conformant |
+| #56 | Med | — | npm resolver (from #54): `browser`-over-`node` export condition; no wildcard subpath exports |
+
+### Notes for the fixer
+- **#73 item 1** is the highest-value new bug: it is the same duplicate-side-effect
+  class as the #26/#41/#39 durability family, and the *inverse* of #52 item 1. Fix
+  alongside family A. Route only **2xx-with-parse-failure** to `needs_review`
+  (a 4xx→`is_error` is correct — the call never applied).
+- **#75 item 1** (API routes in crawl surfaces) and **#77 item 1** (private resources
+  leaking) are both "one generator honors the visibility rule, the others don't" —
+  audit *every* surface generator for the same filter, don't patch one at a time.
+- **#74 item 1** (content-length) mirrors the existing chunked-body strip — extend the
+  same guard to `RouteBody::Full`.
+- **#76** overlaps the isolate-resilience family (B); land with #33/#34.
+
+Updated totals: **35 open bug issues** across the backlog (29 original #25–#53, plus
+#56 and #73–#77 from this sweep). Severity still skews medium — the two Highs (#25,
+#26) remain the top of the "fix now" list.
