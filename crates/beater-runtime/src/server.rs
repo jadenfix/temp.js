@@ -24,7 +24,7 @@ use bytes::Bytes;
 use futures_util::{Stream, stream};
 use serde_json::json;
 use tokio::sync::{RwLock, mpsc, oneshot};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::AppConfig;
 use crate::loader;
@@ -705,7 +705,7 @@ fn route_body(body: RouteBody) -> Body {
     match body {
         RouteBody::Full(body) => Body::from(body),
         RouteBody::Chunks(chunks) => chunks_body(chunks),
-        RouteBody::Stream { rx, .. } => Body::from_stream(UnboundedReceiverStream::new(rx)),
+        RouteBody::Stream { rx, .. } => Body::from_stream(ReceiverStream::new(rx)),
     }
 }
 
@@ -760,11 +760,11 @@ fn empty_unknown_len_body() -> Body {
 
 fn cancel_on_drop_body_stream(
     stream_id: u32,
-    rx: mpsc::UnboundedReceiver<Result<Bytes, io::Error>>,
+    rx: mpsc::Receiver<Result<Bytes, io::Error>>,
     cancel_tx: mpsc::WeakSender<WorkerMsg>,
 ) -> CancelOnDropStream {
     CancelOnDropStream {
-        inner: UnboundedReceiverStream::new(rx),
+        inner: ReceiverStream::new(rx),
         cancel_tx,
         stream_id,
         completed: false,
@@ -772,7 +772,7 @@ fn cancel_on_drop_body_stream(
 }
 
 struct CancelOnDropStream {
-    inner: UnboundedReceiverStream<Result<Bytes, io::Error>>,
+    inner: ReceiverStream<Result<Bytes, io::Error>>,
     cancel_tx: mpsc::WeakSender<WorkerMsg>,
     stream_id: u32,
     completed: bool,
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_body_drop_sends_cancel_stream() {
-        let (_body_tx, body_rx) = mpsc::unbounded_channel();
+        let (_body_tx, body_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
 
         let stream = cancel_on_drop_body_stream(7, body_rx, cancel_tx.downgrade());
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_body_drop_waits_for_cancel_capacity_when_queue_is_full() {
-        let (_body_tx, body_rx) = mpsc::unbounded_channel();
+        let (_body_tx, body_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         cancel_tx
             .try_send(worker::WorkerMsg::RouteMeta {
@@ -1083,7 +1083,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_stream_body_does_not_send_cancel_stream() {
-        let (body_tx, body_rx) = mpsc::unbounded_channel();
+        let (body_tx, body_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         drop(body_tx);
 
@@ -1096,7 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_body_drop_without_live_owner_sender_is_noop() {
-        let (_body_tx, body_rx) = mpsc::unbounded_channel();
+        let (_body_tx, body_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let weak_cancel_tx = cancel_tx.downgrade();
         drop(cancel_tx);

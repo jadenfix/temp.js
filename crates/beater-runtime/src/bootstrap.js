@@ -53,26 +53,26 @@
   }
 
   let nextTimerId = 1;
-  const cancelledTimers = new Set();
+  const activeTimers = new Set();
   globalThis.setTimeout = (cb, ms = 0, ...args) => {
     const id = nextTimerId++;
+    activeTimers.add(id);
     ops.op_beater_sleep(ms).then(() => {
-      if (!cancelledTimers.delete(id)) callTimerCallback(cb, args);
+      if (!activeTimers.delete(id)) return;
+      callTimerCallback(cb, args);
     });
     return id;
   };
   globalThis.clearTimeout = (id) => {
-    cancelledTimers.add(id);
+    activeTimers.delete(id);
   };
   globalThis.setInterval = (cb, ms = 0, ...args) => {
     const id = nextTimerId++;
+    activeTimers.add(id);
     (async () => {
       while (true) {
         await ops.op_beater_sleep(ms);
-        if (cancelledTimers.has(id)) {
-          cancelledTimers.delete(id);
-          return;
-        }
+        if (!activeTimers.has(id)) return;
         callTimerCallback(cb, args);
       }
     })();
@@ -141,9 +141,10 @@
         this._error = null;
         this._locked = false;
         this._pulling = false;
+        const stream = this;
         this._controller = {
           get desiredSize() {
-            return 1;
+            return Math.max(0, 1 - stream._queue.length);
           },
           enqueue: (chunk) => {
             if (this._closed || this._error) return;
@@ -235,8 +236,8 @@
     return flightEncoder.encode(`${kind}${JSON.stringify(payload)}\n`);
   }
 
-  function writeFlightFrame(stream_id, kind, payload) {
-    return ops.op_beater_stream_chunk(stream_id, flightFrame(kind, payload));
+  async function writeFlightFrame(stream_id, kind, payload) {
+    return await ops.op_beater_stream_chunk(stream_id, flightFrame(kind, payload));
   }
 
   async function cancelReader(reader) {
@@ -264,7 +265,7 @@
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (!ops.op_beater_stream_chunk(stream_id, streamChunkBytes(value))) {
+        if (!(await ops.op_beater_stream_chunk(stream_id, streamChunkBytes(value)))) {
           await cancelReader(reader);
           return;
         }
@@ -288,16 +289,16 @@
         const { done, value } = await reader.read();
         if (done) break;
         const bytes = Array.from(streamChunkBytes(value));
-        if (bytes.length && !writeFlightFrame(stream_id, "H", bytes)) {
+        if (bytes.length && !(await writeFlightFrame(stream_id, "H", bytes))) {
           await cancelReader(reader);
           return;
         }
       }
-      writeFlightFrame(stream_id, "E", { ok: true });
+      await writeFlightFrame(stream_id, "E", { ok: true });
       ops.op_beater_stream_end(stream_id);
     } catch (error) {
       if (activeStreams.get(stream_id) === reader) {
-        writeFlightFrame(stream_id, "E", { ok: false, error: fmt(error) });
+        await writeFlightFrame(stream_id, "E", { ok: false, error: fmt(error) });
         ops.op_beater_stream_end(stream_id);
       }
     } finally {
@@ -354,10 +355,12 @@
     if (typeof ReactDOMServer.renderToReadableStream !== "function") {
       throw new Error("react-dom/server renderToReadableStream is unavailable");
     }
-    writeFlightFrame(stream_id, "B", {
+    if (!(await writeFlightFrame(stream_id, "B", {
       protocol: "beater-flight",
       version: 0,
-    });
+    }))) {
+      throw new Error("RSC flight stream closed before bootstrap frame");
+    }
     const stream = await ReactDOMServer.renderToReadableStream(
       React.createElement(Component, { request }),
       {
