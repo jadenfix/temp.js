@@ -4,12 +4,18 @@
   const ops = core.ops;
 
   function fmt(x) {
-    if (typeof x === "string") return x;
-    if (x instanceof Error) return x.stack ?? String(x);
     try {
-      return JSON.stringify(x);
-    } catch {
+      if (typeof x === "string") return x;
+      if (x instanceof Error) return x.stack ?? String(x);
+      try {
+        const json = JSON.stringify(x);
+        if (json !== undefined) return json;
+      } catch {
+        // Fall back to String below.
+      }
       return String(x);
+    } catch {
+      return "<unprintable>";
     }
   }
 
@@ -21,12 +27,37 @@
     debug: (...args) => core.print(args.map(fmt).join(" ") + "\n", false),
   };
 
+  core.setUnhandledPromiseRejectionHandler((_promise, reason) => {
+    try {
+      console.error("Unhandled promise rejection:", reason);
+    } catch {
+      core.print("Unhandled promise rejection: <unprintable>\n", true);
+    }
+    return true;
+  });
+
+  function reportAsyncError(error) {
+    try {
+      console.error("Uncaught async callback error:", error);
+    } catch {
+      core.print("Uncaught async callback error: <unprintable>\n", true);
+    }
+  }
+
+  function callTimerCallback(cb, args) {
+    try {
+      cb(...args);
+    } catch (error) {
+      reportAsyncError(error);
+    }
+  }
+
   let nextTimerId = 1;
   const cancelledTimers = new Set();
   globalThis.setTimeout = (cb, ms = 0, ...args) => {
     const id = nextTimerId++;
     ops.op_beater_sleep(ms).then(() => {
-      if (!cancelledTimers.delete(id)) cb(...args);
+      if (!cancelledTimers.delete(id)) callTimerCallback(cb, args);
     });
     return id;
   };
@@ -42,7 +73,7 @@
           cancelledTimers.delete(id);
           return;
         }
-        cb(...args);
+        callTimerCallback(cb, args);
       }
     })();
     return id;
@@ -58,6 +89,18 @@
   // Minimal UTF-8 TextEncoder — enough for React SSR and stream chunk
   // encoding. Full web API fidelity comes with the npm-compat era.
   if (!globalThis.TextEncoder) {
+    const utf8Bytes = (c) => {
+      if (c < 0x80) return [c];
+      if (c < 0x800) return [0xc0 | (c >> 6), 0x80 | (c & 63)];
+      if (c < 0x10000)
+        return [0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63)];
+      return [
+        0xf0 | (c >> 18),
+        0x80 | ((c >> 12) & 63),
+        0x80 | ((c >> 6) & 63),
+        0x80 | (c & 63),
+      ];
+    };
     globalThis.TextEncoder = class TextEncoder {
       get encoding() {
         return "utf-8";
@@ -67,25 +110,24 @@
         for (let i = 0; i < input.length; i++) {
           let c = input.codePointAt(i);
           if (c > 0xffff) i++;
-          if (c < 0x80) out.push(c);
-          else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-          else if (c < 0x10000)
-            out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-          else
-            out.push(
-              0xf0 | (c >> 18),
-              0x80 | ((c >> 12) & 63),
-              0x80 | ((c >> 6) & 63),
-              0x80 | (c & 63),
-            );
+          out.push(...utf8Bytes(c));
         }
         return new Uint8Array(out);
       }
       encodeInto(src, dest) {
-        const bytes = this.encode(src);
-        const written = Math.min(bytes.length, dest.length);
-        dest.set(bytes.subarray(0, written));
-        return { read: src.length, written };
+        let read = 0;
+        let written = 0;
+        for (let i = 0; i < src.length; ) {
+          const c = src.codePointAt(i);
+          const units = c > 0xffff ? 2 : 1;
+          const bytes = utf8Bytes(c);
+          if (written + bytes.length > dest.length) break;
+          dest.set(bytes, written);
+          written += bytes.length;
+          i += units;
+          read = i;
+        }
+        return { read, written };
       }
     };
   }
