@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
+use axum::middleware;
 use axum::routing::{Router, get, post};
 use beater_agent::ToolRegistry;
 use bytes::Bytes;
@@ -119,6 +120,7 @@ pub async fn serve(
         .route("/llms.txt", get(handle_llms))
         .route("/.well-known/beater.json", get(handle_well_known))
         .fallback(handle)
+        .layer(middleware::map_response(with_route_security_headers))
         .with_state(state);
     let addr = std::net::SocketAddr::from((host, port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -209,24 +211,20 @@ async fn handle_mcp_options(State(state): State<DevState>, headers: HeaderMap) -
 }
 
 async fn handle_robots(State(state): State<DevState>) -> Response<Body> {
-    text_response(StatusCode::OK, crawl::robots_txt(&state.base_url))
+    let routes: Vec<(String, Option<RouteMeta>)> = crawlable_routes(&state)
+        .await
+        .into_iter()
+        .map(|(pattern, _, meta)| (pattern, meta))
+        .collect();
+    text_response(StatusCode::OK, crawl::robots_txt(&state.base_url, &routes))
 }
 
-/// Static (non-parameterized) routes with their `agent` metadata resolved
-/// through the isolate — the shared input for sitemap.xml and llms.txt.
+/// Static page routes with their `agent` metadata resolved through the isolate
+/// — the shared input for sitemap.xml and llms.txt.
 async fn crawlable_routes(state: &DevState) -> Vec<(String, PathBuf, Option<RouteMeta>)> {
     let targets: Vec<(String, PathBuf, Option<String>)> = {
         let table = state.routes.read().await;
-        table
-            .iter()
-            .filter(|r| !r.segments.iter().any(|s| matches!(s, Segment::Param(_))))
-            .map(|r| {
-                let spec = deno_core::ModuleSpecifier::from_file_path(&r.file)
-                    .ok()
-                    .map(|s| s.to_string());
-                (r.pattern.clone(), r.file.clone(), spec)
-            })
-            .collect()
+        crawlable_route_targets(&table)
     };
     let mut routes = Vec::new();
     for (pattern, file, spec) in targets {
@@ -237,6 +235,25 @@ async fn crawlable_routes(state: &DevState) -> Vec<(String, PathBuf, Option<Rout
         routes.push((pattern, file, meta));
     }
     routes
+}
+
+fn crawlable_route_targets(table: &RouteTable) -> Vec<(String, PathBuf, Option<String>)> {
+    table
+        .iter()
+        .filter(|route| route.kind == RouteKind::Page)
+        .filter(|route| {
+            !route
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::Param(_)))
+        })
+        .map(|route| {
+            let spec = deno_core::ModuleSpecifier::from_file_path(&route.file)
+                .ok()
+                .map(|specifier| specifier.to_string());
+            (route.pattern.clone(), route.file.clone(), spec)
+        })
+        .collect()
 }
 
 async fn handle_sitemap(State(state): State<DevState>) -> Response<Body> {
@@ -283,38 +300,48 @@ async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
 
 async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    state
-        .worker_tx
-        .read()
-        .await
-        .send(WorkerMsg::RouteMeta {
-            specifier,
-            reply: reply_tx,
-        })
+    let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        send_worker_msg(
+            &state.worker_tx,
+            WorkerMsg::RouteMeta {
+                specifier,
+                reply: reply_tx,
+            },
+        )
         .await
         .ok()?;
-    match tokio::time::timeout(REQUEST_TIMEOUT, reply_rx).await {
-        Ok(Ok(Ok(meta))) => meta,
-        Ok(Ok(Err(e))) => {
+        reply_rx.await.ok()
+    })
+    .await
+    .ok()??;
+
+    match result {
+        Ok(meta) => meta,
+        Err(e) => {
             tracing::warn!("route meta failed: {e}");
             None
         }
-        _ => None,
     }
+}
+
+async fn send_worker_msg(
+    worker_tx: &Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    msg: WorkerMsg,
+) -> std::result::Result<(), mpsc::error::SendError<WorkerMsg>> {
+    let tx = worker_tx.read().await.clone();
+    tx.send(msg).await
 }
 
 // ---- route dispatch ---------------------------------------------------------
 
 async fn handle(State(state): State<DevState>, req: Request<Body>) -> Response<Body> {
-    let mut response = match handle_inner(state, req).await {
+    match handle_inner(state, req).await {
         Ok(resp) => resp,
         Err(e) => text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("beater internal error: {e:#}"),
         ),
-    };
-    apply_route_security_headers(&mut response);
-    response
+    }
 }
 
 async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Body>> {
@@ -397,18 +424,17 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
         page,
         reply: reply_tx,
     };
-    state
-        .worker_tx
-        .read()
-        .await
-        .send(msg)
-        .await
-        .map_err(|_| anyhow::anyhow!("js worker is gone"))?;
 
-    let result = tokio::time::timeout(REQUEST_TIMEOUT, reply_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("route handler timed out after {REQUEST_TIMEOUT:?}"))?
-        .map_err(|_| anyhow::anyhow!("js worker dropped the request (reloading?)"))?;
+    let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        send_worker_msg(&state.worker_tx, msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("js worker is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("js worker dropped the request (reloading?)"))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("route handler timed out after {REQUEST_TIMEOUT:?}"))??;
 
     match result {
         Ok(route_resp) => route_response_to_http(&state, head, route_resp).await,
@@ -422,17 +448,7 @@ async fn route_response_to_http(
     head: bool,
     route_resp: worker::RouteResponse,
 ) -> Result<Response<Body>> {
-    let uses_chunked_body = matches!(
-        &route_resp.body,
-        RouteBody::Chunks(_) | RouteBody::Stream { .. }
-    );
-    let mut builder = Response::builder().status(route_resp.status);
-    for (k, v) in &route_resp.headers {
-        if uses_chunked_body && k.eq_ignore_ascii_case("content-length") {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
+    let builder = route_response_builder(route_resp.status, &route_resp.headers, &route_resp.body);
     let body = match route_resp.body {
         RouteBody::Full(body) => {
             if head {
@@ -450,12 +466,11 @@ async fn route_response_to_http(
         }
         RouteBody::Stream { stream_id, rx } => {
             if head {
-                let _ = state
-                    .worker_tx
-                    .read()
-                    .await
-                    .send(WorkerMsg::CancelStream { stream_id })
-                    .await;
+                let _ = tokio::time::timeout(
+                    REQUEST_TIMEOUT,
+                    send_worker_msg(&state.worker_tx, WorkerMsg::CancelStream { stream_id }),
+                )
+                .await;
                 drop(rx);
                 empty_unknown_len_body()
             } else {
@@ -464,6 +479,28 @@ async fn route_response_to_http(
         }
     };
     Ok(builder.body(body)?)
+}
+
+fn route_response_builder(
+    status: u16,
+    headers: &HashMap<String, String>,
+    body: &RouteBody,
+) -> axum::http::response::Builder {
+    let full_body_len = match body {
+        RouteBody::Full(body) => Some(body.len()),
+        RouteBody::Chunks(_) | RouteBody::Stream { .. } => None,
+    };
+    let mut builder = Response::builder().status(status);
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    if let Some(len) = full_body_len {
+        builder = builder.header("content-length", len.to_string());
+    }
+    builder
 }
 
 async fn rsc_flight_response(
@@ -510,22 +547,23 @@ async fn rsc_flight_response(
     .to_string();
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    state
-        .worker_tx
-        .read()
-        .await
-        .send(WorkerMsg::RscFlight {
-            specifier: specifier.to_string(),
-            request_json,
-            reply: reply_tx,
-        })
+    let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        send_worker_msg(
+            &state.worker_tx,
+            WorkerMsg::RscFlight {
+                specifier: specifier.to_string(),
+                request_json,
+                reply: reply_tx,
+            },
+        )
         .await
         .map_err(|_| anyhow::anyhow!("js worker is gone"))?;
-
-    let result = tokio::time::timeout(REQUEST_TIMEOUT, reply_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("RSC flight stream timed out after {REQUEST_TIMEOUT:?}"))?
-        .map_err(|_| anyhow::anyhow!("js worker dropped the RSC flight request (reloading?)"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("js worker dropped the RSC flight request (reloading?)"))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("RSC flight stream timed out after {REQUEST_TIMEOUT:?}"))??;
 
     match result {
         Ok(route_resp) => route_response_to_http(state, head, route_resp).await,
@@ -643,14 +681,7 @@ fn route_response(route_resp: worker::RouteResponse) -> Result<Response<Body>, a
         headers,
         body,
     } = route_resp;
-    let uses_chunked_body = matches!(&body, RouteBody::Chunks(_) | RouteBody::Stream { .. });
-    let mut builder = Response::builder().status(status);
-    for (k, v) in &headers {
-        if uses_chunked_body && k.eq_ignore_ascii_case("content-length") {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
+    let builder = route_response_builder(status, &headers, &body);
     builder.body(route_body(body))
 }
 
@@ -673,6 +704,15 @@ fn chunks_body(chunks: Vec<String>) -> Body {
         .into_iter()
         .map(|chunk| Ok::<Bytes, Infallible>(Bytes::from(chunk)));
     Body::from_stream(stream::iter(chunks))
+}
+
+async fn with_route_security_headers(response: Response<Body>) -> Response<Body> {
+    secure_route_response(response)
+}
+
+fn secure_route_response(mut response: Response<Body>) -> Response<Body> {
+    apply_route_security_headers(&mut response);
+    response
 }
 
 fn apply_route_security_headers(response: &mut Response<Body>) {
@@ -721,14 +761,21 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use axum::body::Body;
-    use axum::http::{HeaderValue, Response, StatusCode};
+    use axum::http::{HeaderValue, Request, Response, StatusCode};
+    use axum::routing::get;
+    use axum::{Router, middleware};
+    use tokio::sync::{RwLock, mpsc};
+    use tower::ServiceExt;
 
     use super::{
         apply_route_security_headers, client_module_response, client_module_route_path,
-        find_client_module, find_rsc_server_module, route_response, route_response_body,
-        rsc_flight_route_path, text_response,
+        crawlable_route_targets, find_client_module, find_rsc_server_module, route_response,
+        route_response_body, rsc_flight_route_path, secure_route_response, send_worker_msg,
+        text_response, with_route_security_headers,
     };
     use crate::router::RouteTable;
     use crate::worker;
@@ -803,6 +850,116 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .contains("script-src 'self'")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_send_releases_reload_lock_while_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(worker::WorkerMsg::CancelStream { stream_id: 1 })
+            .unwrap();
+        let worker_tx = Arc::new(RwLock::new(tx));
+
+        let blocked_send = tokio::spawn({
+            let worker_tx = Arc::clone(&worker_tx);
+            async move {
+                send_worker_msg(&worker_tx, worker::WorkerMsg::CancelStream { stream_id: 2 }).await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        let mut guard = tokio::time::timeout(Duration::from_millis(100), worker_tx.write())
+            .await
+            .expect("blocked worker sends should not hold the reload write lock");
+        *guard = replacement_tx;
+        drop(guard);
+
+        match rx
+            .recv()
+            .await
+            .expect("initial message should remain queued")
+        {
+            worker::WorkerMsg::CancelStream { stream_id } => assert_eq!(stream_id, 1),
+            msg => panic!("unexpected worker message: {msg:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_millis(100), blocked_send)
+            .await
+            .expect("blocked send should finish after receiver capacity frees")
+            .expect("send task should not panic")
+            .expect("send should succeed");
+
+        let queued = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("blocked message should be queued on the original channel")
+            .expect("blocked message should be sent");
+        match queued {
+            worker::WorkerMsg::CancelStream { stream_id } => assert_eq!(stream_id, 2),
+            msg => panic!("unexpected worker message: {msg:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_agent_route_security_headers_preserve_existing_headers() {
+        let response = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "http://localhost:3000")
+            .header("content-security-policy", "default-src 'none'")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("test response should build: {error}"));
+
+        let response = secure_route_response(response);
+        let headers = response.headers();
+
+        assert_eq!(
+            headers.get("content-type"),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            headers.get("access-control-allow-origin"),
+            Some(&HeaderValue::from_static("http://localhost:3000"))
+        );
+        assert_eq!(
+            headers.get("content-security-policy"),
+            Some(&HeaderValue::from_static("default-src 'none'"))
+        );
+        assert_eq!(
+            headers.get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            headers.get("x-frame-options"),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+    }
+
+    #[tokio::test]
+    async fn route_security_layer_adds_headers_to_method_not_allowed() {
+        let app = Router::new()
+            .route("/robots.txt", get(|| async { "ok" }))
+            .layer(middleware::map_response(with_route_security_headers));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/robots.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            response.headers().get("x-frame-options"),
+            Some(&HeaderValue::from_static("DENY"))
         );
     }
 
@@ -913,6 +1070,28 @@ mod tests {
         assert!(find_rsc_server_module(app.path(), &table, Path::new("admin/secret")).is_none());
     }
 
+    #[test]
+    fn crawlable_routes_exclude_api_and_parameterized_routes() {
+        let app = TempDir::new("crawlable");
+        app.write("app/routes/index.tsx", "export default function Home() {}");
+        app.write("app/routes/about.tsx", "export default function About() {}");
+        app.write("app/routes/api/health.ts", "export function GET() {}");
+        app.write("app/routes/api/export.js", "export function GET() {}");
+        app.write(
+            "app/routes/blog/[slug].tsx",
+            "export default function BlogPost() {}",
+        );
+        let table = RouteTable::scan(app.path()).unwrap();
+
+        let mut patterns: Vec<_> = crawlable_route_targets(&table)
+            .into_iter()
+            .map(|(pattern, _, _)| pattern)
+            .collect();
+        patterns.sort();
+
+        assert_eq!(patterns, vec!["/", "/about"]);
+    }
+
     #[tokio::test]
     async fn client_module_response_serves_transpiled_javascript() {
         let app = TempDir::new("serve");
@@ -992,9 +1171,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_response_preserves_content_length_for_plain_body() {
+    async fn route_response_derives_content_length_for_plain_body() {
         let mut headers = HashMap::new();
-        headers.insert("content-length".to_string(), "10".to_string());
+        headers.insert("content-length".to_string(), "999".to_string());
 
         let response = route_response(worker::RouteResponse {
             status: 200,
@@ -1004,5 +1183,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.headers().get("content-length").unwrap(), "10");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"plain body");
     }
 }
