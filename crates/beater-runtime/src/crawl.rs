@@ -6,10 +6,31 @@ use serde_json::json;
 
 use crate::worker::RouteMeta;
 
-pub fn robots_txt(base_url: &str) -> String {
-    format!(
-        "User-agent: *\nAllow: /\n\nSitemap: {base_url}/sitemap.xml\n# agent-readable map: {base_url}/llms.txt\n# manifest: {base_url}/.well-known/beater.json\n"
-    )
+pub fn robots_txt(base_url: &str, routes: &[(String, Option<RouteMeta>)]) -> String {
+    let mut disallowed: Vec<&str> = routes
+        .iter()
+        .filter_map(|(pattern, meta)| {
+            if matches!(meta, Some(meta) if !meta.crawl) {
+                Some(pattern.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    disallowed.sort_unstable();
+    disallowed.dedup();
+
+    let mut out = String::from("User-agent: *\n");
+    if !disallowed.contains(&"/") {
+        out.push_str("Allow: /\n");
+    }
+    for path in disallowed {
+        out.push_str(&format!("Disallow: {path}\n"));
+    }
+    out.push_str(&format!(
+        "\nSitemap: {base_url}/sitemap.xml\n# agent-readable map: {base_url}/llms.txt\n# manifest: {base_url}/.well-known/beater.json\n"
+    ));
+    out
 }
 
 /// Crawlable routes (per their `agent` metadata) with lastmod from file mtime.
@@ -114,4 +135,56 @@ pub fn well_known(
         "llms": format!("{base_url}/llms.txt"),
         "agents": agents,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::robots_txt;
+    use crate::worker::RouteMeta;
+
+    fn meta(crawl: bool) -> Option<RouteMeta> {
+        Some(RouteMeta {
+            title: None,
+            description: None,
+            crawl,
+        })
+    }
+
+    #[test]
+    fn robots_txt_allows_all_when_no_routes_disable_crawling() {
+        let routes = vec![("/".to_string(), None), ("/docs".to_string(), meta(true))];
+
+        let robots = robots_txt("https://example.test", &routes);
+
+        assert!(robots.contains("Allow: /\n"));
+        assert!(!robots.contains("Disallow:"));
+        assert!(robots.contains("Sitemap: https://example.test/sitemap.xml"));
+    }
+
+    #[test]
+    fn robots_txt_disallows_routes_with_crawl_false() {
+        let routes = vec![
+            ("/".to_string(), None),
+            ("/admin".to_string(), meta(false)),
+            ("/docs".to_string(), meta(true)),
+            ("/admin".to_string(), meta(false)),
+        ];
+
+        let robots = robots_txt("https://example.test", &routes);
+
+        assert!(robots.contains("Allow: /\n"));
+        assert!(robots.contains("Disallow: /admin\n"));
+        assert!(!robots.contains("Disallow: /docs\n"));
+        assert_eq!(robots.matches("Disallow: /admin\n").count(), 1);
+    }
+
+    #[test]
+    fn robots_txt_omits_allow_all_when_root_disallows_crawling() {
+        let routes = vec![("/".to_string(), meta(false))];
+
+        let robots = robots_txt("https://example.test", &routes);
+
+        assert!(!robots.contains("Allow: /\n"));
+        assert!(robots.contains("Disallow: /\n"));
+    }
 }
