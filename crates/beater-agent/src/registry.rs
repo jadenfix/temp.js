@@ -1474,7 +1474,6 @@ def run(input):
         );
     }
 
-<<<<<<< HEAD
     #[test]
     fn python_tool_timeout_ms_is_configured() {
         let agent_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1504,8 +1503,6 @@ def run(input):
         assert!(format!("{error:#}").contains("timeoutMs"), "{error:#}");
     }
 
-=======
->>>>>>> origin/main
     #[tokio::test(flavor = "current_thread")]
     async fn remote_mcp_executes_with_bearer_and_declared_metadata() {
         let env = unique_env("BEATER_TEST_REMOTE_MCP_TOKEN");
