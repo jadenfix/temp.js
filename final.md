@@ -240,6 +240,7 @@ Phase C progress so far:
 - Remote MCP tools now treat malformed JSON-RPC bodies after HTTP 2xx as ambiguous for non-idempotent calls, and send the journaled `ToolCallContext.idempotency_key` as the provider-facing idempotency header.
 - Agent resume now converts failed idempotent tool re-runs and removed-tool lookups into `is_error` tool results, while still parking genuinely non-idempotent interrupted tools for review.
 - Direct `/mcp tools/call` requests now create synthetic MCP journal runs, commit a `tool_call` started row before executing side-effecting tools, and finish the row/run as completed, failed, or `needs_review` before returning the MCP tool result.
+- Dev hot reload now refreshes the agent/tool registry and agent metadata alongside routes and the worker, preserving the last good agent snapshot if a reload-time config rebuild fails.
 
 | # | Item | Done when |
 |---|---|---|

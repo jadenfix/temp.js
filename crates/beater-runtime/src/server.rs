@@ -19,6 +19,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use axum::middleware;
 use axum::routing::{Router, get, post};
+use beater_agent::BeatboxConfig;
 use beater_agent::ToolRegistry;
 use bytes::Bytes;
 use futures_util::{Stream, stream};
@@ -42,12 +43,26 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 struct DevState {
     routes: Arc<RwLock<RouteTable>>,
     worker_tx: Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
-    registry: Arc<ToolRegistry>,
+    agent_surfaces: Arc<RwLock<AgentSurfaces>>,
     app_name: String,
-    agents: Arc<Vec<String>>,
     base_url: String,
     mcp_access: mcp::AccessConfig,
     app_dir: PathBuf,
+}
+
+#[derive(Clone)]
+struct AgentSurfaces {
+    registry: Arc<ToolRegistry>,
+    agents: Arc<Vec<String>>,
+}
+
+impl AgentSurfaces {
+    fn new(registry: ToolRegistry, agents: Vec<String>) -> Self {
+        Self {
+            registry: Arc::new(registry),
+            agents: Arc::new(agents),
+        }
+    }
 }
 
 pub async fn serve(
@@ -100,15 +115,18 @@ pub async fn serve(
     let state = DevState {
         routes: Arc::new(RwLock::new(table)),
         worker_tx: Arc::new(RwLock::new(worker.tx)),
-        registry: Arc::new(registry),
+        agent_surfaces: Arc::new(RwLock::new(AgentSurfaces::new(registry, agents))),
         app_name: config.name.clone(),
-        agents: Arc::new(agents),
         base_url,
         mcp_access,
         app_dir: config.app_dir.clone(),
     };
 
-    spawn_reloader(config.app_dir.clone(), state.clone());
+    spawn_reloader(
+        config.app_dir.clone(),
+        config.beatbox.clone(),
+        state.clone(),
+    );
     let public_base_url = state.base_url.clone();
 
     let app = Router::new()
@@ -146,7 +164,16 @@ pub async fn serve(
 
 /// Watch app/ and agents/; on change, rescan routes and swap in a fresh
 /// isolate. The old worker drains and exits when its channel closes.
-fn spawn_reloader(app_dir: PathBuf, state: DevState) {
+fn is_ignored_reload_path(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(".beater") | Some("node_modules") | Some("target") | Some(".git")
+        )
+    })
+}
+
+fn spawn_reloader(app_dir: PathBuf, beatbox: BeatboxConfig, state: DevState) {
     let (tx, mut rx) = mpsc::channel::<()>(16);
     let watch_dir = app_dir.clone();
     std::thread::spawn(move || {
@@ -155,6 +182,8 @@ fn spawn_reloader(app_dir: PathBuf, state: DevState) {
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res
                     && (event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove())
+                    && (event.paths.is_empty()
+                        || event.paths.iter().any(|p| !is_ignored_reload_path(p)))
                 {
                     let _ = tx.blocking_send(());
                 }
@@ -165,13 +194,8 @@ fn spawn_reloader(app_dir: PathBuf, state: DevState) {
                     return;
                 }
             };
-        for sub in ["app", "agents"] {
-            let dir = watch_dir.join(sub);
-            if dir.is_dir()
-                && let Err(e) = watcher.watch(&dir, notify::RecursiveMode::Recursive)
-            {
-                tracing::error!("watch {}: {e}", dir.display());
-            }
+        if let Err(e) = watcher.watch(&watch_dir, notify::RecursiveMode::Recursive) {
+            tracing::error!("watch {}: {e}", watch_dir.display());
         }
         // keep the watcher alive forever; the dev process owns its lifetime
         std::thread::park();
@@ -182,14 +206,45 @@ fn spawn_reloader(app_dir: PathBuf, state: DevState) {
             // debounce editor save bursts
             tokio::time::sleep(Duration::from_millis(120)).await;
             while rx.try_recv().is_ok() {}
+            let mut reloaded_worker = false;
             match (RouteTable::scan(&app_dir), worker::spawn()) {
                 (Ok(table), Ok(worker)) => {
                     *state.routes.write().await = table;
                     *state.worker_tx.write().await = worker.tx;
-                    tracing::info!("reloaded (fresh isolate)");
+                    reloaded_worker = true;
                 }
                 (Err(e), _) => tracing::error!("reload: route scan failed: {e:#}"),
                 (_, Err(e)) => tracing::error!("reload: worker spawn failed: {e:#}"),
+            }
+            let app_dir_for_registry = app_dir.clone();
+            let beatbox_for_registry = beatbox.clone();
+            let registry_result = tokio::task::spawn_blocking(move || {
+                crate::build_registry(&app_dir_for_registry, &beatbox_for_registry)
+            })
+            .await;
+            let mut reloaded_agents = false;
+            match registry_result {
+                Ok(Ok((registry, agents))) => {
+                    *state.agent_surfaces.write().await = AgentSurfaces::new(registry, agents);
+                    reloaded_agents = true;
+                }
+                Ok(Err(e)) => tracing::error!(
+                    "reload: agent registry rebuild failed; keeping previous tools/agents: {e:#}"
+                ),
+                Err(e) if e.is_panic() => tracing::error!(
+                    "reload: agent registry rebuild panicked; keeping previous tools/agents: {e}"
+                ),
+                Err(e) => tracing::error!(
+                    "reload: agent registry rebuild task failed; keeping previous tools/agents: {e}"
+                ),
+            }
+            match (reloaded_worker, reloaded_agents) {
+                (true, true) => tracing::info!("reloaded (fresh isolate; refreshed agents)"),
+                (true, false) => {
+                    tracing::info!("reloaded (fresh isolate; previous agents retained)")
+                }
+                (false, true) => tracing::info!("reloaded agents (isolate unchanged)"),
+                (false, false) => {}
             }
         }
     });
@@ -202,8 +257,9 @@ async fn handle_mcp_post(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
+    let surfaces = agent_surfaces(&state).await;
     mcp::handle_post(
-        &state.registry,
+        &surfaces.registry,
         &state.mcp_access,
         &state.app_dir,
         &headers,
@@ -277,6 +333,7 @@ async fn handle_sitemap(State(state): State<DevState>) -> Response<Body> {
 }
 
 async fn handle_llms(State(state): State<DevState>) -> Response<Body> {
+    let surfaces = agent_surfaces(&state).await;
     let routes: Vec<(String, Option<RouteMeta>)> = crawlable_routes(&state)
         .await
         .into_iter()
@@ -288,17 +345,18 @@ async fn handle_llms(State(state): State<DevState>) -> Response<Body> {
             &state.app_name,
             &state.base_url,
             &routes,
-            &state.agents,
+            &surfaces.agents,
             &state.mcp_access,
         ),
     )
 }
 
 async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
+    let surfaces = agent_surfaces(&state).await;
     let manifest = crawl::well_known(
         &state.app_name,
         &state.base_url,
-        &state.agents,
+        &surfaces.agents,
         &state.mcp_access,
     );
     Response::builder()
@@ -306,6 +364,10 @@ async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
         .header("content-type", "application/json")
         .body(Body::from(manifest.to_string()))
         .expect("static response")
+}
+
+async fn agent_surfaces(state: &DevState) -> AgentSurfaces {
+    state.agent_surfaces.read().await.clone()
 }
 
 async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {

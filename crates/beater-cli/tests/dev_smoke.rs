@@ -135,6 +135,134 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
 }
 
 #[test]
+fn dev_server_hot_reloads_agent_registry_and_metadata() {
+    let port = free_port();
+    let workspace = workspace();
+    let temp = temp_dir("agent-hot-reload");
+    let app = temp.path.join("hello");
+    copy_dir_all(&workspace.join("examples/hello"), &app).expect("copy hello fixture");
+    let app = app.canonicalize().expect("canonicalize hello fixture");
+    std::fs::remove_dir_all(app.join("agents")).expect("remove initial agents dir");
+    let beater = beater_bin(&workspace);
+    let child = Command::new(beater)
+        .arg("dev")
+        .arg(&app)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("BEATER_BASE_URL")
+        .env_remove("BEATER_MCP_TOKEN")
+        .env_remove("BEATER_MCP_TRUSTED_ORIGINS")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn beater dev");
+    let _child = ChildGuard { child };
+
+    let health = wait_for_http(port, "GET", "/api/health", None);
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let tools_list_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let initial_tools =
+        http_request(port, "POST", "/mcp", Some(tools_list_body)).expect("POST tools/list");
+    assert!(initial_tools.starts_with("HTTP/1.1 200"), "{initial_tools}");
+    assert!(
+        !initial_tools.contains("hot_reload_echo"),
+        "{initial_tools}"
+    );
+    let initial_manifest =
+        http_request(port, "GET", "/.well-known/beater.json", None).expect("GET manifest");
+    assert!(
+        initial_manifest.contains("\"agents\":[]"),
+        "{initial_manifest}"
+    );
+    assert!(
+        !initial_manifest.contains("\"support\""),
+        "{initial_manifest}"
+    );
+    assert!(!initial_manifest.contains("\"ops\""), "{initial_manifest}");
+
+    std::fs::create_dir_all(app.join("agents/support/tools"))
+        .expect("create support tools dir after server start");
+    std::fs::write(
+        app.join("agents/support/tools/hot_reload_echo.py"),
+        r#"
+TOOL = {
+    "description": "Echo a value after agent hot reload.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+    },
+}
+
+def run(input):
+    return {"echo": input["value"]}
+"#,
+    )
+    .expect("write hot reload python tool");
+    std::fs::write(
+        app.join("agents/support/agent.ts"),
+        r#"
+import { defineAgent, pyTool, rustTool } from "beater:agent";
+
+export default defineAgent({
+  name: "support",
+  model: "claude-opus-4-8",
+  system: "Hot reload test support agent.",
+  tools: [
+    rustTool("get_time"),
+    pyTool("hot_reload_echo", "./tools/hot_reload_echo.py", { idempotent: true }),
+  ],
+});
+"#,
+    )
+    .expect("rewrite support agent");
+    std::fs::create_dir_all(app.join("agents/ops")).expect("create ops agent dir");
+    std::fs::write(
+        app.join("agents/ops/agent.ts"),
+        r#"
+import { defineAgent } from "beater:agent";
+
+export default defineAgent({
+  name: "ops",
+  model: "claude-opus-4-8",
+  system: "Hot reload test ops agent.",
+  tools: [],
+});
+"#,
+    )
+    .expect("write ops agent");
+
+    let reloaded_tools = wait_for_http_contains(
+        port,
+        "POST",
+        "/mcp",
+        Some(tools_list_body),
+        "hot_reload_echo",
+    );
+    assert!(reloaded_tools.contains("get_time"), "{reloaded_tools}");
+    let call = wait_for_http_contains(
+        port,
+        "POST",
+        "/mcp",
+        Some(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hot_reload_echo","arguments":{"value":"fresh"}}}"#,
+        ),
+        "fresh",
+    );
+    assert!(call.contains("\"isError\":false"), "{call}");
+
+    let manifest = wait_for_http_contains(port, "GET", "/.well-known/beater.json", None, "\"ops\"");
+    assert!(manifest.contains("\"support\""), "{manifest}");
+    let llms = wait_for_http_contains(port, "GET", "/llms.txt", None, "ops");
+    assert!(llms.contains("support"), "{llms}");
+}
+
+#[test]
 fn dev_server_refuses_remote_mcp_without_bearer_token() {
     let port = free_port();
     let workspace = workspace();
@@ -863,6 +991,26 @@ fn temp_dir(label: &str) -> TempDirGuard {
     TempDirGuard { path }
 }
 
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name == ".beater" {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(file_name);
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn wait_for_http(port: u16, method: &str, path: &str, body: Option<&str>) -> String {
     let started = Instant::now();
     let mut last_error = None;
@@ -876,6 +1024,31 @@ fn wait_for_http(port: u16, method: &str, path: &str, body: Option<&str>) -> Str
     }
     panic!(
         "server did not become ready on port {port}; last response/error: {:?}",
+        last_error
+    );
+}
+
+fn wait_for_http_contains(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    needle: &str,
+) -> String {
+    let started = Instant::now();
+    let mut last_error = None;
+    while started.elapsed() < Duration::from_secs(30) {
+        match http_request(port, method, path, body) {
+            Ok(response) if response.starts_with("HTTP/1.1 200") && response.contains(needle) => {
+                return response;
+            }
+            Ok(response) => last_error = Some(response),
+            Err(e) => last_error = Some(e.to_string()),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "server response on {method} {path} did not contain {needle:?}; last response/error: {:?}",
         last_error
     );
 }
