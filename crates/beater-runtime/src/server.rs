@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
+use axum::middleware;
 use axum::routing::{Router, get, post};
 use beater_agent::ToolRegistry;
 use bytes::Bytes;
@@ -119,6 +120,7 @@ pub async fn serve(
         .route("/llms.txt", get(handle_llms))
         .route("/.well-known/beater.json", get(handle_well_known))
         .fallback(handle)
+        .layer(middleware::map_response(with_route_security_headers))
         .with_state(state);
     let addr = std::net::SocketAddr::from((host, port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -209,24 +211,20 @@ async fn handle_mcp_options(State(state): State<DevState>, headers: HeaderMap) -
 }
 
 async fn handle_robots(State(state): State<DevState>) -> Response<Body> {
-    text_response(StatusCode::OK, crawl::robots_txt(&state.base_url))
+    let routes: Vec<(String, Option<RouteMeta>)> = crawlable_routes(&state)
+        .await
+        .into_iter()
+        .map(|(pattern, _, meta)| (pattern, meta))
+        .collect();
+    text_response(StatusCode::OK, crawl::robots_txt(&state.base_url, &routes))
 }
 
-/// Static (non-parameterized) routes with their `agent` metadata resolved
-/// through the isolate — the shared input for sitemap.xml and llms.txt.
+/// Static page routes with their `agent` metadata resolved through the isolate
+/// — the shared input for sitemap.xml and llms.txt.
 async fn crawlable_routes(state: &DevState) -> Vec<(String, PathBuf, Option<RouteMeta>)> {
     let targets: Vec<(String, PathBuf, Option<String>)> = {
         let table = state.routes.read().await;
-        table
-            .iter()
-            .filter(|r| !r.segments.iter().any(|s| matches!(s, Segment::Param(_))))
-            .map(|r| {
-                let spec = deno_core::ModuleSpecifier::from_file_path(&r.file)
-                    .ok()
-                    .map(|s| s.to_string());
-                (r.pattern.clone(), r.file.clone(), spec)
-            })
-            .collect()
+        crawlable_route_targets(&table)
     };
     let mut routes = Vec::new();
     for (pattern, file, spec) in targets {
@@ -237,6 +235,25 @@ async fn crawlable_routes(state: &DevState) -> Vec<(String, PathBuf, Option<Rout
         routes.push((pattern, file, meta));
     }
     routes
+}
+
+fn crawlable_route_targets(table: &RouteTable) -> Vec<(String, PathBuf, Option<String>)> {
+    table
+        .iter()
+        .filter(|route| route.kind == RouteKind::Page)
+        .filter(|route| {
+            !route
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::Param(_)))
+        })
+        .map(|route| {
+            let spec = deno_core::ModuleSpecifier::from_file_path(&route.file)
+                .ok()
+                .map(|specifier| specifier.to_string());
+            (route.pattern.clone(), route.file.clone(), spec)
+        })
+        .collect()
 }
 
 async fn handle_sitemap(State(state): State<DevState>) -> Response<Body> {
@@ -318,15 +335,13 @@ async fn send_worker_msg(
 // ---- route dispatch ---------------------------------------------------------
 
 async fn handle(State(state): State<DevState>, req: Request<Body>) -> Response<Body> {
-    let mut response = match handle_inner(state, req).await {
+    match handle_inner(state, req).await {
         Ok(resp) => resp,
         Err(e) => text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("beater internal error: {e:#}"),
         ),
-    };
-    apply_route_security_headers(&mut response);
-    response
+    }
 }
 
 async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Body>> {
@@ -691,6 +706,15 @@ fn chunks_body(chunks: Vec<String>) -> Body {
     Body::from_stream(stream::iter(chunks))
 }
 
+async fn with_route_security_headers(response: Response<Body>) -> Response<Body> {
+    secure_route_response(response)
+}
+
+fn secure_route_response(mut response: Response<Body>) -> Response<Body> {
+    apply_route_security_headers(&mut response);
+    response
+}
+
 fn apply_route_security_headers(response: &mut Response<Body>) {
     let headers = response.headers_mut();
     headers
@@ -741,13 +765,17 @@ mod tests {
     use std::time::Duration;
 
     use axum::body::Body;
-    use axum::http::{HeaderValue, Response, StatusCode};
+    use axum::http::{HeaderValue, Request, Response, StatusCode};
+    use axum::routing::get;
+    use axum::{Router, middleware};
     use tokio::sync::{RwLock, mpsc};
+    use tower::ServiceExt;
 
     use super::{
         apply_route_security_headers, client_module_response, client_module_route_path,
-        find_client_module, find_rsc_server_module, route_response, route_response_body,
-        rsc_flight_route_path, send_worker_msg, text_response,
+        crawlable_route_targets, find_client_module, find_rsc_server_module, route_response,
+        route_response_body, rsc_flight_route_path, secure_route_response, send_worker_msg,
+        text_response, with_route_security_headers,
     };
     use crate::router::RouteTable;
     use crate::worker;
@@ -872,6 +900,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_agent_route_security_headers_preserve_existing_headers() {
+        let response = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "http://localhost:3000")
+            .header("content-security-policy", "default-src 'none'")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("test response should build: {error}"));
+
+        let response = secure_route_response(response);
+        let headers = response.headers();
+
+        assert_eq!(
+            headers.get("content-type"),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            headers.get("access-control-allow-origin"),
+            Some(&HeaderValue::from_static("http://localhost:3000"))
+        );
+        assert_eq!(
+            headers.get("content-security-policy"),
+            Some(&HeaderValue::from_static("default-src 'none'"))
+        );
+        assert_eq!(
+            headers.get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            headers.get("x-frame-options"),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+    }
+
+    #[tokio::test]
+    async fn route_security_layer_adds_headers_to_method_not_allowed() {
+        let app = Router::new()
+            .route("/robots.txt", get(|| async { "ok" }))
+            .layer(middleware::map_response(with_route_security_headers));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/robots.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            response.headers().get("x-frame-options"),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+    }
+
     struct TempDir {
         path: PathBuf,
     }
@@ -977,6 +1068,28 @@ mod tests {
         let table = RouteTable::scan(app.path()).unwrap();
 
         assert!(find_rsc_server_module(app.path(), &table, Path::new("admin/secret")).is_none());
+    }
+
+    #[test]
+    fn crawlable_routes_exclude_api_and_parameterized_routes() {
+        let app = TempDir::new("crawlable");
+        app.write("app/routes/index.tsx", "export default function Home() {}");
+        app.write("app/routes/about.tsx", "export default function About() {}");
+        app.write("app/routes/api/health.ts", "export function GET() {}");
+        app.write("app/routes/api/export.js", "export function GET() {}");
+        app.write(
+            "app/routes/blog/[slug].tsx",
+            "export default function BlogPost() {}",
+        );
+        let table = RouteTable::scan(app.path()).unwrap();
+
+        let mut patterns: Vec<_> = crawlable_route_targets(&table)
+            .into_iter()
+            .map(|(pattern, _, _)| pattern)
+            .collect();
+        patterns.sort();
+
+        assert_eq!(patterns, vec!["/", "/about"]);
     }
 
     #[tokio::test]
