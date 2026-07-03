@@ -828,5 +828,4 @@ mod tests {
         assert_eq!(err.to_string(), WORKER_SHUTDOWN_STREAM_ERROR);
         assert!(rx.try_recv().is_err());
     }
-
 }
