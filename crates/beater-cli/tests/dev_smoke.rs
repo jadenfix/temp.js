@@ -387,7 +387,7 @@ fn dev_server_requires_mcp_bearer_token_when_configured() {
     );
     assert!(manifest.contains("\"required\":true"), "{manifest}");
     assert!(
-        manifest.contains("\"trustedOrigins\":[\"https://ops.example.test\"]"),
+        !manifest.contains("https://ops.example.test") && !manifest.contains("trustedOrigins"),
         "{manifest}"
     );
 
