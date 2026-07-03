@@ -57,7 +57,7 @@ pub fn dev(
 }
 
 /// Merge every agent's tools into the registry served over /mcp.
-fn build_registry(
+pub(crate) fn build_registry(
     app_dir: &Path,
     beatbox: &beater_agent::BeatboxConfig,
 ) -> Result<(beater_agent::ToolRegistry, Vec<String>)> {
