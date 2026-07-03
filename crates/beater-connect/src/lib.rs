@@ -426,7 +426,7 @@ impl ConnectApp {
         writeln!(out, "  }},").ok();
         writeln!(out, "  \"skills\": [").ok();
         let mut rows = Vec::new();
-        for resource in &self.resources {
+        for resource in self.public_resources() {
             rows.push(format!(
                 "    {{ \"id\": \"read_{}\", \"name\": \"Read {}\", \"description\": \"{}\", \"tags\": [\"resource\"] }}",
                 json_escape(&resource.id),
@@ -510,7 +510,7 @@ impl ConnectApp {
         writeln!(out, "  \"server\": \"{}\",", json_escape(&self.name)).ok();
         writeln!(out, "  \"resources\": [").ok();
         let mut resource_rows = Vec::new();
-        for resource in &self.resources {
+        for resource in self.public_resources() {
             resource_rows.push(format!(
                 "    {{ \"uri\": \"beater://resource/{}\", \"name\": \"{}\", \"description\": \"{}\", \"mimeType\": \"text/markdown\", \"href\": \"{}\" }}",
                 json_escape(&resource.id),
@@ -582,7 +582,7 @@ impl ConnectApp {
         writeln!(out).ok();
         writeln!(out, "## Resources").ok();
         writeln!(out).ok();
-        for resource in &self.resources {
+        for resource in self.public_resources() {
             writeln!(
                 out,
                 "- [{}]({}{}): {}",
@@ -624,7 +624,7 @@ impl ConnectApp {
             "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"
         )
         .ok();
-        for resource in self.resources.iter().filter(|resource| resource.public) {
+        for resource in self.public_resources() {
             writeln!(out, "  <url>").ok();
             writeln!(
                 out,
@@ -659,8 +659,9 @@ impl ConnectApp {
         let inner = " ".repeat(indent + 2);
         let mut out = String::new();
         writeln!(out, "[").ok();
-        for (index, resource) in self.resources.iter().enumerate() {
-            let comma = if index + 1 == self.resources.len() {
+        let resources = self.public_resources().collect::<Vec<_>>();
+        for (index, resource) in resources.iter().enumerate() {
+            let comma = if index + 1 == resources.len() {
                 ""
             } else {
                 ","
@@ -696,6 +697,10 @@ impl ConnectApp {
         }
         write!(out, "{pad}]").ok();
         out
+    }
+
+    fn public_resources(&self) -> impl Iterator<Item = &Resource> {
+        self.resources.iter().filter(|resource| resource.public)
     }
 
     fn actions_json(&self, indent: usize) -> String {
@@ -758,7 +763,7 @@ impl ConnectApp {
 
     fn openapi_path_rows(&self) -> Vec<String> {
         let mut paths = Vec::new();
-        for resource in &self.resources {
+        for resource in self.public_resources() {
             push_openapi_operation(
                 &mut paths,
                 &resource.path,
@@ -1152,20 +1157,39 @@ mod tests {
     }
 
     #[test]
-    fn private_resources_are_not_added_to_sitemap() {
-        let app = ConnectApp::new("Private", "Private app", "https://example.com").resource(
-            Resource::new(
-                "orders",
-                "Orders",
-                "Private orders.",
-                "/orders",
-                "/orders.md",
-            )
-            .public(false),
-        );
+    fn private_resources_are_not_added_to_agent_surfaces() {
+        let app = ConnectApp::new("Private", "Private app", "https://example.com")
+            .resource(Resource::new(
+                "docs",
+                "Docs",
+                "Public docs.",
+                "/docs",
+                "/docs.md",
+            ))
+            .resource(
+                Resource::new(
+                    "orders",
+                    "Orders",
+                    "Private orders.",
+                    "/orders",
+                    "/orders.md",
+                )
+                .public(false),
+            );
 
-        let sitemap = app.sitemap_xml();
-        assert!(!sitemap.contains("/orders"));
+        for surface in [
+            app.beater_manifest_json(),
+            app.agent_card_json(),
+            app.openapi_json(),
+            app.mcp_catalog_json(),
+            app.llms_txt(),
+            app.sitemap_xml(),
+        ] {
+            assert!(surface.contains("docs"), "{surface}");
+            assert!(!surface.contains("orders"), "{surface}");
+            assert!(!surface.contains("/orders"), "{surface}");
+            assert!(!surface.contains("Private orders."), "{surface}");
+        }
     }
 
     #[test]
