@@ -190,19 +190,20 @@ async fn resume_async(
                             && s.status == "completed"
                             && s.tool_use_id.as_deref() == Some(id)
                     });
-                    let content = match done {
-                        Some(s) => s
-                            .result
-                            .as_ref()
-                            .and_then(|r| r["content"].as_str())
-                            .unwrap_or_default()
-                            .to_string(),
+                    let tool_result = match done {
+                        Some(s) => {
+                            let content = s
+                                .result
+                                .as_ref()
+                                .and_then(|r| r["content"].as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            json!({"type": "tool_result", "tool_use_id": id, "content": content})
+                        }
                         None => {
-                            let tool = ctx
-                                .registry
-                                .get(name)
-                                .with_context(|| format!("no tool {name}"))?;
-                            if !tool.idempotent {
+                            if let Some(tool) = ctx.registry.get(name)
+                                && !tool.idempotent
+                            {
                                 ctx.journal.set_run_status(run_id, "needs_review")?;
                                 println!(
                                     "run {run_id} needs review: tool {name} ({id}) may have executed \
@@ -220,13 +221,30 @@ async fn resume_async(
                                 "resuming: re-running interrupted tool {name} (attempt {})",
                                 prior_attempts + 1
                             );
-                            execute_tool_step(ctx, name, id, &tu["input"], prior_attempts + 1)
-                                .await?
+                            match execute_tool_step(ctx, name, id, &tu["input"], prior_attempts + 1)
+                                .await
+                            {
+                                Ok(content) => {
+                                    json!({"type": "tool_result", "tool_use_id": id, "content": content})
+                                }
+                                Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
+                                    println!("← needs review: {e:#}");
+                                    ctx.journal.set_run_status(run_id, "needs_review")?;
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    println!("← tool error: {e:#}");
+                                    json!({
+                                        "type": "tool_result",
+                                        "tool_use_id": id,
+                                        "content": format!("Error: {e:#}"),
+                                        "is_error": true,
+                                    })
+                                }
+                            }
                         }
                     };
-                    tool_results.push(
-                        json!({"type": "tool_result", "tool_use_id": id, "content": content}),
-                    );
+                    tool_results.push(tool_result);
                 }
                 messages.push(json!({"role": "user", "content": tool_results}));
                 messages
@@ -870,6 +888,97 @@ def run(input):
             tool_steps[1].request["idempotency_key"],
             "beater:run-1:tool:toolu_1"
         );
+    }
+
+    #[test]
+    fn resume_turns_failed_idempotent_tool_rerun_into_error_result() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("idempotent-error");
+        seed_interrupted_tool_run_for(&app, "echo", json!({"missing": "value"}));
+        let server = MockAnthropic::new(vec![json!({
+            "content": [{"type": "text", "text": "handled tool error"}],
+            "stop_reason": "end_turn",
+        })]);
+        let _env = EnvGuard::set(&server.base_url);
+
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_str(&requests[0]).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let tool_result = &messages.last().unwrap()["content"][0];
+        assert_eq!(tool_result["tool_use_id"], "toolu_1");
+        assert_eq!(tool_result["is_error"], true);
+        assert!(
+            tool_result["content"].as_str().unwrap().contains("Error:"),
+            "{tool_result}"
+        );
+
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        let tool_steps: Vec<_> = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .filter(|step| {
+                step.kind == "tool_call" && step.tool_use_id.as_deref() == Some("toolu_1")
+            })
+            .collect();
+        assert_eq!(tool_steps.len(), 2);
+        assert_eq!(tool_steps[0].status, "started");
+        assert_eq!(tool_steps[1].status, "failed");
+        assert_eq!(tool_steps[1].attempt, 2);
+    }
+
+    #[test]
+    fn resume_turns_removed_tool_rerun_into_error_result() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("removed-tool");
+        seed_interrupted_tool_run_for(&app, "old.echo", json!({"value": "ok"}));
+        let server = MockAnthropic::new(vec![json!({
+            "content": [{"type": "text", "text": "handled missing tool"}],
+            "stop_reason": "end_turn",
+        })]);
+        let _env = EnvGuard::set(&server.base_url);
+
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_str(&requests[0]).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let tool_result = &messages.last().unwrap()["content"][0];
+        assert_eq!(tool_result["tool_use_id"], "toolu_1");
+        assert_eq!(tool_result["is_error"], true);
+        assert!(
+            tool_result["content"]
+                .as_str()
+                .unwrap()
+                .contains("no tool named old.echo"),
+            "{tool_result}"
+        );
+
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        let tool_steps: Vec<_> = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .filter(|step| step.kind == "tool_call")
+            .collect();
+        assert_eq!(tool_steps.len(), 2);
+        assert_eq!(tool_steps[0].tool_name.as_deref(), Some("old.echo"));
+        assert_eq!(tool_steps[0].status, "started");
+        assert_eq!(tool_steps[1].tool_name.as_deref(), Some("old.echo"));
+        assert_eq!(tool_steps[1].status, "failed");
+        assert_eq!(tool_steps[1].attempt, 2);
     }
 
     #[test]
