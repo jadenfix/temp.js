@@ -237,6 +237,7 @@ Phase C progress so far:
 - Dropping an SSR/RSC response body before it reaches EOF now sends `CancelStream` to the owning worker, so disconnected clients do not leave stalled stream state registered indefinitely.
 - SSR/RSC stream chunks now cross from the isolate to the HTTP body through a bounded async channel, the local `ReadableStream` shim exposes queue pressure through `desiredSize`, and stale timer clears no longer accumulate cancellation ids in long-lived workers.
 - Remote MCP tools now treat malformed JSON-RPC bodies after HTTP 2xx as ambiguous for non-idempotent calls, and send the journaled `ToolCallContext.idempotency_key` as the provider-facing idempotency header.
+- Agent resume now converts failed idempotent tool re-runs and removed-tool lookups into `is_error` tool results, while still parking genuinely non-idempotent interrupted tools for review.
 
 | # | Item | Done when |
 |---|---|---|
