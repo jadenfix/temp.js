@@ -4,12 +4,18 @@
   const ops = core.ops;
 
   function fmt(x) {
-    if (typeof x === "string") return x;
-    if (x instanceof Error) return x.stack ?? String(x);
     try {
-      return JSON.stringify(x);
-    } catch {
+      if (typeof x === "string") return x;
+      if (x instanceof Error) return x.stack ?? String(x);
+      try {
+        const json = JSON.stringify(x);
+        if (json !== undefined) return json;
+      } catch {
+        // Fall back to String below.
+      }
       return String(x);
+    } catch {
+      return "<unprintable>";
     }
   }
 
@@ -21,12 +27,37 @@
     debug: (...args) => core.print(args.map(fmt).join(" ") + "\n", false),
   };
 
+  core.setUnhandledPromiseRejectionHandler((_promise, reason) => {
+    try {
+      console.error("Unhandled promise rejection:", reason);
+    } catch {
+      core.print("Unhandled promise rejection: <unprintable>\n", true);
+    }
+    return true;
+  });
+
+  function reportAsyncError(error) {
+    try {
+      console.error("Uncaught async callback error:", error);
+    } catch {
+      core.print("Uncaught async callback error: <unprintable>\n", true);
+    }
+  }
+
+  function callTimerCallback(cb, args) {
+    try {
+      cb(...args);
+    } catch (error) {
+      reportAsyncError(error);
+    }
+  }
+
   let nextTimerId = 1;
   const cancelledTimers = new Set();
   globalThis.setTimeout = (cb, ms = 0, ...args) => {
     const id = nextTimerId++;
     ops.op_beater_sleep(ms).then(() => {
-      if (!cancelledTimers.delete(id)) cb(...args);
+      if (!cancelledTimers.delete(id)) callTimerCallback(cb, args);
     });
     return id;
   };
@@ -42,7 +73,7 @@
           cancelledTimers.delete(id);
           return;
         }
-        cb(...args);
+        callTimerCallback(cb, args);
       }
     })();
     return id;
