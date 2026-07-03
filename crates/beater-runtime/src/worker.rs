@@ -480,3 +480,78 @@ fn format_core_error(err: CoreError) -> String {
         other => format!("{other}"),
     }
 }
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+
+    fn runtime_with_bootstrap() -> JsRuntime {
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            module_loader: Some(Rc::new(BeaterModuleLoader)),
+            extensions: vec![beater_ext::init()],
+            ..Default::default()
+        });
+        runtime
+            .execute_script("beater:bootstrap", include_str!("bootstrap.js"))
+            .expect("bootstrap.js must evaluate");
+        runtime
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unhandled_rejections_are_reported_without_poisoning_the_runtime() {
+        let mut runtime = runtime_with_bootstrap();
+        runtime
+            .execute_script(
+                "beater:unhandled-rejection",
+                "Promise.reject(new Error('stray rejection'));",
+            )
+            .expect("schedule unhandled rejection");
+        runtime
+            .run_event_loop(Default::default())
+            .await
+            .expect("handled unhandled rejection should not fail the event loop");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unprintable_unhandled_rejections_are_still_handled() {
+        let mut runtime = runtime_with_bootstrap();
+        runtime
+            .execute_script(
+                "beater:unprintable-rejection",
+                r#"
+                const badObject = {
+                  toJSON() { throw new Error("toJSON exploded"); },
+                  [Symbol.toPrimitive]() { throw new Error("toPrimitive exploded"); },
+                  toString() { throw new Error("toString exploded"); },
+                };
+                Promise.reject(badObject);
+
+                const badError = new Error("bad stack");
+                Object.defineProperty(badError, "stack", {
+                  get() { throw new Error("stack exploded"); },
+                });
+                Promise.reject(badError);
+                "#,
+            )
+            .expect("schedule unprintable rejection");
+        runtime
+            .run_event_loop(Default::default())
+            .await
+            .expect("unprintable rejection should not fail the event loop");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn throwing_timer_callbacks_are_reported_without_rejecting_timer_promises() {
+        let mut runtime = runtime_with_bootstrap();
+        runtime
+            .execute_script(
+                "beater:throwing-timer",
+                "setTimeout(() => { throw new Error('timer boom'); }, 0);",
+            )
+            .expect("schedule throwing timer");
+        runtime
+            .run_event_loop(Default::default())
+            .await
+            .expect("throwing timer callback should not fail the event loop");
+    }
+}
