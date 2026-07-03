@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::loader::BeaterModuleLoader;
 
+const WORKER_SHUTDOWN_STREAM_ERROR: &str = "js worker shut down before stream completed";
+
 #[derive(Debug)]
 pub enum WorkerMsg {
     Route {
@@ -180,7 +182,10 @@ async fn worker_main(mut rx: mpsc::Receiver<WorkerMsg>) {
 
             tokio::select! {
                 maybe_msg = rx.recv() => {
-                    let Some(msg) = maybe_msg else { break };
+                    let Some(msg) = maybe_msg else {
+                        fail_active_streams_for_shutdown(&mut runtime);
+                        break;
+                    };
                     handle_worker_msg(&mut runtime, &mut next_stream_id, msg).await;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {}
@@ -258,6 +263,10 @@ fn fail_active_streams(runtime: &mut JsRuntime, error: String) {
     for (_, tx) in streams {
         let _ = tx.send(Err(io::Error::other(error.clone())));
     }
+}
+
+fn fail_active_streams_for_shutdown(runtime: &mut JsRuntime) {
+    fail_active_streams(runtime, WORKER_SHUTDOWN_STREAM_ERROR.to_string());
 }
 
 async fn dispatch_api(
@@ -478,5 +487,37 @@ fn format_core_error(err: CoreError) -> String {
     match *err.0 {
         CoreErrorKind::Js(js) => format_js_error(&js),
         other => format!("{other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use deno_core::{JsRuntime, RuntimeOptions};
+
+    use super::{
+        WORKER_SHUTDOWN_STREAM_ERROR, active_streams, beater_ext, fail_active_streams_for_shutdown,
+        register_page_stream,
+    };
+
+    #[test]
+    fn shutdown_failure_aborts_active_streams() {
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            extensions: vec![beater_ext::init()],
+            ..Default::default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_page_stream(&mut runtime, 7, tx);
+
+        assert!(active_streams(&runtime));
+
+        fail_active_streams_for_shutdown(&mut runtime);
+
+        assert!(!active_streams(&runtime));
+        let err = rx
+            .try_recv()
+            .expect("stream should receive a shutdown result")
+            .expect_err("shutdown should abort the stream");
+        assert_eq!(err.to_string(), WORKER_SHUTDOWN_STREAM_ERROR);
+        assert!(rx.try_recv().is_err());
     }
 }
