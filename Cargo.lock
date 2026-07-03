@@ -304,6 +304,7 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
+ "uuid",
  "walkdir",
 ]
 
