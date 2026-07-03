@@ -202,7 +202,14 @@ async fn handle_mcp_post(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    mcp::handle_post(&state.registry, &state.mcp_access, &headers, &body).await
+    mcp::handle_post(
+        &state.registry,
+        &state.mcp_access,
+        &state.app_dir,
+        &headers,
+        &body,
+    )
+    .await
 }
 
 async fn handle_mcp_get(State(state): State<DevState>, headers: HeaderMap) -> Response<Body> {

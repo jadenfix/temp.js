@@ -21,6 +21,11 @@ struct Ctx {
     run_id: String,
 }
 
+pub struct JournaledToolCall {
+    pub seq: i64,
+    pub context: ToolCallContext,
+}
+
 fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -364,14 +369,15 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>) -> Result<()> {
 }
 
 /// Journal-wrapped tool execution: started row committed before the tool runs.
-async fn execute_tool_step(
-    ctx: &Ctx,
+pub fn start_journaled_tool_call(
+    journal: &Journal,
+    run_id: &str,
     name: &str,
     tool_use_id: &str,
     input: &Value,
     attempt: i64,
-) -> Result<String> {
-    let idempotency_key = tool_idempotency_key(&ctx.run_id, tool_use_id);
+    idempotency_key: Option<String>,
+) -> Result<JournaledToolCall> {
     let request = match &idempotency_key {
         Some(key) => json!({
             "name": name,
@@ -381,30 +387,69 @@ async fn execute_tool_step(
         }),
         None => json!({"name": name, "input": input, "tool_use_id": tool_use_id}),
     };
-    let seq = ctx.journal.start_step(
-        &ctx.run_id,
+    let seq = journal.start_step(
+        run_id,
         "tool_call",
         &request,
         Some(name),
         Some(tool_use_id),
         attempt,
     )?;
-    let tool_context = ToolCallContext {
-        tool_use_id: Some(tool_use_id.to_string()),
+    Ok(JournaledToolCall {
+        seq,
+        context: ToolCallContext {
+            tool_use_id: Some(tool_use_id.to_string()),
+            idempotency_key,
+        },
+    })
+}
+
+pub fn complete_journaled_tool_call(
+    journal: &Journal,
+    run_id: &str,
+    seq: i64,
+    result: &str,
+) -> Result<()> {
+    journal.complete_step(run_id, seq, &json!({"content": result}))
+}
+
+pub fn fail_journaled_tool_call(
+    journal: &Journal,
+    run_id: &str,
+    seq: i64,
+    error: &str,
+) -> Result<()> {
+    journal.fail_step(run_id, seq, error)
+}
+
+async fn execute_tool_step(
+    ctx: &Ctx,
+    name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    attempt: i64,
+) -> Result<String> {
+    let idempotency_key = tool_idempotency_key(&ctx.run_id, tool_use_id);
+    let call = start_journaled_tool_call(
+        &ctx.journal,
+        &ctx.run_id,
+        name,
+        tool_use_id,
+        input,
+        attempt,
         idempotency_key,
-    };
+    )?;
     match ctx
         .registry
-        .execute_with_context(name, input, &tool_context)
+        .execute_with_context(name, input, &call.context)
         .await
     {
         Ok(result) => {
-            ctx.journal
-                .complete_step(&ctx.run_id, seq, &json!({"content": result}))?;
+            complete_journaled_tool_call(&ctx.journal, &ctx.run_id, call.seq, &result)?;
             Ok(result)
         }
         Err(e) => {
-            ctx.journal.fail_step(&ctx.run_id, seq, &format!("{e:#}"))?;
+            fail_journaled_tool_call(&ctx.journal, &ctx.run_id, call.seq, &format!("{e:#}"))?;
             Err(e)
         }
     }

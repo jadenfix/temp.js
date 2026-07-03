@@ -8,6 +8,7 @@
 //! single JSON object back.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 
 use axum::body::Body;
 use axum::http::header::{
@@ -20,7 +21,10 @@ use deno_core::url::{Host, Url};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use beater_agent::{ToolCallContext, ToolRegistry};
+use beater_agent::{
+    Journal, ToolNeedsReview, ToolRegistry, complete_journaled_tool_call, fail_journaled_tool_call,
+    start_journaled_tool_call,
+};
 
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 pub const DEFAULT_TOKEN_ENV: &str = "BEATER_MCP_TOKEN";
@@ -177,6 +181,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 pub async fn handle_post(
     registry: &ToolRegistry,
     access: &AccessConfig,
+    app_dir: &Path,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Response<Body> {
@@ -225,7 +230,7 @@ pub async fn handle_post(
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools_json(registry)})),
-        "tools/call" => tools_call(registry, &params).await,
+        "tools/call" => tools_call(registry, app_dir, &params).await,
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
@@ -303,7 +308,11 @@ fn tools_json(registry: &ToolRegistry) -> Value {
     )
 }
 
-async fn tools_call(registry: &ToolRegistry, params: &Value) -> Result<Value, (i64, String)> {
+async fn tools_call(
+    registry: &ToolRegistry,
+    app_dir: &Path,
+    params: &Value,
+) -> Result<Value, (i64, String)> {
     let name = params["name"]
         .as_str()
         .ok_or((-32602, "tools/call requires params.name".to_string()))?;
@@ -312,27 +321,89 @@ async fn tools_call(registry: &ToolRegistry, params: &Value) -> Result<Value, (i
         return Err((-32602, format!("unknown tool: {name}")));
     }
     // Tool failures are results with isError, not protocol errors.
-    let context = ToolCallContext {
-        tool_use_id: Some(mcp_tool_use_id()),
-        idempotency_key: None,
+    let tool_use_id = mcp_tool_use_id();
+    let run_id = mcp_run_id();
+    let idempotency_key = Some(mcp_tool_idempotency_key(&run_id, &tool_use_id));
+    let call = {
+        let journal = open_journal(app_dir)?;
+        journal
+            .create_run(
+                &run_id,
+                "mcp",
+                &json!({
+                    "method": "tools/call",
+                    "name": name,
+                    "arguments": arguments,
+                    "tool_use_id": tool_use_id,
+                })
+                .to_string(),
+            )
+            .map_err(journal_error)?;
+        start_journaled_tool_call(
+            &journal,
+            &run_id,
+            name,
+            &tool_use_id,
+            &arguments,
+            1,
+            idempotency_key,
+        )
+        .map_err(journal_error)?
     };
     match registry
-        .execute_with_context(name, &arguments, &context)
+        .execute_with_context(name, &arguments, &call.context)
         .await
     {
-        Ok(result) => Ok(json!({
-            "content": [{"type": "text", "text": result}],
-            "isError": false,
-        })),
-        Err(e) => Ok(json!({
-            "content": [{"type": "text", "text": format!("Error: {e:#}")}],
-            "isError": true,
-        })),
+        Ok(result) => {
+            let journal = open_journal(app_dir)?;
+            complete_journaled_tool_call(&journal, &run_id, call.seq, &result)
+                .map_err(journal_error)?;
+            journal
+                .set_run_status(&run_id, "completed")
+                .map_err(journal_error)?;
+            Ok(json!({
+                "content": [{"type": "text", "text": result}],
+                "isError": false,
+            }))
+        }
+        Err(e) => {
+            let status = if e.downcast_ref::<ToolNeedsReview>().is_some() {
+                "needs_review"
+            } else {
+                "failed"
+            };
+            let journal = open_journal(app_dir)?;
+            fail_journaled_tool_call(&journal, &run_id, call.seq, &format!("{e:#}"))
+                .map_err(journal_error)?;
+            journal
+                .set_run_status(&run_id, status)
+                .map_err(journal_error)?;
+            Ok(json!({
+                "content": [{"type": "text", "text": format!("Error: {e:#}")}],
+                "isError": true,
+            }))
+        }
     }
 }
 
 fn mcp_tool_use_id() -> String {
     format!("beater:mcp:{}", Uuid::new_v4())
+}
+
+fn mcp_run_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn mcp_tool_idempotency_key(run_id: &str, tool_use_id: &str) -> String {
+    format!("beater:{run_id}:tool:{tool_use_id}")
+}
+
+fn open_journal(app_dir: &Path) -> Result<Journal, (i64, String)> {
+    Journal::open(app_dir).map_err(journal_error)
+}
+
+fn journal_error(error: anyhow::Error) -> (i64, String) {
+    (-32000, format!("journal error: {error:#}"))
 }
 
 fn http_response(status: StatusCode, body: Value) -> Response<Body> {
@@ -375,9 +446,10 @@ fn with_cors(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -385,10 +457,36 @@ mod tests {
     use axum::http::header::{AUTHORIZATION, ORIGIN};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
-    use beater_agent::{ToolDecl, ToolRegistry};
+    use beater_agent::{Journal, ToolDecl, ToolRegistry};
     use serde_json::{Value, json};
 
     use super::{AccessConfig, handle_get, handle_options, handle_post, mcp_tool_use_id};
+
+    struct TempApp {
+        path: PathBuf,
+    }
+
+    impl TempApp {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "beater-mcp-{name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempApp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn origin_policy_accepts_loopback_and_rejects_prefix_spoofing() {
@@ -440,6 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_token_is_required_when_configured() {
+        let app = TempApp::new("auth-required");
         let registry = ToolRegistry::empty();
         let access = AccessConfig::new(Some("secret".to_string()), Vec::new());
         let headers = HeaderMap::new();
@@ -447,6 +546,7 @@ mod tests {
         let response = handle_post(
             &registry,
             &access,
+            app.path(),
             &headers,
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         )
@@ -461,6 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_token_allows_mcp_requests() {
+        let app = TempApp::new("auth-allows");
         let registry = ToolRegistry::empty();
         let access = AccessConfig::new(Some("secret".to_string()), Vec::new());
         let mut headers = HeaderMap::new();
@@ -469,6 +570,7 @@ mod tests {
         let response = handle_post(
             &registry,
             &access,
+            app.path(),
             &headers,
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         )
@@ -479,6 +581,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_token_requires_exact_match() {
+        let app = TempApp::new("auth-exact");
         let registry = ToolRegistry::empty();
         let access = AccessConfig::new(Some("secret".to_string()), Vec::new());
         let mut headers = HeaderMap::new();
@@ -487,6 +590,7 @@ mod tests {
         let response = handle_post(
             &registry,
             &access,
+            app.path(),
             &headers,
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         )
@@ -509,6 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_call_uses_unique_namespaced_remote_mcp_context_ids() {
+        let app = TempApp::new("remote-context-ids");
         let remote = MockRemoteMcp::new_many(vec![
             json!({
             "jsonrpc": "2.0",
@@ -536,6 +641,7 @@ mod tests {
         let first_response = handle_post(
             &registry,
             &AccessConfig::default(),
+            app.path(),
             &HeaderMap::new(),
             br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"crm.lookup","arguments":{"email":"a@example.com"}}}"#,
         )
@@ -543,6 +649,7 @@ mod tests {
         let second_response = handle_post(
             &registry,
             &AccessConfig::default(),
+            app.path(),
             &HeaderMap::new(),
             br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"crm.lookup","arguments":{"email":"b@example.com"}}}"#,
         )
@@ -568,12 +675,128 @@ mod tests {
         assert_ne!(first_id, "1");
         assert_ne!(second_id, "1");
         assert_ne!(first_id, second_id);
-        assert_eq!(first_key, first_id);
-        assert_eq!(second_key, second_id);
+        assert!(first_key.starts_with("beater:"), "{first_key}");
+        assert!(second_key.starts_with("beater:"), "{second_key}");
+        assert!(first_key.ends_with(first_id), "{first_key}");
+        assert!(second_key.ends_with(second_id), "{second_key}");
+        assert_ne!(first_key, first_id);
+        assert_ne!(second_key, second_id);
+        assert_ne!(first_key, second_key);
         assert_eq!(first_body["params"]["name"], "lookup_contact");
         assert_eq!(second_body["params"]["name"], "lookup_contact");
         assert_eq!(first_body["params"]["arguments"]["email"], "a@example.com");
         assert_eq!(second_body["params"]["arguments"]["email"], "b@example.com");
+    }
+
+    #[tokio::test]
+    async fn tools_call_journals_successful_tool_execution() {
+        let app = TempApp::new("journal-success");
+        let registry = ToolRegistry::build(Path::new(""), &[rust_decl("get_time")])
+            .expect("rust builtin registry should build");
+
+        let response = handle_post(
+            &registry,
+            &AccessConfig::default(),
+            app.path(),
+            &HeaderMap::new(),
+            br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"get_time","arguments":{}}}"#,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["id"], "1");
+        assert_eq!(body["result"]["isError"], false);
+
+        let journal = Journal::open(app.path()).unwrap();
+        let runs = journal.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let (run, step_count) = &runs[0];
+        assert_eq!(run.agent, "mcp");
+        assert_eq!(run.status, "completed");
+        assert_eq!(*step_count, 1);
+        assert!(run.input.contains("\"method\":\"tools/call\""));
+        assert!(run.input.contains("\"name\":\"get_time\""));
+
+        let steps = journal.steps(&run.id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, "tool_call");
+        assert_eq!(steps[0].status, "completed");
+        assert_eq!(steps[0].tool_name.as_deref(), Some("get_time"));
+        let tool_use_id = steps[0].tool_use_id.as_deref().unwrap();
+        assert!(tool_use_id.starts_with("beater:mcp:"), "{tool_use_id}");
+        assert_eq!(steps[0].request["name"], "get_time");
+        assert_eq!(steps[0].request["tool_use_id"], tool_use_id);
+        assert_eq!(
+            steps[0].request["idempotency_key"],
+            format!("beater:{}:tool:{tool_use_id}", run.id)
+        );
+        assert!(steps[0].result.as_ref().unwrap()["content"].is_string());
+    }
+
+    #[tokio::test]
+    async fn tools_call_journals_failed_tool_execution() {
+        let app = TempApp::new("journal-failed");
+        let remote = MockRemoteMcp::new_many(vec![json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "result": {
+                "content": [{"type": "text", "text": "denied"}],
+                "isError": true
+            }
+        })]);
+        let registry = ToolRegistry::build(
+            Path::new(""),
+            &[remote_decl_with_idempotent(
+                "crm.lookup",
+                &remote.endpoint,
+                true,
+            )],
+        )
+        .expect("remote MCP registry should build");
+
+        let response = handle_post(
+            &registry,
+            &AccessConfig::default(),
+            app.path(),
+            &HeaderMap::new(),
+            br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"crm.lookup","arguments":{"email":"blocked@example.com"}}}"#,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["id"], "1");
+        assert_eq!(body["result"]["isError"], true);
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("returned isError"),
+            "{body}"
+        );
+
+        let journal = Journal::open(app.path()).unwrap();
+        let runs = journal.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let (run, step_count) = &runs[0];
+        assert_eq!(run.agent, "mcp");
+        assert_eq!(run.status, "failed");
+        assert_eq!(*step_count, 1);
+
+        let steps = journal.steps(&run.id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, "tool_call");
+        assert_eq!(steps[0].status, "failed");
+        assert_eq!(steps[0].tool_name.as_deref(), Some("crm.lookup"));
+        assert!(
+            steps[0].result.as_ref().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("returned isError"),
+            "{:?}",
+            steps[0].result
+        );
     }
 
     #[test]
@@ -643,7 +866,20 @@ mod tests {
         );
     }
 
+    fn rust_decl(name: &str) -> ToolDecl {
+        serde_json::from_value(json!({
+            "kind": "rust",
+            "name": name,
+            "idempotent": true,
+        }))
+        .unwrap()
+    }
+
     fn remote_decl(name: &str, endpoint: &str) -> ToolDecl {
+        remote_decl_with_idempotent(name, endpoint, false)
+    }
+
+    fn remote_decl_with_idempotent(name: &str, endpoint: &str, idempotent: bool) -> ToolDecl {
         let egress = endpoint
             .strip_prefix("http://")
             .expect("test endpoint should be http")
@@ -662,7 +898,7 @@ mod tests {
             "endpoint": endpoint,
             "tool": "lookup_contact",
             "timeoutMs": 1000,
-            "idempotent": false,
+            "idempotent": idempotent,
             "retry": {"attempts": 2, "backoffMs": 1, "idempotencyKey": "tool_use_id"},
             "egress": [egress]
         }))
