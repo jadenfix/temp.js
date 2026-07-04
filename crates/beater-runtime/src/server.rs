@@ -112,6 +112,7 @@ pub async fn serve(
         .route("/sitemap.xml", get(handle_sitemap))
         .route("/llms.txt", get(handle_llms))
         .route("/.well-known/beater.json", get(handle_well_known))
+        .route("/_beater/client.js", get(handle_client_bundle))
         .fallback(handle)
         .with_state(state);
     let addr = std::net::SocketAddr::from((host, port));
@@ -275,6 +276,72 @@ async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
         .expect("static response")
 }
 
+async fn handle_client_bundle(State(state): State<DevState>, req: Request<Body>) -> Response<Body> {
+    let route_path = client_route_path(req.uri().query());
+    let Some(specifier) = client_route_specifier(&state, &route_path).await else {
+        return text_response(
+            StatusCode::NOT_FOUND,
+            format!("no page route for client bundle: {route_path}"),
+        );
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .worker_tx
+        .read()
+        .await
+        .send(WorkerMsg::ClientBundle {
+            specifier,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "js worker is gone".to_string(),
+        );
+    }
+
+    match tokio::time::timeout(REQUEST_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(Some(source)))) => javascript_response(StatusCode::OK, source),
+        Ok(Ok(Ok(None))) => {
+            javascript_response(StatusCode::OK, "// no client export\n".to_string())
+        }
+        Ok(Ok(Err(stack))) => text_response(StatusCode::INTERNAL_SERVER_ERROR, stack),
+        Ok(Err(_)) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "js worker dropped the client bundle request (reloading?)".to_string(),
+        ),
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("client bundle timed out after {REQUEST_TIMEOUT:?}"),
+        ),
+    }
+}
+
+fn client_route_path(query: Option<&str>) -> String {
+    query
+        .and_then(|query| {
+            deno_core::url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "route")
+                .map(|(_, value)| value.into_owned())
+        })
+        .filter(|path| path.starts_with('/') && !path.chars().any(char::is_control))
+        .unwrap_or_else(|| "/".to_string())
+}
+
+async fn client_route_specifier(state: &DevState, route_path: &str) -> Option<String> {
+    let table = state.routes.read().await;
+    let (route, _) = table.match_path(route_path)?;
+    if route.kind != RouteKind::Page {
+        return None;
+    }
+    deno_core::ModuleSpecifier::from_file_path(&route.file)
+        .ok()
+        .map(|specifier| specifier.to_string())
+}
+
 async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
     let (reply_tx, reply_rx) = oneshot::channel();
     state
@@ -366,14 +433,17 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
         serde_json::Value::String(String::from_utf8_lossy(&body_bytes).into_owned())
     };
 
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string();
+    let script_nonce = page.then(|| uuid::Uuid::new_v4().simple().to_string());
     let request_json = json!({
-        "id": NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string(),
+        "id": request_id,
         "method": method,
         "path": path,
         "params": params,
         "query": query,
         "headers": headers,
         "body": body,
+        "scriptNonce": script_nonce.as_deref(),
     })
     .to_string();
 
@@ -441,7 +511,11 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
                     }
                 }
             };
-            Ok(builder.body(body)?)
+            let mut response = builder.body(body)?;
+            if page && let Some(script_nonce) = script_nonce.as_deref() {
+                apply_page_security_headers(&mut response, script_nonce);
+            }
+            Ok(response)
         }
         // JS error: readable, source-mapped stack in the dev response
         Err(stack) => Ok(text_response(StatusCode::INTERNAL_SERVER_ERROR, stack)),
@@ -516,8 +590,30 @@ fn apply_route_security_headers(response: &mut Response<Body>) {
         ));
 }
 
+fn apply_page_security_headers(response: &mut Response<Body>, script_nonce: &str) {
+    let csp = format!(
+        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'nonce-{script_nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'"
+    );
+    response
+        .headers_mut()
+        .entry("content-security-policy")
+        .or_insert(
+            HeaderValue::from_str(&csp).expect("generated page CSP should be a valid header"),
+        );
+}
+
 fn empty_unknown_len_body() -> Body {
     Body::from_stream(stream::empty::<Result<Bytes, Infallible>>())
+}
+
+fn javascript_response(status: StatusCode, body: String) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/javascript; charset=utf-8")
+        .header("cache-control", "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(body))
+        .expect("static response")
 }
 
 fn text_response(status: StatusCode, body: String) -> Response<Body> {
@@ -535,7 +631,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::{HeaderValue, Response, StatusCode};
 
-    use super::{apply_route_security_headers, route_response, route_response_body, text_response};
+    use super::{
+        apply_page_security_headers, apply_route_security_headers, client_route_path,
+        route_response, route_response_body, text_response,
+    };
     use crate::worker;
 
     #[test]
@@ -590,6 +689,36 @@ mod tests {
             response.headers().get("content-security-policy"),
             Some(&HeaderValue::from_static("default-src 'none'"))
         );
+    }
+
+    #[test]
+    fn page_security_headers_allow_self_scripts_and_nonce() {
+        let mut response = Response::builder()
+            .status(200)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("test response should build: {error}"));
+
+        apply_page_security_headers(&mut response, "abc123");
+        apply_route_security_headers(&mut response);
+
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(csp.contains("script-src 'self' 'nonce-abc123'"));
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+    }
+
+    #[test]
+    fn client_route_path_defaults_and_requires_absolute_paths() {
+        assert_eq!(client_route_path(None), "/");
+        assert_eq!(client_route_path(Some("route=%2F")), "/");
+        assert_eq!(client_route_path(Some("route=%2Fusers%2F42")), "/users/42");
+        assert_eq!(client_route_path(Some("route=relative")), "/");
+        assert_eq!(client_route_path(Some("route=%2F%0Aalert(1)")), "/");
     }
 
     #[test]

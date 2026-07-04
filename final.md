@@ -65,7 +65,7 @@ The work below is not just about matching Node/Next request handling. The end st
 
 **Primary PR sequence:**
 - [x] Add streaming React SSR over the worker chunk channel and prove shell-before-delayed-subtree delivery.
-- [ ] Add client hydration with a per-route client bundle.
+- [x] Add client hydration with a per-route client bundle.
 - [ ] Add RSC flight protocol over the same chunk channel.
 - [ ] Add npm/node-compat adoption wedge.
 - [ ] Add isolate pool behind the existing worker protocol.
@@ -100,6 +100,7 @@ The work below is not just about matching Node/Next request handling. The end st
 | Agent config pipeline | `agent.ts` (via `beater:agent` shim) evaluates in a one-shot isolate → JSON config → Rust registry; Python TOOL metadata loads through embedded CPython |
 | Durability machinery (code) | SQLite journal with started/completed/failed lifecycle + attempts; resume logic for dangling LLM calls and idempotent-only tool re-runs; `needs_review` parking |
 | Streaming SSR | `scripts/streaming-ssr-gate.sh` starts `beater dev`, reads the raw HTTP socket, and proved shell marker at 0.026s before Suspense-delayed marker at 0.489s while `/api/health` returned in 0.002s |
+| Client hydration | `scripts/client-hydration-gate.sh` starts `beater dev`, verifies `/_beater/client.js?route=%2F`, drives headless Chrome over CDP, and proved the hello counter clicked from 0 to 2 |
 
 ---
 
@@ -213,7 +214,7 @@ The through-line is not just parity with Node/Next; it is an agent-native runtim
 | # | Item | Done when |
 |---|---|---|
 | 1 | **Streaming SSR** — renderToReadableStream over the chunked worker channel | **done:** `scripts/streaming-ssr-gate.sh` proved the shell chunk arrived before the Suspense-delayed subtree chunk |
-| 2 | **Client hydration** — per-route client bundle (`/_beater/client.js`) | a counter button on index.tsx works in a browser |
+| 2 | **Client hydration** — per-route client bundle (`/_beater/client.js`) | **done:** `scripts/client-hydration-gate.sh` proved the index counter works in headless Chrome (`before=0 after=2`) |
 | 3 | **RSC** — flight protocol over the same chunked channel | server components with client islands render + hydrate |
 | 4 | **npm/node-compat** — the adoption wedge (Deno-style compat layer, not a reimplementation) | `import { z } from "zod"` works in a route |
 | 5 | **Isolate pool** — N workers behind the existing channel protocol | wrk shows near-linear scaling to core count |

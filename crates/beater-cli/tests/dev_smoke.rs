@@ -68,7 +68,31 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         home.contains("content-security-policy: default-src 'self'"),
         "{home}"
     );
+    assert!(
+        home.contains("script-src 'self' 'nonce-"),
+        "page CSP should allow self-hosted scripts and nonce React streaming scripts: {home}"
+    );
+    assert!(
+        home.contains("data-beater-counter=\"true\"") || home.contains("data-beater-counter=\"\""),
+        "home should include the hydration counter SSR marker: {home}"
+    );
+    assert!(
+        home.contains("src=\"/_beater/client.js?route=%2F\""),
+        "home should reference the route client bundle: {home}"
+    );
     assert!(home.contains("x-content-type-options: nosniff"), "{home}");
+
+    let client_js =
+        http_request(port, "GET", "/_beater/client.js?route=%2F", None).expect("GET client bundle");
+    assert!(client_js.starts_with("HTTP/1.1 200"), "{client_js}");
+    assert!(
+        client_js.contains("content-type: application/javascript"),
+        "{client_js}"
+    );
+    assert!(
+        client_js.contains("data-beater-counter"),
+        "client bundle should contain the route counter hydrator: {client_js}"
+    );
 
     let missing = http_request(port, "GET", "/not-a-route", None).expect("GET /not-a-route");
     assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");

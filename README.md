@@ -22,6 +22,7 @@ Pre-alpha, built in the open. Current milestone progress:
 - [x] **M2** — durable agent loop + embedded-Python tools + step-lifecycle journal (code complete; live-API kill-9/resume gate pending an `ANTHROPIC_API_KEY`)
 - [x] **M3** — MCP server endpoint (spec 2025-11-25, verified with the official MCP inspector) + agent-ready crawl layer (robots.txt, sitemap.xml, llms.txt, .well-known manifest — auto-generated from the route table)
 - [x] **M4** — streamed React 19 SSR (`renderToReadableStream`; shell chunks flush before Suspense-delayed subtrees)
+- [x] **Phase C hydration** — per-route browser bundle at `/_beater/client.js`; the hello counter hydrates and clicks in Chrome
 
 ## Quickstart (target DX)
 

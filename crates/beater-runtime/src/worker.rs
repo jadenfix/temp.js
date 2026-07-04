@@ -35,6 +35,12 @@ pub enum WorkerMsg {
         specifier: String,
         reply: oneshot::Sender<Result<Option<RouteMeta>, String>>,
     },
+    /// Build a route-scoped browser entry from the route module's optional
+    /// `client` export.
+    ClientBundle {
+        specifier: String,
+        reply: oneshot::Sender<Result<Option<String>, String>>,
+    },
     CancelStream {
         stream_id: u32,
     },
@@ -206,6 +212,10 @@ async fn handle_worker_msg(runtime: &mut JsRuntime, next_stream_id: &mut u32, ms
         }
         WorkerMsg::RouteMeta { specifier, reply } => {
             let result = route_meta(runtime, &specifier).await;
+            let _ = reply.send(result);
+        }
+        WorkerMsg::ClientBundle { specifier, reply } => {
+            let result = client_bundle(runtime, &specifier).await;
             let _ = reply.send(result);
         }
         WorkerMsg::CancelStream { stream_id } => {
@@ -389,6 +399,24 @@ async fn route_meta(runtime: &mut JsRuntime, specifier: &str) -> Result<Option<R
     deno_core::scope!(scope, runtime);
     let local = v8::Local::new(scope, global);
     deno_core::serde_v8::from_v8(scope, local).map_err(|e| format!("bad agent metadata: {e}"))
+}
+
+async fn client_bundle(runtime: &mut JsRuntime, specifier: &str) -> Result<Option<String>, String> {
+    let code = format!(
+        "globalThis.__beaterClientBundle({})",
+        serde_json::Value::String(specifier.to_string()),
+    );
+    let promise = runtime
+        .execute_script("beater:client-bundle", code)
+        .map_err(|e| format_js_error(&e))?;
+    let resolved = runtime.resolve(promise);
+    let global = runtime
+        .with_event_loop_promise(resolved, PollEventLoopOptions::default())
+        .await
+        .map_err(format_core_error)?;
+    deno_core::scope!(scope, runtime);
+    let local = v8::Local::new(scope, global);
+    deno_core::serde_v8::from_v8(scope, local).map_err(|e| format!("bad client bundle: {e}"))
 }
 
 /// Render a JS exception with its (source-mapped) stack for dev output.
