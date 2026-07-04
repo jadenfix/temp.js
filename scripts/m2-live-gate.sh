@@ -316,4 +316,8 @@ run_crash_resume \
 
 write_evidence
 echo "wrote evidence manifest to $EVIDENCE"
-echo "M2 live gate passed"
+if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then
+  echo "M2 gate passed against $ANTHROPIC_BASE_URL"
+else
+  echo "M2 live gate passed"
+fi

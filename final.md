@@ -31,6 +31,7 @@ The work below is not just about matching Node/Next request handling. The end st
 **Primary PR sequence:**
 - [x] Add the slow-tool fixtures for A2 with the smallest possible example-app surface.
 - [x] Make `scripts/m2-live-gate.sh` self-recording: raw transcripts plus `evidence.md`.
+- [x] Add a process-level mock rehearsal for the M2 gate using `ANTHROPIC_BASE_URL`.
 - [ ] Run and record A3 happy path with the live Anthropic API.
 - [ ] Run and record A4 crash/resume idempotent proof.
 - [ ] Run and record A5 non-idempotent `needs_review` proof.
@@ -101,6 +102,7 @@ The work below is not just about matching Node/Next request handling. The end st
 | Agent config pipeline | `agent.ts` (via `beater:agent` shim) evaluates in a one-shot isolate → JSON config → Rust registry; Python TOOL metadata loads through embedded CPython |
 | Durability machinery (code) | SQLite journal with started/completed/failed lifecycle + attempts; resume logic for dangling LLM calls and idempotent-only tool re-runs; `needs_review` parking |
 | M2 crash/resume fixtures | `slow_summarize.py` and `slow_summarize_once.py` are declared from `examples/hello/agents/support/agent.ts`; `scripts/m2-live-gate.sh` drives A3-A5 once `ANTHROPIC_API_KEY` is present and writes raw transcripts plus `evidence.md` |
+| M2 mock gate rehearsal | `BEATER_BIN=<existing beater binary> node scripts/m2-mock-gate.cjs` passed locally on 2026-07-02, driving `scripts/m2-live-gate.sh` through a local `ANTHROPIC_BASE_URL` mock and producing A3/A4/A5 evidence under `target/m2-mock-gate/...`; this does not claim live Anthropic coverage |
 | Streaming SSR | `scripts/streaming-ssr-gate.sh` starts `beater dev`, reads the raw HTTP socket, and proved shell marker at 0.026s before Suspense-delayed marker at 0.489s while `/api/health` returned in 0.002s |
 | Client hydration | `/_beater/client/index.js` serves `app/routes/index.client.ts`; the hello page loads it as a module and `scripts/client-hydration-gate.cjs` verifies the counter increments in a browser |
 | RSC transport foundation | `/_beater/rsc/index.flight` serves `app/routes/index.server.tsx` as `text/x-component` frames over the worker stream channel; `scripts/rsc-flight-gate.cjs` verifies the browser renders the server island and the client counter still hydrates |
@@ -126,6 +128,10 @@ Once the key is present and `./target/debug/beater` is built, `scripts/m2-live-g
 **Done.** `examples/hello/agents/support/tools/slow_summarize.py` waits before returning and is declared in `agent.ts` as `pyTool("slow_summarize", "./tools/slow_summarize.py", { idempotent: true })`. `slow_summarize_once.py` covers the non-idempotent path with `idempotent: false`. These fixtures are also included in the `beater new` hello template.
 
 A3-A5 are still pending until the live gate is run with `ANTHROPIC_API_KEY` against the real Anthropic Messages API.
+
+### A2b. Mock rehearsal: same gate, local Messages API
+
+`scripts/m2-mock-gate.cjs` copies the hello app into `target/m2-mock-gate/`, starts a local mock Anthropic Messages API, sets `ANTHROPIC_BASE_URL`, and runs `scripts/m2-live-gate.sh`. This rehearses the CLI process flow, kill-9 timing, resume behavior, evidence manifest writing, and journal queries without spending live API calls or polluting the checked-in example app's journal. It is useful before the key is available, but it is not completion evidence for A3-A5.
 
 ### A3. Gate 1 — happy path (TS agent → Rust loop → Python tool → LLM)
 
