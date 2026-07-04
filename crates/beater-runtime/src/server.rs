@@ -113,6 +113,7 @@ pub async fn serve(
                 .get(handle_mcp_get)
                 .options(handle_mcp_options),
         )
+        .route("/_beater/client.js", get(handle_client_bundle))
         .route("/robots.txt", get(handle_robots))
         .route("/sitemap.xml", get(handle_sitemap))
         .route("/llms.txt", get(handle_llms))
@@ -278,6 +279,24 @@ async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
         .header("content-type", "application/json")
         .body(Body::from(manifest.to_string()))
         .expect("static response")
+}
+
+async fn handle_client_bundle(State(state): State<DevState>, req: Request<Body>) -> Response<Body> {
+    let routes = state.routes.read().await;
+    let mut response = match client_bundle_response(
+        &state.app_dir,
+        &routes,
+        req.method().as_str(),
+        req.uri().query(),
+    ) {
+        Ok(response) => response,
+        Err(error) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("beater internal error: {error:#}"),
+        ),
+    };
+    apply_route_security_headers(&mut response);
+    response
 }
 
 async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
@@ -491,6 +510,57 @@ fn client_module_response(app_dir: &Path, method: &str, path: &str) -> Result<Re
         .map_err(Into::into)
 }
 
+fn client_bundle_response(
+    app_dir: &Path,
+    routes: &RouteTable,
+    method: &str,
+    query: Option<&str>,
+) -> Result<Response<Body>> {
+    if method != "GET" && method != "HEAD" {
+        return Ok(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "client bundles are GET-only".to_string(),
+        ));
+    }
+
+    let Some(route_path) = client_bundle_route_path(app_dir, routes, query) else {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "client bundle not found".to_string(),
+        ));
+    };
+    let client_path = format!(
+        "/_beater/client/{}.js",
+        route_path
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    client_module_response(app_dir, method, &client_path)
+}
+
+fn client_bundle_route_path(
+    app_dir: &Path,
+    routes: &RouteTable,
+    query: Option<&str>,
+) -> Option<PathBuf> {
+    let route = query
+        .and_then(|query| {
+            deno_core::url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "route")
+                .map(|(_, value)| value.into_owned())
+        })
+        .unwrap_or_else(|| "/".to_string());
+    if !route.starts_with('/') || route.chars().any(char::is_control) {
+        return None;
+    }
+    let (route, _) = routes.match_path(&route)?;
+    let routes_dir = app_dir.join("app").join("routes");
+    let route_path = route.file.strip_prefix(routes_dir).ok()?.with_extension("");
+    Some(route_path.to_path_buf())
+}
+
 fn client_module_route_path(path: &str) -> Option<PathBuf> {
     let rel = path
         .strip_prefix(CLIENT_MODULE_PREFIX)?
@@ -616,9 +686,11 @@ mod tests {
     use axum::http::{HeaderValue, Response, StatusCode};
 
     use super::{
-        apply_route_security_headers, client_module_response, client_module_route_path,
-        find_client_module, route_response, route_response_body, text_response,
+        apply_route_security_headers, client_bundle_response, client_bundle_route_path,
+        client_module_response, client_module_route_path, find_client_module, route_response,
+        route_response_body, text_response,
     };
+    use crate::router::RouteTable;
     use crate::worker;
 
     #[test]
@@ -777,6 +849,94 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("document.body.dataset.count"));
         assert!(!body.contains(": number"));
+    }
+
+    #[test]
+    fn client_bundle_route_paths_are_resolved_through_route_table() {
+        let app = TempDir::new("bundle-paths");
+        app.write("app/routes/index.tsx", "export default function Home() {}");
+        app.write(
+            "app/routes/index.client.ts",
+            "document.body.dataset.home = 'ok';",
+        );
+        app.write(
+            "app/routes/users/[id].tsx",
+            "export default function User() {}",
+        );
+        app.write(
+            "app/routes/users/[id].client.ts",
+            "document.body.dataset.user = 'ok';",
+        );
+
+        let routes = RouteTable::scan(app.path()).unwrap();
+        assert_eq!(
+            client_bundle_route_path(app.path(), &routes, Some("route=%2F")).as_deref(),
+            Some(Path::new("index"))
+        );
+        assert_eq!(
+            client_bundle_route_path(app.path(), &routes, Some("route=%2Fusers%2F42")).as_deref(),
+            Some(Path::new("users/[id]"))
+        );
+        assert_eq!(
+            client_bundle_route_path(app.path(), &routes, Some("route=%2Fusers%2F42%2F"))
+                .as_deref(),
+            Some(Path::new("users/[id]"))
+        );
+        assert!(client_bundle_route_path(app.path(), &routes, Some("route=relative")).is_none());
+        assert!(
+            client_bundle_route_path(app.path(), &routes, Some("route=%2F..%2Fsecret")).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn client_bundle_response_serves_route_client_module() {
+        let app = TempDir::new("bundle");
+        app.write(
+            "app/routes/index.client.ts",
+            "const count: number = 1;\ndocument.body.dataset.count = String(count);\n",
+        );
+        app.write("app/routes/index.tsx", "export default function Home() {}");
+        let routes = RouteTable::scan(app.path()).unwrap();
+
+        let response =
+            client_bundle_response(app.path(), &routes, "GET", Some("route=%2F")).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("document.body.dataset.count"));
+        assert!(!body.contains(": number"));
+    }
+
+    #[tokio::test]
+    async fn client_bundle_response_serves_dynamic_route_client_module() {
+        let app = TempDir::new("bundle-dynamic");
+        app.write(
+            "app/routes/users/[id].tsx",
+            "export default function User() {}",
+        );
+        app.write(
+            "app/routes/users/[id].client.ts",
+            "document.body.dataset.userId = \"hydrated\";\n",
+        );
+        let routes = RouteTable::scan(app.path()).unwrap();
+
+        let response =
+            client_bundle_response(app.path(), &routes, "GET", Some("route=%2Fusers%2F42%2F"))
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("dataset.userId"));
     }
 
     #[tokio::test]

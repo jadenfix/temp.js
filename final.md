@@ -65,7 +65,7 @@ The work below is not just about matching Node/Next request handling. The end st
 
 **Primary PR sequence:**
 - [x] Add streaming React SSR over the worker chunk channel and prove shell-before-delayed-subtree delivery.
-- [ ] Add client hydration with a per-route client bundle.
+- [x] Add client hydration with a per-route client bundle.
 - [ ] Add RSC flight protocol over the same chunk channel.
 - [ ] Add npm/node-compat adoption wedge.
 - [ ] Add isolate pool behind the existing worker protocol.
@@ -213,12 +213,12 @@ The through-line is not just parity with Node/Next; it is an agent-native runtim
 Phase C progress so far:
 
 - Route responses can now carry ordered `body_chunks`; the Rust server forwards them as chunked response bodies and strips stale `content-length` headers.
-- Route-scoped client modules can now live beside page routes as `*.client.ts` files and are served from `/_beater/client/<route>.js`; the hello page uses this to prove same-origin browser code can hydrate a counter without Node/npm. Full React hydration and bundling are still open.
+- Route-scoped client modules can now live beside page routes as `*.client.ts` files and are served from `/_beater/client.js?route=/...`; the hello page uses this to prove same-origin browser code can hydrate a counter without Node/npm. Full React hydration and bundling are still open.
 
 | # | Item | Done when |
 |---|---|---|
 | 1 | **Streaming SSR** — renderToReadableStream over the chunked worker channel | **done:** `scripts/streaming-ssr-gate.sh` proved the shell chunk arrived before the Suspense-delayed subtree chunk |
-| 2 | **Client hydration** — route-scoped client bundles (`/_beater/client/<route>.js`) | a counter button on index.tsx works in a browser |
+| 2 | **Client hydration** — route-scoped client bundles (`/_beater/client.js?route=...`) | **done:** `scripts/client-hydration-gate.sh` proved the index counter works in headless Chrome (`before=0 after=2`) |
 | 3 | **RSC** — flight protocol over the same chunked channel | server components with client islands render + hydrate |
 | 4 | **npm/node-compat** — the adoption wedge (Deno-style compat layer, not a reimplementation) | `import { z } from "zod"` works in a route |
 | 5 | **Isolate pool** — N workers behind the existing channel protocol | wrk shows near-linear scaling to core count |

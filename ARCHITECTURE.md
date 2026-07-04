@@ -137,7 +137,7 @@ CLI: `beater new <app>` · `beater dev` · `beater agent run <name> "<prompt>"` 
 
 - **npm ecosystem / node-compat** — the adoption wedge; adopt a Deno-style compat layer rather than reimplementing.
 - **WHATWG fetch classes in routes** — comes with npm-compat.
-- **RSC + client hydration** — the chunked isolate→host streaming plumbing is the substrate; add the flight protocol + client bundle step next.
+- **RSC + client hydration** — the chunked isolate→host streaming plumbing is the substrate; client modules now ship through `/_beater/client.js`, and the next step is the flight protocol.
 - **Wasmtime sandbox** — fourth `impl` kind in the tool registry, for untrusted/agent-generated code.
 - **C++ tools** — via `cxx` on the Rust built-in path when a real use case appears.
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
@@ -156,3 +156,4 @@ CLI: `beater new <app>` · `beater dev` · `beater agent run <name> "<prompt>"` 
 | M2 | durable agent loop + Python tool + kill-9 resume | **the thesis** | code done; live-API gate pending |
 | M3 | `/mcp` endpoint (inspector-verified) + crawl layer (robots/sitemap/llms.txt/.well-known) | ecosystem | **done** |
 | M4 | React streaming SSR (`renderToReadableStream`) | the web half | **done** |
+| C2 | `/_beater/client.js` route client bundle | client interactivity | **done** |

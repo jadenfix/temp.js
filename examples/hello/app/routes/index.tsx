@@ -1,7 +1,5 @@
 // Phase C item 1: streamed React SSR from the embedded isolate — no Node anywhere.
 
-import { Suspense } from "react";
-
 export const agent = {
   title: "beater.js Runtime Console",
   description: "Public, crawl-safe operational home for the hello example app.",
@@ -587,41 +585,6 @@ type PageRequest = {
   path: string;
 };
 
-type DelayRecord = {
-  ready: boolean;
-  promise: Promise<void>;
-};
-
-const delayedByRequest = new Map<string, DelayRecord>();
-
-function waitForDelayedSubtree(requestId: string) {
-  let record = delayedByRequest.get(requestId);
-  if (!record) {
-    record = {
-      ready: false,
-      promise: Promise.resolve(),
-    };
-    record.promise = new Promise((resolve) => {
-      setTimeout(() => {
-        record!.ready = true;
-        resolve();
-      }, 450);
-    });
-    delayedByRequest.set(requestId, record);
-  }
-  if (!record.ready) throw record.promise;
-}
-
-function DelayedStreamingSubtree({ requestId }: { requestId: string }) {
-  waitForDelayedSubtree(requestId);
-  delayedByRequest.delete(requestId);
-  return (
-    <p id="stream-delayed" data-stream-marker="delayed">
-      Suspense-delayed subtree flushed after the shell.
-    </p>
-  );
-}
-
 export default function Home({ request }: { request: PageRequest }) {
   return (
     <html lang="en">
@@ -658,15 +621,9 @@ export default function Home({ request }: { request: PageRequest }) {
                   TypeScript routes, React SSR, durable Rust agent runs, Python tools,
                   and MCP discovery are served from the same local runtime.
                 </p>
-                <Suspense
-                  fallback={
-                    <p id="stream-shell" data-stream-marker="shell">
-                      Streaming shell flushed before the delayed subtree.
-                    </p>
-                  }
-                >
-                  <DelayedStreamingSubtree requestId={request.id} />
-                </Suspense>
+                <p id="stream-shell" data-stream-marker="shell">
+                  Streaming shell rendered without inline bootstrap scripts.
+                </p>
               </div>
 
               <div className="signal-row">
@@ -788,7 +745,10 @@ export default function Home({ request }: { request: PageRequest }) {
             </div>
           </section>
         </main>
-        <script type="module" src="/_beater/client/index.js" />
+        <script
+          type="module"
+          src={`/_beater/client.js?route=${encodeURIComponent(request.path)}`}
+        />
       </body>
     </html>
   );

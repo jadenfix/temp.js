@@ -22,6 +22,7 @@ Pre-alpha, built in the open. Current milestone progress:
 - [x] **M2** — durable agent loop + embedded-Python tools + step-lifecycle journal (code complete; live-API kill-9/resume gate pending an `ANTHROPIC_API_KEY`)
 - [x] **M3** — MCP server endpoint (spec 2025-11-25, verified with the official MCP inspector) + agent-ready crawl layer (robots.txt, sitemap.xml, llms.txt, .well-known manifest — auto-generated from the route table)
 - [x] **M4** — streamed React 19 SSR (`renderToReadableStream`; shell chunks flush before Suspense-delayed subtrees)
+- [x] **Phase C hydration** — per-route client bundle at `/_beater/client.js`; the hello counter hydrates and clicks in Chrome
 
 ## Quickstart (target DX)
 
@@ -32,12 +33,14 @@ cargo build --workspace
 ./target/debug/beater new my-app                         # scaffold from the hello template
 python3.11 -m venv my-app/.venv                          # optional: enables third-party Python packages
 ./target/debug/beater dev my-app                         # serve routes with hot reload
-./target/debug/beater dev my-app --host 0.0.0.0          # bind for containers/VMs
+./target/debug/beater dev my-app --host 127.0.0.1        # bind locally
 export ANTHROPIC_API_KEY=sk-ant-...                     # required for live agent runs
 ./target/debug/beater agent run --app my-app support "summarize 3,1,4,1,5"
 ./target/debug/beater agent resume --app my-app <run_id>
 ./target/debug/beater doctor my-app                      # verify Python/venv/V8 wiring
 ```
+
+Remote binds require `BEATER_MCP_TOKEN` or `--allow-unauthenticated-remote`.
 
 When exposing `/mcp` beyond localhost, require a bearer token and add browser origins explicitly:
 
@@ -50,6 +53,8 @@ export BEATER_MCP_TRUSTED_ORIGINS="https://ops.example.com" # browser-based oper
 ## Current limits
 
 `beater dev` currently uses one JS route isolate, so TS routes and React SSR serialize through that worker. One dev server serves one app directory. See [Runtime limits](docs/runtime-limits.md) for the exact concurrency model and isolate-pool path.
+
+`scripts/client-hydration-gate.sh` needs `node` plus Chrome or Chromium on `PATH`, or an explicit `CHROME=/path/to/browser`.
 
 ## Build from source
 

@@ -71,13 +71,13 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
     assert!(home.contains("script-src 'self'"), "{home}");
     assert!(home.contains("x-content-type-options: nosniff"), "{home}");
     assert!(
-        home.contains(r#"<script type="module" src="/_beater/client/index.js"></script>"#),
+        home.contains(r#"<script type="module" src="/_beater/client.js?route=%2F"></script>"#),
         "{home}"
     );
     assert!(home.contains("data-beater-counter"), "{home}");
 
     let client =
-        http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
+        http_request(port, "GET", "/_beater/client.js?route=%2F", None).expect("GET client bundle");
     assert!(client.starts_with("HTTP/1.1 200"), "{client}");
     assert!(
         client.contains("content-type: application/javascript"),
