@@ -26,7 +26,7 @@ One Rust host process owns the event loop, the HTTP server, the agent scheduler,
 | 1 | **V8** (deno_core) | routes (TS/TSX), agent definitions, React SSR | the web's language, JIT-fast, isolate-scoped |
 | 2 | **CPython** (PyO3, embedded) | ML tools — numpy, torch, pandas work as-is | full-fat Python; wasm cannot run the ML ecosystem |
 | 3 | **Native Rust** | the agent loop itself, built-in tools, all framework machinery | performance, correctness, survives isolate reloads |
-| 4 | **Wasmtime** *(future)* | untrusted / agent-generated code | capability-scoped sandbox |
+| 4 | **Wasmtime** | untrusted / agent-generated scalar wasm code | hermetic W0 sandbox: empty imports, no filesystem, no network, no env/secrets, fuel + memory + wall limits |
 
 The agent loop deliberately lives in tier 3, not tier 1: it survives hot reloads of user code, it is journaled by construction, and it cannot be starved by user JS.
 
@@ -138,7 +138,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **Full npm ecosystem / node-compat** — server routes can import local ESM packages from `node_modules` with bare specifiers; CommonJS `require`, Node built-ins, package install/build hooks, import maps, and client-side dependency bundling remain.
 - **WHATWG fetch classes in routes** — comes with broader npm-compat.
 - **Full RSC** — the chunked isolate→host streaming plumbing, route-scoped client modules, and initial `text/x-component` flight transport are the substrate; add official React Flight client references/manifests after broader npm-compat.
-- **Wasmtime sandbox** — fourth `impl` kind in the tool registry, for untrusted/agent-generated code.
+- **Wasmtime sandbox expansion** — local `wasmtime` tools now run hermetic scalar wasm with empty imports; broader WASI/capability handles for files, sockets, and richer value passing remain future work.
 - **C++ tools** — via `cxx` on the Rust built-in path when a real use case appears.
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
 - **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.

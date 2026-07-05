@@ -31,7 +31,7 @@ Do not put MCP bearer tokens in `beater.toml`. Keep them in the process environm
 
 Python tools are first-party code and run with the same OS privileges as the beater process. They can read files, open sockets, import packages from the configured venv, and mutate external systems.
 
-Do not run untrusted Python tools. The planned Wasmtime tier is the sandbox path for untrusted or agent-generated code.
+Do not run untrusted Python tools. Use `wasmtimeTool` for the current untrusted-code path: it runs hermetic scalar wasm with an empty linker, denied host imports, no filesystem mounts, no network, no environment variables, no secrets, and fuel/memory/wall-clock limits.
 
 ## Journal Data
 

@@ -60,6 +60,7 @@ beater-agent = { path = "crates/beater-agent" }
 beater-py = { path = "crates/beater-py" }
 beater-connect = { path = "crates/beater-connect" }
 beatbox-client = { git = "https://github.com/jadenfix/beatbox", rev = "dc2ddd9d93542737627210a05eeae96e008a1aad" }
+wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
 
 # V8 and swc are unusable at opt-level 0; keep our own crates fast to compile
 [profile.dev.package."*"]

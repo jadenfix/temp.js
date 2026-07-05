@@ -214,4 +214,61 @@ export default defineAgent({
             })
         );
     }
+
+    #[test]
+    fn wasmtime_tool_serializes_hermetic_contract() {
+        let app = TempApp::new("wasmtime-tool");
+        fs::write(
+            app.path().join("agents/operator/agent.ts"),
+            r#"
+import { defineAgent, wasmtimeTool } from "beater:agent";
+
+export default defineAgent({
+  name: "operator",
+  tools: [
+    wasmtimeTool("double_wasm", {
+      source: {
+        kind: "wasm_wat",
+        text: "(module (func (export \"run\") (param i64) (result i64) local.get 0))",
+      },
+      description: "Double an integer in a hermetic wasm sandbox.",
+      inputSchema: {
+        type: "object",
+        properties: {n: {type: "integer"}},
+        required: ["n"],
+      },
+      policy: {
+        limits: {wall_ms: 1000, memory_bytes: 1048576, fuel: 100000},
+      },
+      idempotent: true,
+    }),
+  ],
+});
+"#,
+        )
+        .unwrap();
+
+        let config = load_agent_config(app.path(), "operator").unwrap();
+        assert_eq!(
+            config["tools"][0],
+            json!({
+                "kind": "wasmtime",
+                "name": "double_wasm",
+                "idempotent": true,
+                "source": {
+                    "kind": "wasm_wat",
+                    "text": "(module (func (export \"run\") (param i64) (result i64) local.get 0))"
+                },
+                "description": "Double an integer in a hermetic wasm sandbox.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer"}},
+                    "required": ["n"]
+                },
+                "policy": {
+                    "limits": {"wall_ms": 1000, "memory_bytes": 1048576, "fuel": 100000}
+                }
+            })
+        );
+    }
 }

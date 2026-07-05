@@ -209,7 +209,7 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 
 ### Security floor (currently: dev-mode assumptions everywhere)
 - [x] /mcp local-dev mode can remain unauthenticated; `BEATER_MCP_TOKEN` enables bearer auth, `BEATER_MCP_TRUSTED_ORIGINS` pins browser operators, and smoke tests prove unauthorized remote calls fail closed.
-- [x] Python tools run with full process privileges — trust model documented in `docs/security.md` (tools are first-party code until the wasm sandbox tier lands)
+- [x] Python tools run with full process privileges — trust model documented in `docs/security.md`; untrusted scalar wasm now uses the hermetic local `wasmtime` tier
 - [x] Journal stores full prompts/results in plaintext SQLite — documented in `docs/security.md`; redaction hooks remain later work
 
 ### Docs
@@ -243,6 +243,7 @@ Phase C progress so far:
 - Agent resume now converts failed idempotent tool re-runs and removed-tool lookups into `is_error` tool results, while still parking genuinely non-idempotent interrupted tools for review.
 - Direct `/mcp tools/call` requests now create synthetic MCP journal runs, commit a `tool_call` started row before executing side-effecting tools, and finish the row/run as completed, failed, or `needs_review` before returning the MCP tool result.
 - Dev hot reload now refreshes the agent/tool registry and agent metadata alongside routes and the worker, preserving the last good agent snapshot if a reload-time config rebuild fails.
+- Local `wasmtime` tools now provide the fourth registry implementation kind for hermetic untrusted scalar wasm: `wasmtime_tool_runs_hermetic_wasm_function` proves execution with fuel/memory/wall limits, and `wasmtime_tool_rejects_filesystem_imports_before_execution` plus `wasmtime_policy_rejects_filesystem_mounts` prove filesystem capability denial.
 
 | # | Item | Done when |
 |---|---|---|
@@ -251,7 +252,7 @@ Phase C progress so far:
 | 3 | **RSC** — flight protocol over the same chunked channel | **partial:** `/_beater/rsc/index.flight` streams the hello server island and the browser gate renders it; official React Flight client references/manifests remain after npm-compat |
 | 4 | **npm/node-compat** — the adoption wedge (Deno-style compat layer, not a reimplementation) | **done for the wedge:** `import { z } from "zod"` works in a route; full CommonJS, Node built-ins, install hooks, and client bundling remain later work |
 | 5 | **Isolate pool** — N workers behind the existing channel protocol | wrk shows near-linear scaling to core count |
-| 6 | **Wasm sandbox tier** — Wasmtime as the 4th tool impl kind | an untrusted tool runs capability-scoped and cannot read the filesystem |
+| 6 | **Wasm sandbox tier** — Wasmtime as the 4th tool impl kind | **done for W0:** local `wasmtime` tools run hermetic scalar wasm with empty imports, no filesystem mounts, no network/env/secrets, and fuel/memory/wall limits; tests prove filesystem imports and mounts are denied |
 | 7 | **LLM streaming** — SSE to browser + partial-step journal records | tokens stream to a page while every step stays crash-resumable |
 | 8 | **MCP consume + sessions** — use remote MCP servers as tool sources; add session/auth plumbing for remote management; adopt the next MCP spec when released | an agent uses a third-party MCP server's tool via config only, with scoped credentials and resumable error handling |
 | 9 | **Agentic browsing** — reuse beater-agents' CDP/Playwright crates as a tool provider | an agent completes a real browsing task from a pyTool-style declaration, with browser sessions cleaned up after crashes |

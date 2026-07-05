@@ -9,7 +9,7 @@ agents/support/agent.ts       → durable agent loop (runs in Rust, survives cra
 agents/support/tools/*.py     → full-fat Python tools (numpy/torch work) in embedded CPython
 ```
 
-Why: the Node/Next stack was designed for documents and forms. Agent apps are long-running polyglot loops — the unit of work is a journaled, resumable run, not a request; the ML half lives in Python and native code, not JS. beater.js is one Rust host process with four execution tiers: **V8** (routes, SSR), **CPython** (ML tools), **native Rust** (the agent loop itself), and **Wasmtime** (sandboxed untrusted code, planned). Tools speak [MCP](https://modelcontextprotocol.io) natively.
+Why: the Node/Next stack was designed for documents and forms. Agent apps are long-running polyglot loops — the unit of work is a journaled, resumable run, not a request; the ML half lives in Python and native code, not JS. beater.js is one Rust host process with four execution tiers: **V8** (routes, SSR), **CPython** (ML tools), **native Rust** (the agent loop itself), and **Wasmtime** (hermetic W0 sandboxed untrusted code). Tools speak [MCP](https://modelcontextprotocol.io) natively.
 
 Read the full design: [ARCHITECTURE.md](./ARCHITECTURE.md)
 
@@ -101,5 +101,5 @@ Apache-2.0
 beater.js is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: one Rust binary that serves your app and runs durable polyglot agents, with no sibling project required. Within the family it can connect for:
 
 - feeding its journaled runs to [beater-memory](https://github.com/jadenfix/beater-memory) (journal import exists today) and its traces to [beater](https://github.com/jadenfix/beater) for evals and CI gates
-- using [beatbox](https://github.com/jadenfix/beatbox) as the sandboxed execution tier for untrusted agent-generated code (the planned Wasmtime tier)
+- using the local Wasmtime tier for hermetic untrusted scalar wasm tools, with [beatbox](https://github.com/jadenfix/beatbox) still available as the remote sandbox lane
 - giving its agents web hands via [tempo](https://github.com/jadenfix/tempo) and running under [beaterOS](https://github.com/jadenfix/beaterOS) authority and policy

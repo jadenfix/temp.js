@@ -1,5 +1,5 @@
 //! One registry for local and networked tools: Python files (embedded CPython),
-//! Rust built-ins, remote MCP providers, and (later) inline TS + sandboxed wasm.
+//! Rust built-ins, hermetic Wasmtime tools, remote MCP providers, and browser tools.
 //! Every tool declares `idempotent` — the resume-safety contract
 //! (ARCHITECTURE.md §5).
 
@@ -7,13 +7,18 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 pub const DEFAULT_BEATBOX_URL: &str = "http://127.0.0.1:7300";
 const DEFAULT_PYTHON_TIMEOUT_MS: u64 = 10_000;
@@ -69,7 +74,7 @@ fn default_model() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct ToolDecl {
-    pub kind: String, // "python" | "rust" | "remote_mcp" | "browser" | "sandbox"
+    pub kind: String, // "python" | "rust" | "remote_mcp" | "browser" | "sandbox" | "wasmtime"
     pub name: String,
     #[serde(default)]
     pub path: Option<String>,
@@ -161,12 +166,20 @@ pub enum ToolImpl {
         config: BrowserTool,
     },
     Sandbox(Box<SandboxTool>),
+    Wasmtime(Box<WasmtimeTool>),
 }
 
 pub struct SandboxTool {
     beatbox: BeatboxConfig,
     lane: beatbox_client::Lane,
     source: beatbox_client::Source,
+    policy: beatbox_client::Policy,
+    entrypoint: Option<String>,
+}
+
+pub struct WasmtimeTool {
+    engine: Engine,
+    module: Module,
     policy: beatbox_client::Policy,
     entrypoint: Option<String>,
 }
@@ -314,6 +327,44 @@ impl ToolRegistry {
                         })),
                     }
                 }
+                "wasmtime" => {
+                    let source = wasmtime_source(agent_dir, decl)
+                        .with_context(|| format!("loading wasmtime source for {}", decl.name))?;
+                    let policy = sandbox_policy(decl.policy.as_ref())
+                        .with_context(|| format!("parsing wasmtime policy for {}", decl.name))?;
+                    admit_wasmtime_policy(&policy)
+                        .with_context(|| format!("checking wasmtime policy for {}", decl.name))?;
+                    let engine = wasmtime_engine()?;
+                    let module = Module::new(&engine, &source).map_err(|error| {
+                        anyhow!("compiling wasmtime module for {}: {error}", decl.name)
+                    })?;
+                    let imports = module_imports(&module);
+                    ensure!(
+                        imports.is_empty(),
+                        "wasmtime tool {} imports are disabled: {}",
+                        decl.name,
+                        imports.join(", ")
+                    );
+                    let description = decl.description.clone().unwrap_or_else(|| {
+                        format!("Run {} inside the local Wasmtime sandbox.", decl.name)
+                    });
+                    let input_schema = decl
+                        .input_schema
+                        .clone()
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    ToolEntry {
+                        name: decl.name.clone(),
+                        description,
+                        input_schema,
+                        idempotent: decl.idempotent,
+                        imp: ToolImpl::Wasmtime(Box::new(WasmtimeTool {
+                            engine,
+                            module,
+                            policy,
+                            entrypoint: decl.entrypoint.clone(),
+                        })),
+                    }
+                }
                 other => bail!("unknown tool kind {other:?} for tool {}", decl.name),
             };
             push_unique_tool(&mut tools, entry);
@@ -403,6 +454,16 @@ impl ToolRegistry {
                 )
                 .await
             }
+            ToolImpl::Wasmtime(wasm) => {
+                execute_wasmtime(
+                    wasm.engine.clone(),
+                    wasm.module.clone(),
+                    wasm.policy.clone(),
+                    wasm.entrypoint.clone(),
+                    input.clone(),
+                )
+                .await
+            }
         }
     }
 }
@@ -475,6 +536,43 @@ fn sandbox_source_path(agent_dir: &Path, path: &str) -> Result<beatbox_client::S
             bytes: base64::engine::general_purpose::STANDARD.encode(bytes),
         })
     }
+}
+
+fn wasmtime_source(agent_dir: &Path, decl: &ToolDecl) -> Result<Vec<u8>> {
+    if decl.path.is_some() && decl.source.is_some() {
+        bail!(
+            "wasmtime tool {} cannot declare both source and path",
+            decl.name
+        );
+    }
+    match decl.source.as_ref() {
+        Some(SandboxSourceDecl::Path { path }) => wasmtime_source_path(agent_dir, path),
+        Some(SandboxSourceDecl::Wat { text }) | Some(SandboxSourceDecl::WasmWat { text }) => {
+            Ok(text.as_bytes().to_vec())
+        }
+        Some(SandboxSourceDecl::WasmBase64 { bytes })
+        | Some(SandboxSourceDecl::WasmBytesBase64 { bytes }) => {
+            base64::engine::general_purpose::STANDARD
+                .decode(bytes)
+                .context("decoding wasmtime wasm base64 source")
+        }
+        Some(SandboxSourceDecl::Inline { code }) => Ok(code.as_bytes().to_vec()),
+        Some(SandboxSourceDecl::ModuleRef { .. }) => {
+            bail!("module_ref wasmtime sources are not supported yet")
+        }
+        None => {
+            let path = decl
+                .path
+                .as_deref()
+                .with_context(|| format!("wasmtime tool {} has no source or path", decl.name))?;
+            wasmtime_source_path(agent_dir, path)
+        }
+    }
+}
+
+fn wasmtime_source_path(agent_dir: &Path, path: &str) -> Result<Vec<u8>> {
+    let (_, path) = contained_agent_path(agent_dir, path, "wasmtime source")?;
+    std::fs::read(&path).with_context(|| format!("reading wasmtime source {}", path.display()))
 }
 
 fn contained_agent_path(agent_dir: &Path, path: &str, label: &str) -> Result<(PathBuf, PathBuf)> {
@@ -687,6 +785,190 @@ async fn execute_sandbox_job(
 
 fn job_poll_timeout(wall_ms: u64) -> Duration {
     Duration::from_millis(wall_ms.saturating_add(5_000).max(5_000))
+}
+
+fn wasmtime_engine() -> Result<Engine> {
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+    config.cranelift_nan_canonicalization(true);
+    config.relaxed_simd_deterministic(true);
+    Engine::new(&config).map_err(|error| anyhow!("creating wasmtime engine: {error}"))
+}
+
+fn admit_wasmtime_policy(policy: &beatbox_client::Policy) -> Result<()> {
+    ensure!(
+        policy.fs.workspace.is_none(),
+        "local wasmtime tools are hermetic and expose no filesystem workspace"
+    );
+    ensure!(
+        policy.fs.mounts.is_empty(),
+        "local wasmtime tools are hermetic and expose no filesystem mounts"
+    );
+    ensure!(
+        matches!(policy.net, beatbox_client::NetPolicy::Deny),
+        "local wasmtime tools expose no network"
+    );
+    ensure!(
+        policy.env.is_empty(),
+        "local wasmtime tools expose no environment variables"
+    );
+    ensure!(
+        policy.secrets.is_empty(),
+        "local wasmtime tools expose no secrets"
+    );
+    Ok(())
+}
+
+fn module_imports(module: &Module) -> Vec<String> {
+    module
+        .imports()
+        .map(|import| format!("{}::{}", import.module(), import.name()))
+        .collect()
+}
+
+struct WasmtimeState {
+    limits: StoreLimits,
+}
+
+async fn execute_wasmtime(
+    engine: Engine,
+    module: Module,
+    policy: beatbox_client::Policy,
+    entrypoint: Option<String>,
+    input: Value,
+) -> Result<String> {
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let memory_limit = usize::try_from(policy.limits.memory_bytes).unwrap_or(usize::MAX);
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(memory_limit)
+            .instances(1)
+            .memories(1)
+            .tables(4)
+            .build();
+        let mut store = Store::new(&engine, WasmtimeState { limits });
+        store.limiter(|state| &mut state.limits);
+
+        let requested_fuel = policy.limits.fuel.unwrap_or(10_000_000);
+        store
+            .set_fuel(requested_fuel)
+            .map_err(|error| anyhow!("configuring wasmtime fuel: {error}"))?;
+        store.set_epoch_deadline(1);
+        let ticker = epoch_ticker(engine.clone(), policy.limits.wall_ms);
+        let result = run_wasmtime_entrypoint(&mut store, &engine, &module, entrypoint, &input);
+        ticker.stop();
+
+        let remaining_fuel = store.get_fuel().ok();
+        let fuel_used = remaining_fuel.map(|remaining| requested_fuel.saturating_sub(remaining));
+        let value = result?;
+        Ok(json!({
+            "status": "ok",
+            "impl": "wasmtime",
+            "value": value,
+            "metrics": {
+                "wall_time_ms": started.elapsed().as_millis() as u64,
+                "fuel_used": fuel_used,
+            },
+            "isolation": {
+                "filesystem": "none",
+                "network": "none",
+                "imports": "denied",
+            }
+        })
+        .to_string())
+    })
+    .await
+    .context("wasmtime worker panicked")?
+}
+
+fn run_wasmtime_entrypoint(
+    store: &mut Store<WasmtimeState>,
+    engine: &Engine,
+    module: &Module,
+    entrypoint: Option<String>,
+    input: &Value,
+) -> Result<Value> {
+    let linker = Linker::new(engine);
+    let instance = linker
+        .instantiate(&mut *store, module)
+        .map_err(|error| anyhow!("instantiating wasmtime module: {error}"))?;
+    let entrypoint = entrypoint.as_deref().unwrap_or("run");
+
+    if let Ok(func) = instance.get_typed_func::<i64, i64>(&mut *store, entrypoint) {
+        let input = input_i64(input)?;
+        let value = func
+            .call(&mut *store, input)
+            .map_err(|error| anyhow!("calling wasmtime entrypoint {entrypoint}: {error}"))?;
+        return Ok(json!(value));
+    }
+
+    if let Ok(func) = instance.get_typed_func::<(), i64>(&mut *store, entrypoint) {
+        let value = func
+            .call(&mut *store, ())
+            .map_err(|error| anyhow!("calling wasmtime entrypoint {entrypoint}: {error}"))?;
+        return Ok(json!(value));
+    }
+
+    if let Ok(func) = instance.get_typed_func::<(), ()>(&mut *store, entrypoint) {
+        func.call(&mut *store, ())
+            .map_err(|error| anyhow!("calling wasmtime entrypoint {entrypoint}: {error}"))?;
+        return Ok(Value::Null);
+    }
+
+    bail!(
+        "missing supported wasmtime entrypoint `{entrypoint}`; expected ()->(), ()->i64, or i64->i64"
+    )
+}
+
+fn input_i64(input: &Value) -> Result<i64> {
+    if input.is_null() {
+        return Ok(0);
+    }
+    if let Some(value) = input.as_i64() {
+        return Ok(value);
+    }
+    if let Some(value) = input.get("n").and_then(Value::as_i64) {
+        return Ok(value);
+    }
+    bail!("wasmtime i64 entrypoints require input as an integer or {{\"n\": integer}}")
+}
+
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn epoch_ticker(engine: Engine, wall_ms: u64) -> EpochTicker {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let sleep_for = Duration::from_millis(wall_ms.max(1));
+    let handle = thread::spawn(move || {
+        let tick = Duration::from_millis(10);
+        let started = Instant::now();
+        while started.elapsed() < sleep_for {
+            if thread_stop.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(tick);
+        }
+        if !thread_stop.load(Ordering::SeqCst) {
+            engine.increment_epoch();
+        }
+    });
+    EpochTicker {
+        stop,
+        handle: Some(handle),
+    }
 }
 
 pub struct RemoteMcpTool {
@@ -2288,6 +2570,71 @@ def run(input):
         assert!(requests[1].headers.starts_with("GET /mcp/v1/jobs/job-1 "));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn wasmtime_tool_runs_hermetic_wasm_function() {
+        let registry = ToolRegistry::build(PathBuf::new().as_path(), &[wasmtime_decl()])
+            .expect("wasmtime registry should build");
+
+        let result = registry
+            .execute("double_wasm", &json!({"n": 21}))
+            .await
+            .expect("wasmtime tool should run");
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["impl"], "wasmtime");
+        assert_eq!(result["value"], 42);
+        assert_eq!(result["isolation"]["filesystem"], "none");
+        assert_eq!(result["isolation"]["network"], "none");
+        assert_eq!(result["isolation"]["imports"], "denied");
+    }
+
+    #[test]
+    fn wasmtime_tool_rejects_filesystem_imports_before_execution() {
+        let mut decl = wasmtime_decl();
+        decl.source = Some(
+            serde_json::from_value(json!({
+                "kind": "wasm_wat",
+                "text": r#"
+                    (module
+                      (import "wasi_snapshot_preview1" "path_open"
+                        (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+                      (func (export "run") (result i64)
+                        i64.const 1))
+                "#
+            }))
+            .unwrap(),
+        );
+        let error = match ToolRegistry::build(PathBuf::new().as_path(), &[decl]) {
+            Ok(_) => panic!("wasmtime tool with host imports should fail"),
+            Err(error) => error,
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("imports are disabled"), "{text}");
+        assert!(text.contains("wasi_snapshot_preview1::path_open"), "{text}");
+    }
+
+    #[test]
+    fn wasmtime_policy_rejects_filesystem_mounts() {
+        let mut decl = wasmtime_decl();
+        decl.policy = Some(json!({
+            "fs": {
+                "mounts": [{
+                    "host": "/tmp",
+                    "guest": "/host",
+                    "mode": "ro"
+                }]
+            }
+        }));
+        let error = match ToolRegistry::build(PathBuf::new().as_path(), &[decl]) {
+            Ok(_) => panic!("wasmtime tool with filesystem mount should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("no filesystem mounts"),
+            "{error:#}"
+        );
+    }
+
     fn py_decl(name: &str, path: &str, idempotent: bool) -> ToolDecl {
         serde_json::from_value(json!({
             "kind": "python",
@@ -2352,6 +2699,38 @@ def run(input):
                 "properties": {"n": {"type": "integer"}},
                 "required": ["n"]
             }
+        }))
+        .unwrap()
+    }
+
+    fn wasmtime_decl() -> ToolDecl {
+        serde_json::from_value(json!({
+            "kind": "wasmtime",
+            "name": "double_wasm",
+            "source": {
+                "kind": "wasm_wat",
+                "text": r#"
+                    (module
+                      (func (export "run") (param i64) (result i64)
+                        local.get 0
+                        i64.const 2
+                        i64.mul))
+                "#
+            },
+            "description": "Double an integer in the local Wasmtime sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "required": ["n"]
+            },
+            "policy": {
+                "limits": {
+                    "wall_ms": 5000,
+                    "memory_bytes": 67108864,
+                    "fuel": 1000000
+                }
+            },
+            "idempotent": true
         }))
         .unwrap()
     }

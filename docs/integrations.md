@@ -2,7 +2,7 @@
 
 beater.js should expose one integration registry, not separate queues or sidecar services for web actions, local tools, remote MCP servers, and browser-control providers.
 
-The implemented registry today supports first-party Python tools, Rust built-ins, declared remote MCP tools, and a mock CDP browser provider for deterministic agent-loop and lifecycle tests. Production Playwright/CDP providers still need to fit the same contract before they ship.
+The implemented registry today supports first-party Python tools, Rust built-ins, hermetic local Wasmtime tools, declared remote MCP tools, and a mock CDP browser provider for deterministic agent-loop and lifecycle tests. Production Playwright/CDP providers still need to fit the same contract before they ship.
 
 ## Contract
 
@@ -11,7 +11,7 @@ Every integration exposed to an agent should have:
 - `name`: stable, globally unique tool name within the app.
 - `description`: human-readable capability summary for LLM/tool clients.
 - `input_schema`: JSON Schema for validation and MCP/tool metadata.
-- `kind`: implementation kind, such as `python`, `rust`, `remote_mcp`, or `browser`.
+- `kind`: implementation kind, such as `python`, `rust`, `wasmtime`, `remote_mcp`, or `browser`.
 - `idempotent`: crash-resume safety signal used by the journal.
 - `timeout`: maximum time for one call before it fails closed.
 - `retry`: explicit retry policy for network failures, including whether retries use an idempotency key.

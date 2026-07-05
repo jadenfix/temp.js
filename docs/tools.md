@@ -7,7 +7,7 @@ beater.js tools are first-party code declared by an agent and exposed through th
 `agents/<name>/agent.ts` imports helpers from `beater:agent`:
 
 ```ts
-import { browserTool, defineAgent, pyTool, remoteMcpTool, rustTool } from "beater:agent";
+import { browserTool, defineAgent, pyTool, remoteMcpTool, rustTool, wasmtimeTool } from "beater:agent";
 
 export default defineAgent({
   name: "support",
@@ -59,6 +59,37 @@ Rust tools are built into the host binary. Current built-ins:
 - `get_time`: returns the current UTC time as JSON.
 
 Rust built-ins are idempotent by default because they are first-party host code with no external side effects unless explicitly implemented otherwise.
+
+## Wasmtime tools
+
+Use `wasmtimeTool` for untrusted scalar wasm functions that do not need host capabilities:
+
+```ts
+wasmtimeTool("double_wasm", {
+  source: {
+    kind: "wasm_wat",
+    text: `
+      (module
+        (func (export "run") (param i64) (result i64)
+          local.get 0
+          i64.const 2
+          i64.mul))
+    `,
+  },
+  description: "Double an integer in the local Wasmtime sandbox.",
+  inputSchema: {
+    type: "object",
+    properties: {n: {type: "integer"}},
+    required: ["n"],
+  },
+  policy: {
+    limits: {wall_ms: 1000, memory_bytes: 1048576, fuel: 100000},
+  },
+  idempotent: true,
+})
+```
+
+The first Wasmtime tier is hermetic: no WASI, no host imports, no filesystem mounts, no network, no environment variables, and no secrets. Supported entrypoints are `run() -> ()`, `run() -> i64`, and `run(i64) -> i64`; the one-argument form accepts either a raw integer input or `{n: integer}`. Broader capability-scoped WASI handles and richer value passing are future work.
 
 ## Idempotency
 

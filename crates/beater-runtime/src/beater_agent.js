@@ -52,6 +52,32 @@ export function sandboxTool(name, opts = {}) {
   return tool;
 }
 
+// Local Wasmtime tool: hermetic W0 sandbox with no host imports, filesystem,
+// network, env, or secrets. Use this for untrusted scalar wasm functions.
+export function wasmtimeTool(name, opts = {}) {
+  if (!opts || typeof opts !== "object") {
+    throw new Error("wasmtimeTool(name, options) requires an options object");
+  }
+  if (opts.path && opts.source) {
+    throw new Error("wasmtimeTool accepts either path or source, not both");
+  }
+  if (!opts.path && !opts.source) {
+    throw new Error("wasmtimeTool requires a path or source");
+  }
+  const tool = {
+    kind: "wasmtime",
+    name,
+    policy: opts.policy ?? {},
+    idempotent: opts.idempotent ?? false,
+  };
+  if (opts.path) tool.path = opts.path;
+  if (opts.source) tool.source = opts.source;
+  if (opts.entrypoint) tool.entrypoint = opts.entrypoint;
+  if (opts.description) tool.description = opts.description;
+  if (opts.inputSchema) tool.inputSchema = opts.inputSchema;
+  return tool;
+}
+
 // Remote MCP tool source. Metadata is declared locally so the agent can expose
 // stable tool schemas before it calls the networked provider.
 export function remoteMcpTool(name, opts = {}) {
