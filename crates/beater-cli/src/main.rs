@@ -641,6 +641,10 @@ DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 HOST=${BEATER_HOST:-127.0.0.1}
 PORT_VALUE=${BEATER_PORT:-${PORT:-3000}}
 
+if [ -d /Library/Developer/CommandLineTools/Library/Frameworks ]; then
+  export DYLD_FRAMEWORK_PATH="${DYLD_FRAMEWORK_PATH:+$DYLD_FRAMEWORK_PATH:}/Library/Developer/CommandLineTools/Library/Frameworks"
+fi
+
 if [ "${BEATER_ALLOW_UNAUTHENTICATED_REMOTE:-}" = "1" ]; then
   exec "$DIR/bin/beater" dev "$DIR/app" --host "$HOST" --port "$PORT_VALUE" --allow-unauthenticated-remote "$@"
 fi
