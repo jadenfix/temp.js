@@ -141,7 +141,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **Wasmtime sandbox** — fourth `impl` kind in the tool registry, for untrusted/agent-generated code.
 - **C++ tools** — via `cxx` on the Rust built-in path when a real use case appears.
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
-- **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. Full image building, target-OS binary selection, venv baking guarantees, and the `docker run` cold-start gate remain.
+- **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.
 - **Isolate pool scaling proof / per-request isolation** — `[app].workers = N` starts N route isolates and smoke tests prove round-robin dispatch; the remaining acceptance proof is near-linear load-test scaling plus any per-request isolation hardening needed for production.
 - **LLM streaming (SSE to browser)** — journal needs partial-step records first.
 - **MCP sessions/SSE + the 2026-07-28 spec** — adopt when released.
@@ -159,4 +159,4 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 | M5 | route-scoped client module (`/_beater/client/<route>.js`) + hydrated counter | interactivity | **done** |
 | M6 | route-scoped RSC transport (`/_beater/rsc/<route>.flight`) + browser-rendered server island | RSC substrate | transport done; official React Flight manifests pending |
 | M7 | bare ESM package imports from local `node_modules` in server routes | adoption wedge | **done** |
-| M8 | `beater build` host bundle + Docker context | deploy substrate | host bundle done; Docker cold-start gate pending |
+| M8 | `beater build` host bundle + Docker context | deploy substrate | host bundle done; Docker cold-start gate scripted but pending a passing Linux image run |
