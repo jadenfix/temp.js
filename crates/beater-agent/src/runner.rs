@@ -2,6 +2,7 @@
 //! reloads and every LLM/tool step is journaled before it executes.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -12,6 +13,7 @@ use crate::registry::{AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsRevi
 
 const MAX_TOKENS: u64 = 16000;
 const MAX_LOOP_STEPS: usize = 50;
+const LIVE_RUN_RESUME_GRACE: Duration = Duration::from_secs(30);
 
 struct Ctx {
     journal: Journal,
@@ -80,7 +82,7 @@ pub fn run(
         run_id,
     };
     let messages = vec![json!({"role": "user", "content": prompt})];
-    runtime()?.block_on(agent_loop(&ctx, messages))
+    runtime()?.block_on(agent_loop(&ctx, messages, 1))
 }
 
 pub fn resume(
@@ -96,6 +98,12 @@ pub fn resume(
         println!("run {run_id} already completed");
         return Ok(());
     }
+    if run.status == "running" && run.updated_at + LIVE_RUN_RESUME_GRACE.as_secs() as i64 > now() {
+        bail!(
+            "run {run_id} still appears active; wait at least {}s after its last journal update before resuming",
+            LIVE_RUN_RESUME_GRACE.as_secs()
+        );
+    }
     let config_value = load_config(&run.agent)?;
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     let steps = journal.steps(run_id)?;
@@ -110,6 +118,10 @@ pub fn resume(
     runtime()?.block_on(resume_async(&ctx, run, steps))
 }
 
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
 async fn resume_async(
     ctx: &Ctx,
     run: crate::journal::RunRow,
@@ -119,14 +131,16 @@ async fn resume_async(
     // Rebuild conversation state from the journal. The last llm_call's request
     // body carries the exact messages[] at that point — no delta replay needed.
     let last_llm = steps.iter().rev().find(|s| s.kind == "llm_call");
+    let mut next_llm_attempt = 1;
     let messages = match last_llm {
         None => vec![json!({"role": "user", "content": run.input})],
         Some(step) if step.status != "completed" => {
             // Dangling LLM call: we own the request and it had no observable
             // side effect on our state — always safe to re-issue.
+            next_llm_attempt = step.attempt + 1;
             println!(
                 "resuming: re-issuing interrupted LLM call (attempt {})",
-                step.attempt + 1
+                next_llm_attempt
             );
             step.request["messages"]
                 .as_array()
@@ -258,7 +272,7 @@ async fn resume_async(
     };
 
     ctx.journal.set_run_status(run_id, "running")?;
-    agent_loop(ctx, messages).await
+    agent_loop(ctx, messages, next_llm_attempt).await
 }
 
 pub fn list_runs(app_dir: &Path) -> Result<()> {
@@ -282,7 +296,7 @@ pub fn list_runs(app_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>) -> Result<()> {
+async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i64) -> Result<()> {
     for _ in 0..MAX_LOOP_STEPS {
         let body = json!({
             "model": ctx.config.model,
@@ -293,9 +307,10 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>) -> Result<()> {
             "messages": messages,
         });
 
-        let seq = ctx
-            .journal
-            .start_step(&ctx.run_id, "llm_call", &body, None, None, 1)?;
+        let seq =
+            ctx.journal
+                .start_step(&ctx.run_id, "llm_call", &body, None, None, next_llm_attempt)?;
+        next_llm_attempt = 1;
         let response = match ctx.client.create_message(&body).await {
             Ok(r) => r,
             Err(e) => {
@@ -461,9 +476,10 @@ fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resume, run, tool_idempotency_key};
+    use super::{LIVE_RUN_RESUME_GRACE, resume, run, tool_idempotency_key};
     use crate::journal::Journal;
     use crate::registry::BeatboxConfig;
+    use rusqlite::params;
     use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::fs;
@@ -812,6 +828,30 @@ def run(input):
                 1,
             )
             .unwrap();
+        mark_run_stale(app, "run-1");
+    }
+
+    fn seed_interrupted_llm_run(app: &TempApp) {
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "continue interrupted llm")
+            .unwrap();
+        journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": "continue interrupted llm",
+                    }],
+                }),
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+        mark_run_stale(app, "run-1");
     }
 
     fn seed_completed_llm_run(app: &TempApp, status: &str, response: Value) {
@@ -836,6 +876,20 @@ def run(input):
             .unwrap();
         journal.complete_step("run-1", llm, &response).unwrap();
         journal.set_run_status("run-1", status).unwrap();
+        if status == "running" {
+            mark_run_stale(app, "run-1");
+        }
+    }
+
+    fn mark_run_stale(app: &TempApp, run_id: &str) {
+        let stale_updated_at =
+            chrono::Utc::now().timestamp() - LIVE_RUN_RESUME_GRACE.as_secs() as i64 - 1;
+        let conn = rusqlite::Connection::open(app.path().join(".beater/journal.db")).unwrap();
+        conn.execute(
+            "UPDATE runs SET updated_at = ?2 WHERE id = ?1",
+            params![run_id, stale_updated_at],
+        )
+        .unwrap();
     }
 
     fn execution_result_json(value: i64) -> Value {
@@ -1167,6 +1221,56 @@ def run(input):
         let steps = journal.steps("run-1").unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].kind, "llm_call");
+    }
+
+    #[test]
+    fn resume_reissues_interrupted_llm_with_incremented_attempt() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("interrupted-llm-attempt");
+        seed_interrupted_llm_run(&app);
+        let server = MockAnthropic::new(vec![json!({
+            "content": [{"type": "text", "text": "continued"}],
+            "stop_reason": "end_turn",
+        })]);
+        let _env = EnvGuard::set(&server.base_url);
+
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        let llm_attempts: Vec<_> = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .filter(|step| step.kind == "llm_call")
+            .map(|step| (step.status, step.attempt))
+            .collect();
+        assert_eq!(
+            llm_attempts,
+            vec![("started".to_string(), 2), ("completed".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn resume_refuses_recently_updated_running_run() {
+        let app = TempApp::new("fresh-running-run");
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "still active")
+            .unwrap();
+
+        let err = resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            panic!("fresh running guard should reject before loading config")
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("still appears active"));
+        assert_eq!(journal.run("run-1").unwrap().status, "running");
     }
 
     #[test]

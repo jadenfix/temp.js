@@ -220,7 +220,7 @@ impl ToolRegistry {
     ) -> Result<Self> {
         let mut tools = Vec::new();
         for decl in decls {
-            match decl.kind.as_str() {
+            let entry = match decl.kind.as_str() {
                 "python" => {
                     let timeout = python_timeout(decl)?;
                     let rel = decl
@@ -231,7 +231,7 @@ impl ToolRegistry {
                         .with_context(|| format!("resolving python tool {}", decl.name))?;
                     let (description, input_schema) = beater_py::load_tool_spec(&path)
                         .with_context(|| format!("loading python tool {}", decl.name))?;
-                    tools.push(ToolEntry {
+                    ToolEntry {
                         name: decl.name.clone(),
                         description,
                         input_schema,
@@ -241,12 +241,13 @@ impl ToolRegistry {
                             path,
                             timeout,
                         },
-                    });
+                    }
                 }
                 "rust" => {
-                    let entry = rust_builtin(&decl.name)
+                    let mut entry = rust_builtin(&decl.name)
                         .with_context(|| format!("unknown rust builtin tool {}", decl.name))?;
-                    tools.push(entry);
+                    entry.idempotent = decl.idempotent;
+                    entry
                 }
                 "remote_mcp" => {
                     let description = decl.description.clone().with_context(|| {
@@ -256,13 +257,13 @@ impl ToolRegistry {
                         format!("remote_mcp tool {} requires inputSchema", decl.name)
                     })?;
                     let config = RemoteMcpTool::from_decl(decl)?;
-                    tools.push(ToolEntry {
+                    ToolEntry {
                         name: decl.name.clone(),
                         description,
                         input_schema,
                         idempotent: decl.idempotent,
                         imp: ToolImpl::RemoteMcp { config },
-                    });
+                    }
                 }
                 "browser" => {
                     let description = decl.description.clone().with_context(|| {
@@ -272,13 +273,13 @@ impl ToolRegistry {
                         format!("browser tool {} requires inputSchema", decl.name)
                     })?;
                     let config = BrowserTool::from_decl(decl)?;
-                    tools.push(ToolEntry {
+                    ToolEntry {
                         name: decl.name.clone(),
                         description,
                         input_schema,
                         idempotent: decl.idempotent,
                         imp: ToolImpl::Browser { config },
-                    });
+                    }
                 }
                 "sandbox" => {
                     let lane = decl.lane.clone().unwrap_or(beatbox_client::Lane::Wasm);
@@ -299,7 +300,7 @@ impl ToolRegistry {
                         .input_schema
                         .clone()
                         .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-                    tools.push(ToolEntry {
+                    ToolEntry {
                         name: decl.name.clone(),
                         description,
                         input_schema,
@@ -311,10 +312,11 @@ impl ToolRegistry {
                             policy,
                             entrypoint: decl.entrypoint.clone(),
                         })),
-                    });
+                    }
                 }
                 other => bail!("unknown tool kind {other:?} for tool {}", decl.name),
-            }
+            };
+            push_unique_tool(&mut tools, entry);
         }
         Ok(Self { tools })
     }
@@ -402,6 +404,17 @@ impl ToolRegistry {
                 .await
             }
         }
+    }
+}
+
+fn push_unique_tool(tools: &mut Vec<ToolEntry>, tool: ToolEntry) {
+    if tools.iter().any(|existing| existing.name == tool.name) {
+        tracing::warn!(
+            "duplicate tool {} within agent — keeping the first",
+            tool.name
+        );
+    } else {
+        tools.push(tool);
     }
 }
 
@@ -609,7 +622,9 @@ async fn execute_sandbox(
         policy,
         idempotency_key,
     };
-    let client = beatbox.client();
+    let client = beatbox
+        .client()
+        .with_timeout(job_poll_timeout(request.policy.limits.wall_ms))?;
     let result = if request.idempotency_key.is_some() {
         execute_sandbox_job(&client, &request).await?
     } else {
@@ -724,6 +739,7 @@ enum IdempotencyKeySource {
 
 enum RemoteAttempt {
     Retryable(anyhow::Error),
+    RetryableNoSideEffect(anyhow::Error),
     ProviderFailure(anyhow::Error),
     AmbiguousSuccess(anyhow::Error),
     Fatal(anyhow::Error),
@@ -1019,7 +1035,9 @@ impl RemoteMcpTool {
                 .await
             {
                 Ok(result) => return Ok(result),
-                Err(RemoteAttempt::Retryable(error)) if attempt < attempts => {
+                Err(
+                    RemoteAttempt::Retryable(error) | RemoteAttempt::RetryableNoSideEffect(error),
+                ) if attempt < attempts => {
                     tracing::warn!(
                         "remote MCP tool {} attempt {attempt}/{attempts} failed: {error:#}",
                         self.remote_tool
@@ -1036,6 +1054,7 @@ impl RemoteMcpTool {
                 }
                 Err(
                     RemoteAttempt::Retryable(error)
+                    | RemoteAttempt::RetryableNoSideEffect(error)
                     | RemoteAttempt::ProviderFailure(error)
                     | RemoteAttempt::AmbiguousSuccess(error)
                     | RemoteAttempt::Fatal(error),
@@ -1113,12 +1132,17 @@ impl RemoteMcpTool {
         }
 
         let response = request.send().await.map_err(|error| {
+            let had_no_side_effect = error.is_connect();
             let error = anyhow!(
                 "remote MCP tool {} request to {} failed: {error}",
                 self.remote_tool,
                 self.endpoint
             );
-            RemoteAttempt::Retryable(error)
+            if had_no_side_effect {
+                RemoteAttempt::RetryableNoSideEffect(error)
+            } else {
+                RemoteAttempt::Retryable(error)
+            }
         })?;
         let status = response.status();
         let text = response.text().await.map_err(|error| {
@@ -1408,6 +1432,29 @@ mod tests {
             once.description
                 .contains("explicitly asks for slow_summarize_once by name")
         );
+    }
+
+    #[test]
+    fn registry_deduplicates_tool_names_within_one_agent() {
+        let registry = ToolRegistry::build(
+            PathBuf::new().as_path(),
+            &[rust_decl("get_time", true), rust_decl("get_time", false)],
+        )
+        .expect("registry should keep first duplicate");
+
+        assert_eq!(registry.entries().len(), 1);
+        let tool = registry.get("get_time").unwrap();
+        assert!(matches!(tool.imp, ToolImpl::RustBuiltin));
+        assert!(tool.idempotent);
+    }
+
+    #[test]
+    fn rust_builtin_honors_declared_idempotent_flag() {
+        let registry =
+            ToolRegistry::build(PathBuf::new().as_path(), &[rust_decl("get_time", false)])
+                .expect("rust builtin registry should build");
+
+        assert!(!registry.get("get_time").unwrap().idempotent);
     }
 
     #[test]
@@ -1951,6 +1998,38 @@ def run(input):
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn remote_mcp_connect_errors_do_not_need_review_for_non_idempotent_tools() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        let mut decl = remote_decl(&endpoint, None, None, false);
+        decl.timeout_ms = Some(100);
+        let registry = ToolRegistry::build(PathBuf::new().as_path(), &[decl])
+            .expect("remote MCP registry should build");
+
+        let error = registry
+            .execute_with_context(
+                "crm.lookup",
+                &json!({"email": "a@example.com"}),
+                &ToolCallContext {
+                    tool_use_id: Some("toolu_connect".to_string()),
+                    ..ToolCallContext::default()
+                },
+            )
+            .await
+            .expect_err("connect-refused should fail");
+
+        assert!(
+            error.downcast_ref::<ToolNeedsReview>().is_none(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("failed"), "{error:#}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn remote_mcp_retries_server_errors_with_tool_use_id() {
         let server = MockMcp::new(vec![
             MockResponse::json(
@@ -2215,6 +2294,15 @@ def run(input):
             "name": name,
             "path": path,
             "idempotent": idempotent
+        }))
+        .unwrap()
+    }
+
+    fn rust_decl(name: &str, idempotent: bool) -> ToolDecl {
+        serde_json::from_value(json!({
+            "kind": "rust",
+            "name": name,
+            "idempotent": idempotent,
         }))
         .unwrap()
     }

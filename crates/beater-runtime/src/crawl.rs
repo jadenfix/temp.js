@@ -83,12 +83,18 @@ pub fn llms_txt(
             Some(m) if !m.crawl => continue,
             Some(m) => {
                 let title = m.title.clone().unwrap_or_else(|| pattern.clone());
+                let href = markdown_link_destination(&format!("{base_url}{pattern}"));
+                let title = markdown_link_text(&title);
                 match &m.description {
-                    Some(d) => out.push_str(&format!("- [{title}]({base_url}{pattern}): {d}\n")),
-                    None => out.push_str(&format!("- [{title}]({base_url}{pattern})\n")),
+                    Some(d) => out.push_str(&format!("- [{title}]({href}): {d}\n")),
+                    None => out.push_str(&format!("- [{title}]({href})\n")),
                 }
             }
-            None => out.push_str(&format!("- [{pattern}]({base_url}{pattern})\n")),
+            None => {
+                let href = markdown_link_destination(&format!("{base_url}{pattern}"));
+                let title = markdown_link_text(pattern);
+                out.push_str(&format!("- [{title}]({href})\n"));
+            }
         }
     }
     if !agents.is_empty() {
@@ -154,6 +160,26 @@ fn escape_xml_text(value: &str) -> String {
     out
 }
 
+fn markdown_link_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn markdown_link_destination(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            ' ' => out.push_str("%20"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +210,26 @@ mod tests {
             ),
             "{xml}"
         );
+    }
+
+    #[test]
+    fn llms_txt_escapes_markdown_link_text_and_destination() {
+        let llms = llms_txt(
+            "hello",
+            "https://example.test/root",
+            &[(
+                "/docs/(draft)".to_string(),
+                Some(RouteMeta {
+                    title: Some("Docs [draft]".to_string()),
+                    description: None,
+                    crawl: true,
+                }),
+            )],
+            &[],
+            &crate::mcp::AccessConfig::default(),
+        );
+
+        assert!(llms.contains("- [Docs \\[draft\\]](https://example.test/root/docs/%28draft%29)"));
     }
 
     #[test]

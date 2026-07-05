@@ -375,7 +375,7 @@ impl ConnectApp {
         writeln!(out, "  \"version\": \"{}\",", json_escape(&self.version)).ok();
         writeln!(out, "  \"base_url\": \"{}\",", json_escape(&self.base_url)).ok();
         writeln!(out, "  \"endpoints\": {{").ok();
-        writeln!(out, "    \"mcp\": \"/mcp\",").ok();
+        writeln!(out, "    \"mcp_catalog\": \"/mcp/catalog.json\",").ok();
         writeln!(out, "    \"openapi\": \"/openapi.json\",").ok();
         writeln!(out, "    \"agent_card\": \"/.well-known/agent-card.json\",").ok();
         writeln!(out, "    \"llms\": \"/llms.txt\",").ok();
@@ -384,14 +384,9 @@ impl ConnectApp {
         writeln!(out, "  }},").ok();
         writeln!(
             out,
-            "  \"capabilities\": [\"resources\", \"actions\", \"openapi\", \"mcp\", \"a2a\", \"crawl\", \"receipts\"],"
+            "  \"capabilities\": [\"resources\", \"actions\", \"openapi\", \"mcp_catalog\", \"a2a\", \"crawl\"],"
         )
         .ok();
-        writeln!(out, "  \"auth\": {{").ok();
-        writeln!(out, "    \"type\": \"oauth2\",").ok();
-        writeln!(out, "    \"authorization_url\": \"/oauth/authorize\",").ok();
-        writeln!(out, "    \"token_url\": \"/oauth/token\"").ok();
-        writeln!(out, "  }},").ok();
         writeln!(out, "  \"resources\": {},", self.resources_json(2)).ok();
         writeln!(out, "  \"actions\": {}", self.actions_json(2)).ok();
         writeln!(out, "}}").ok();
@@ -410,9 +405,8 @@ impl ConnectApp {
         .ok();
         writeln!(out, "  \"url\": \"{}\",", json_escape(&self.base_url)).ok();
         writeln!(out, "  \"version\": \"{}\",", json_escape(&self.version)).ok();
-        writeln!(out, "  \"preferred_transport\": \"mcp\",").ok();
+        writeln!(out, "  \"preferred_transport\": \"openapi\",").ok();
         writeln!(out, "  \"interfaces\": [").ok();
-        writeln!(out, "    {{ \"type\": \"mcp\", \"url\": \"/mcp\" }},").ok();
         writeln!(
             out,
             "    {{ \"type\": \"openapi\", \"url\": \"/openapi.json\" }}"
@@ -444,14 +438,7 @@ impl ConnectApp {
             ));
         }
         writeln!(out, "{}", rows.join(",\n")).ok();
-        writeln!(out, "  ],").ok();
-        writeln!(out, "  \"security_schemes\": {{").ok();
-        writeln!(out, "    \"oauth2\": {{").ok();
-        writeln!(out, "      \"type\": \"oauth2\",").ok();
-        writeln!(out, "      \"authorization_url\": \"/oauth/authorize\",").ok();
-        writeln!(out, "      \"token_url\": \"/oauth/token\"").ok();
-        writeln!(out, "    }}").ok();
-        writeln!(out, "  }}").ok();
+        writeln!(out, "  ]").ok();
         writeln!(out, "}}").ok();
         out
     }
@@ -481,24 +468,7 @@ impl ConnectApp {
         let path_rows = self.openapi_path_rows();
         writeln!(out, "{}", path_rows.join(",\n")).ok();
         writeln!(out, "  }},").ok();
-        writeln!(out, "  \"components\": {{").ok();
-        writeln!(out, "    \"securitySchemes\": {{").ok();
-        writeln!(out, "      \"oauth2\": {{").ok();
-        writeln!(out, "        \"type\": \"oauth2\",").ok();
-        writeln!(out, "        \"flows\": {{").ok();
-        writeln!(out, "          \"authorizationCode\": {{").ok();
-        writeln!(
-            out,
-            "            \"authorizationUrl\": \"/oauth/authorize\","
-        )
-        .ok();
-        writeln!(out, "            \"tokenUrl\": \"/oauth/token\",").ok();
-        writeln!(out, "            \"scopes\": {}", self.scopes_json(12)).ok();
-        writeln!(out, "          }}").ok();
-        writeln!(out, "        }}").ok();
-        writeln!(out, "      }}").ok();
-        writeln!(out, "    }}").ok();
-        writeln!(out, "  }}").ok();
+        writeln!(out, "  \"components\": {{}}").ok();
         writeln!(out, "}}").ok();
         out
     }
@@ -794,20 +764,14 @@ impl ConnectApp {
 
     fn action_operation_json(&self, action: &Action) -> String {
         let method = action.method.to_ascii_lowercase();
-        let security = match action.auth {
-            Auth::Public => "[]".to_string(),
-            _ => format!(
-                "[{{ \"oauth2\": {} }}]",
-                string_array_json(action.auth.scopes())
-            ),
-        };
+        let security = "[]";
         let idempotency_header = if action.idempotency_required {
             "\n        \"parameters\": [\n          {\n            \"name\": \"Idempotency-Key\",\n            \"in\": \"header\",\n            \"required\": true,\n            \"schema\": { \"type\": \"string\" }\n          }\n        ],"
         } else {
             ""
         };
         format!(
-            "      \"{}\": {{\n        \"operationId\": \"{}\",\n        \"summary\": \"{}\",\n        \"description\": \"{}\",\n        \"security\": {},{}\n        \"x-beater-connect\": {{\n          \"sideEffect\": \"{}\",\n          \"confirm\": {},\n          \"dryRun\": {},\n          \"idempotencyRequired\": {}\n        }},\n        \"requestBody\": {{\n          \"required\": true,\n          \"content\": {{\n            \"application/json\": {{\n              \"schema\": {}\n            }}\n          }}\n        }},\n        \"responses\": {{\n          \"200\": {{ \"description\": \"Action result\" }}\n        }}\n      }}",
+            "      \"{}\": {{\n        \"operationId\": \"{}\",\n        \"summary\": \"{}\",\n        \"description\": \"{}\",\n        \"security\": {},{}\n        \"x-beater-connect\": {{\n          \"sideEffect\": \"{}\",\n          \"confirm\": {},\n          \"dryRun\": {},\n          \"idempotencyRequired\": {},\n          \"auth\": {}\n        }},\n        \"requestBody\": {{\n          \"required\": true,\n          \"content\": {{\n            \"application/json\": {{\n              \"schema\": {}\n            }}\n          }}\n        }},\n        \"responses\": {{\n          \"200\": {{ \"description\": \"Action result\" }}\n        }}\n      }}",
             json_escape(&method),
             json_escape(&action.id),
             json_escape(&action.title),
@@ -818,35 +782,9 @@ impl ConnectApp {
             action.confirm,
             action.dry_run,
             action.idempotency_required,
+            auth_json(&action.auth, 10),
             action.input.json_schema(14)
         )
-    }
-
-    fn scopes_json(&self, indent: usize) -> String {
-        let pad = " ".repeat(indent);
-        let inner = " ".repeat(indent + 2);
-        let mut scopes = Vec::new();
-        for action in &self.actions {
-            for scope in action.auth.scopes() {
-                if !scopes.contains(scope) {
-                    scopes.push(scope.to_string());
-                }
-            }
-        }
-        let mut out = String::new();
-        writeln!(out, "{{").ok();
-        for (index, scope) in scopes.iter().enumerate() {
-            let comma = if index + 1 == scopes.len() { "" } else { "," };
-            writeln!(
-                out,
-                "{inner}\"{}\": \"{}\"{comma}",
-                json_escape(scope),
-                json_escape(&format!("Access scope {scope}"))
-            )
-            .ok();
-        }
-        write!(out, "{pad}}}").ok();
-        out
     }
 }
 
@@ -1083,6 +1021,44 @@ mod tests {
         let openapi = demo_app().openapi_json();
         assert!(openapi.contains("\"Idempotency-Key\""));
         assert!(openapi.contains("\"idempotencyRequired\": true"));
+    }
+
+    #[test]
+    fn generated_discovery_only_advertises_implemented_static_surfaces() {
+        let app = demo_app();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&app.beater_manifest_json()).expect("manifest should be JSON");
+        assert_eq!(manifest["endpoints"]["mcp_catalog"], "/mcp/catalog.json");
+        assert!(manifest["endpoints"].get("mcp").is_none());
+        assert!(manifest.get("auth").is_none());
+        let capabilities = manifest["capabilities"]
+            .as_array()
+            .expect("capabilities should be an array");
+        assert!(capabilities.iter().any(|value| value == "mcp_catalog"));
+        assert!(!capabilities.iter().any(|value| value == "mcp"));
+        assert!(!capabilities.iter().any(|value| value == "receipts"));
+
+        let agent_card: serde_json::Value =
+            serde_json::from_str(&app.agent_card_json()).expect("agent card should be JSON");
+        assert_eq!(agent_card["preferred_transport"], "openapi");
+        assert!(agent_card.get("security_schemes").is_none());
+        assert!(
+            agent_card["interfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|interface| interface["type"] != "mcp")
+        );
+
+        let openapi: serde_json::Value =
+            serde_json::from_str(&app.openapi_json()).expect("openapi should be JSON");
+        assert!(openapi["components"]["securitySchemes"].is_null());
+        assert!(!app.openapi_json().contains("/oauth/"));
+        assert_eq!(
+            openapi["paths"]["/agent/actions/book-demo"]["post"]["x-beater-connect"]["auth"]["type"],
+            "user"
+        );
     }
 
     #[test]

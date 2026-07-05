@@ -6,7 +6,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context as TaskContext, Poll, Waker};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -19,7 +24,12 @@ use tokio::sync::{mpsc, oneshot};
 use crate::loader::BeaterModuleLoader;
 
 const WORKER_SHUTDOWN_STREAM_ERROR: &str = "js worker shut down before stream completed";
+const WORKER_EXECUTION_TIMEOUT_ERROR: &str = "js execution timed out";
 const STREAM_CHUNK_QUEUE_CAPACITY: usize = 16;
+#[cfg(test)]
+const WORKER_EXECUTION_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const WORKER_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 type StreamItem = Result<Bytes, io::Error>;
 type StreamSender = mpsc::Sender<StreamItem>;
@@ -52,6 +62,16 @@ pub enum WorkerMsg {
     },
     CancelStream {
         stream_id: u32,
+    },
+    #[cfg(test)]
+    EvalBool {
+        code: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    #[cfg(test)]
+    RegisterTestStream {
+        stream_id: u32,
+        reply: oneshot::Sender<StreamReceiver>,
     },
 }
 
@@ -182,6 +202,44 @@ pub fn spawn() -> Result<WorkerHandle> {
 }
 
 async fn worker_main(mut rx: mpsc::Receiver<WorkerMsg>) {
+    let mut runtime = new_js_runtime();
+    tracing::debug!("js worker ready (V8 {})", v8::VERSION_STRING);
+
+    let mut next_stream_id = 1_u32;
+    loop {
+        if let Err(e) = poll_event_loop_once(&mut runtime) {
+            fail_active_streams(&mut runtime, e);
+        }
+        if active_streams(&runtime) {
+            tokio::select! {
+                maybe_msg = rx.recv() => {
+                    let Some(msg) = maybe_msg else {
+                        fail_active_streams_for_shutdown(&mut runtime);
+                        break;
+                    };
+                    if handle_worker_msg(&mut runtime, &mut next_stream_id, msg).await {
+                        fail_active_streams(&mut runtime, WORKER_EXECUTION_TIMEOUT_ERROR.to_string());
+                        recycle_js_runtime(&mut runtime);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        } else {
+            tokio::select! {
+                maybe_msg = rx.recv() => {
+                    let Some(msg) = maybe_msg else { break };
+                    if handle_worker_msg(&mut runtime, &mut next_stream_id, msg).await {
+                        recycle_js_runtime(&mut runtime);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+    }
+    tracing::debug!("js worker shutting down");
+}
+
+fn new_js_runtime() -> JsRuntime {
     let mut runtime = JsRuntime::new(RuntimeOptions {
         module_loader: Some(Rc::new(BeaterModuleLoader)),
         extensions: vec![beater_ext::init()],
@@ -190,34 +248,21 @@ async fn worker_main(mut rx: mpsc::Receiver<WorkerMsg>) {
     runtime
         .execute_script("beater:bootstrap", include_str!("bootstrap.js"))
         .expect("bootstrap.js must evaluate");
-    tracing::debug!("js worker ready (V8 {})", v8::VERSION_STRING);
-
-    let mut next_stream_id = 1_u32;
-    loop {
-        if active_streams(&runtime) {
-            if let Err(e) = poll_event_loop_once(&mut runtime) {
-                fail_active_streams(&mut runtime, e);
-            }
-
-            tokio::select! {
-                maybe_msg = rx.recv() => {
-                    let Some(msg) = maybe_msg else {
-                        fail_active_streams_for_shutdown(&mut runtime);
-                        break;
-                    };
-                    handle_worker_msg(&mut runtime, &mut next_stream_id, msg).await;
-                }
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
-            }
-        } else {
-            let Some(msg) = rx.recv().await else { break };
-            handle_worker_msg(&mut runtime, &mut next_stream_id, msg).await;
-        }
-    }
-    tracing::debug!("js worker shutting down");
+    runtime
 }
 
-async fn handle_worker_msg(runtime: &mut JsRuntime, next_stream_id: &mut u32, msg: WorkerMsg) {
+fn recycle_js_runtime(runtime: &mut JsRuntime) {
+    // Dropping a just-terminated Deno runtime can re-enter V8 in an invalid handle scope.
+    // Timeouts are exceptional; install a fresh isolate and leave the terminated one inert.
+    let terminated = std::mem::replace(runtime, new_js_runtime());
+    std::mem::forget(terminated);
+}
+
+async fn handle_worker_msg(
+    runtime: &mut JsRuntime,
+    next_stream_id: &mut u32,
+    msg: WorkerMsg,
+) -> bool {
     match msg {
         WorkerMsg::Route {
             specifier,
@@ -227,12 +272,13 @@ async fn handle_worker_msg(runtime: &mut JsRuntime, next_stream_id: &mut u32, ms
             reply,
         } => {
             if page {
-                let stream_id = *next_stream_id;
-                *next_stream_id = next_stream_id.saturating_add(1).max(1);
-                dispatch_page_stream(runtime, &specifier, &request_json, stream_id, reply).await;
+                let stream_id = allocate_stream_id(next_stream_id);
+                dispatch_page_stream(runtime, &specifier, &request_json, stream_id, reply).await
             } else {
                 let result = dispatch_api(runtime, &specifier, &method, &request_json).await;
+                let recycle = is_execution_timeout(&result);
                 let _ = reply.send(result);
+                recycle
             }
         }
         WorkerMsg::RscFlight {
@@ -240,20 +286,67 @@ async fn handle_worker_msg(runtime: &mut JsRuntime, next_stream_id: &mut u32, ms
             request_json,
             reply,
         } => {
-            let stream_id = *next_stream_id;
-            *next_stream_id = next_stream_id.saturating_add(1).max(1);
-            dispatch_rsc_flight_stream(runtime, &specifier, &request_json, stream_id, reply).await;
+            let stream_id = allocate_stream_id(next_stream_id);
+            dispatch_rsc_flight_stream(runtime, &specifier, &request_json, stream_id, reply).await
         }
         WorkerMsg::RouteMeta { specifier, reply } => {
             let result = route_meta(runtime, &specifier).await;
+            let recycle = is_execution_timeout(&result);
             let _ = reply.send(result);
+            recycle
         }
         WorkerMsg::CancelStream { stream_id } => {
-            if cancel_page_stream(runtime, stream_id).await.is_err() {
+            let result = cancel_page_stream(runtime, stream_id).await;
+            let recycle = is_execution_timeout(&result);
+            if result.is_err() {
                 remove_page_stream(runtime, stream_id);
             }
+            recycle
+        }
+        #[cfg(test)]
+        WorkerMsg::EvalBool { code, reply } => {
+            let result = eval_bool_script(runtime, &code);
+            let recycle = is_execution_timeout(&result);
+            let _ = reply.send(result);
+            recycle
+        }
+        #[cfg(test)]
+        WorkerMsg::RegisterTestStream { stream_id, reply } => {
+            let (body_tx, body_rx) = stream_body_channel();
+            register_page_stream(runtime, stream_id, body_tx);
+            let _ = reply.send(body_rx);
+            false
         }
     }
+}
+
+fn allocate_stream_id(next_stream_id: &mut u32) -> u32 {
+    let stream_id = (*next_stream_id).max(1);
+    *next_stream_id = stream_id.wrapping_add(1).max(1);
+    stream_id
+}
+
+#[cfg(test)]
+fn eval_bool_script(runtime: &mut JsRuntime, code: &str) -> Result<bool, String> {
+    let deadline = ExecutionDeadline::start(runtime, "test eval");
+    let global = match runtime.execute_script("beater:test-eval-bool", code.to_string()) {
+        Ok(global) => global,
+        Err(e) => {
+            let error = if deadline.tripped() {
+                deadline.timeout_error()
+            } else {
+                format_js_error(&e)
+            };
+            return deadline.finish(runtime, Err(error));
+        }
+    };
+    let result = {
+        deno_core::scope!(scope, runtime);
+        let local = v8::Local::new(scope, global);
+        deno_core::serde_v8::from_v8(scope, local)
+            .map_err(|e| format!("eval did not return bool: {e}"))
+    };
+    deadline.finish(runtime, result)
 }
 
 fn active_streams(runtime: &JsRuntime) -> bool {
@@ -306,6 +399,98 @@ fn stream_body_channel() -> (StreamSender, StreamReceiver) {
     mpsc::channel(STREAM_CHUNK_QUEUE_CAPACITY)
 }
 
+struct ExecutionDeadline {
+    tripped: Arc<AtomicBool>,
+    cancel: Option<std::sync::mpsc::Sender<()>>,
+    watchdog: Option<JoinHandle<()>>,
+    operation: &'static str,
+}
+
+impl ExecutionDeadline {
+    fn start(runtime: &mut JsRuntime, operation: &'static str) -> Self {
+        let tripped = Arc::new(AtomicBool::new(false));
+        let watchdog_tripped = Arc::clone(&tripped);
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        let isolate = runtime.v8_isolate().thread_safe_handle();
+        let watchdog = std::thread::spawn(move || {
+            if cancelled
+                .recv_timeout(WORKER_EXECUTION_TIMEOUT)
+                .is_err_and(|err| err == std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                watchdog_tripped.store(true, Ordering::Release);
+                let _ = isolate.terminate_execution();
+            };
+        });
+        Self {
+            tripped,
+            cancel: Some(cancel),
+            watchdog: Some(watchdog),
+            operation,
+        }
+    }
+
+    fn tripped(&self) -> bool {
+        self.tripped.load(Ordering::Acquire)
+    }
+
+    fn timeout_error(&self) -> String {
+        format!(
+            "{WORKER_EXECUTION_TIMEOUT_ERROR} during {} after {:?}",
+            self.operation, WORKER_EXECUTION_TIMEOUT
+        )
+    }
+
+    fn finish<T>(
+        mut self,
+        runtime: &mut JsRuntime,
+        result: Result<T, String>,
+    ) -> Result<T, String> {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+        if self.tripped.load(Ordering::Acquire) {
+            let _ = runtime.v8_isolate().cancel_terminate_execution();
+            return Err(self.timeout_error());
+        }
+        result
+    }
+}
+
+fn is_execution_timeout<T>(result: &Result<T, String>) -> bool {
+    matches!(result, Err(error) if error.contains(WORKER_EXECUTION_TIMEOUT_ERROR))
+}
+
+fn format_core_error_for_deadline(deadline: &ExecutionDeadline, err: CoreError) -> String {
+    if deadline.tripped() {
+        deadline.timeout_error()
+    } else {
+        format_core_error(err)
+    }
+}
+
+fn execute_script_with_deadline(
+    runtime: &mut JsRuntime,
+    name: &'static str,
+    code: String,
+    operation: &'static str,
+) -> Result<(v8::Global<v8::Value>, ExecutionDeadline), String> {
+    let deadline = ExecutionDeadline::start(runtime, operation);
+    match runtime.execute_script(name, code) {
+        Ok(value) => Ok((value, deadline)),
+        Err(e) => {
+            let error = if deadline.tripped() {
+                deadline.timeout_error()
+            } else {
+                format_js_error(&e)
+            };
+            Err(deadline.finish::<()>(runtime, Err(error)).unwrap_err())
+        }
+    }
+}
+
 async fn dispatch_api(
     runtime: &mut JsRuntime,
     specifier: &str,
@@ -318,28 +503,42 @@ async fn dispatch_api(
         serde_json::Value::String(method.to_string()),
         request_json,
     );
-    let promise = runtime
-        .execute_script("beater:dispatch", code)
-        .map_err(|e| format_js_error(&e))?;
+    let (promise, deadline) =
+        execute_script_with_deadline(runtime, "beater:dispatch", code, "route handler")?;
     let resolved = runtime.resolve(promise);
-    let global = runtime
+    let global = match runtime
         .with_event_loop_promise(resolved, PollEventLoopOptions::default())
         .await
-        .map_err(format_core_error)?;
+    {
+        Ok(global) => global,
+        Err(e) => {
+            let error = format_core_error_for_deadline(&deadline, e);
+            return deadline.finish(runtime, Err(error));
+        }
+    };
 
-    deno_core::scope!(scope, runtime);
-    let local = v8::Local::new(scope, global);
-    let response: JsRouteResponse = deno_core::serde_v8::from_v8(scope, local)
-        .map_err(|e| format!("route response did not match {{ status, headers, body }}: {e}"))?;
-    Ok(RouteResponse {
-        status: response.status,
-        headers: response.headers,
-        body: if response.body_chunks.is_empty() {
-            RouteBody::Full(response.body)
-        } else {
-            RouteBody::Chunks(response.body_chunks)
-        },
-    })
+    let response: Result<JsRouteResponse, String> = {
+        deno_core::scope!(scope, runtime);
+        let local = v8::Local::new(scope, global);
+        deno_core::serde_v8::from_v8(scope, local)
+            .map_err(|e| format!("route response did not match {{ status, headers, body }}: {e}"))
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => return deadline.finish(runtime, Err(e)),
+    };
+    deadline.finish(
+        runtime,
+        Ok(RouteResponse {
+            status: response.status,
+            headers: response.headers,
+            body: if response.body_chunks.is_empty() {
+                RouteBody::Full(response.body)
+            } else {
+                RouteBody::Chunks(response.body_chunks)
+            },
+        }),
+    )
 }
 
 async fn dispatch_page_stream(
@@ -348,7 +547,7 @@ async fn dispatch_page_stream(
     request_json: &str,
     stream_id: u32,
     reply: oneshot::Sender<Result<RouteResponse, String>>,
-) {
+) -> bool {
     let (body_tx, body_rx) = stream_body_channel();
     register_page_stream(runtime, stream_id, body_tx);
 
@@ -356,8 +555,9 @@ async fn dispatch_page_stream(
         Ok(stream) => stream,
         Err(e) => {
             remove_page_stream(runtime, stream_id);
+            let recycle = e.contains(WORKER_EXECUTION_TIMEOUT_ERROR);
             let _ = reply.send(Err(e));
-            return;
+            return recycle;
         }
     };
 
@@ -372,6 +572,7 @@ async fn dispatch_page_stream(
     if reply.send(Ok(response)).is_err() {
         let _ = cancel_page_stream(runtime, stream_id).await;
     }
+    false
 }
 
 async fn dispatch_rsc_flight_stream(
@@ -380,7 +581,7 @@ async fn dispatch_rsc_flight_stream(
     request_json: &str,
     stream_id: u32,
     reply: oneshot::Sender<Result<RouteResponse, String>>,
-) {
+) -> bool {
     let (body_tx, body_rx) = stream_body_channel();
     register_page_stream(runtime, stream_id, body_tx);
 
@@ -389,8 +590,9 @@ async fn dispatch_rsc_flight_stream(
             Ok(stream) => stream,
             Err(e) => {
                 remove_page_stream(runtime, stream_id);
+                let recycle = e.contains(WORKER_EXECUTION_TIMEOUT_ERROR);
                 let _ = reply.send(Err(e));
-                return;
+                return recycle;
             }
         };
 
@@ -405,6 +607,7 @@ async fn dispatch_rsc_flight_stream(
     if reply.send(Ok(response)).is_err() {
         let _ = cancel_page_stream(runtime, stream_id).await;
     }
+    false
 }
 
 fn register_page_stream(runtime: &mut JsRuntime, stream_id: u32, tx: StreamSender) {
@@ -436,19 +639,27 @@ async fn prepare_page_stream(
         serde_json::Value::String(specifier.to_string()),
         request_json,
     );
-    let promise = runtime
-        .execute_script("beater:prepare-page-stream", code)
-        .map_err(|e| format_js_error(&e))?;
+    let (promise, deadline) =
+        execute_script_with_deadline(runtime, "beater:prepare-page-stream", code, "page render")?;
     let resolved = runtime.resolve(promise);
-    let global = runtime
+    let global = match runtime
         .with_event_loop_promise(resolved, PollEventLoopOptions::default())
         .await
-        .map_err(format_core_error)?;
+    {
+        Ok(global) => global,
+        Err(e) => {
+            let error = format_core_error_for_deadline(&deadline, e);
+            return deadline.finish(runtime, Err(error));
+        }
+    };
 
-    deno_core::scope!(scope, runtime);
-    let local = v8::Local::new(scope, global);
-    deno_core::serde_v8::from_v8(scope, local)
-        .map_err(|e| format!("page stream response did not match {{ status, headers }}: {e}"))
+    let result = {
+        deno_core::scope!(scope, runtime);
+        let local = v8::Local::new(scope, global);
+        deno_core::serde_v8::from_v8(scope, local)
+            .map_err(|e| format!("page stream response did not match {{ status, headers }}: {e}"))
+    };
+    deadline.finish(runtime, result)
 }
 
 async fn prepare_rsc_flight_stream(
@@ -462,32 +673,47 @@ async fn prepare_rsc_flight_stream(
         serde_json::Value::String(specifier.to_string()),
         request_json,
     );
-    let promise = runtime
-        .execute_script("beater:prepare-rsc-flight-stream", code)
-        .map_err(|e| format_js_error(&e))?;
+    let (promise, deadline) = execute_script_with_deadline(
+        runtime,
+        "beater:prepare-rsc-flight-stream",
+        code,
+        "RSC flight render",
+    )?;
     let resolved = runtime.resolve(promise);
-    let global = runtime
+    let global = match runtime
         .with_event_loop_promise(resolved, PollEventLoopOptions::default())
         .await
-        .map_err(format_core_error)?;
+    {
+        Ok(global) => global,
+        Err(e) => {
+            let error = format_core_error_for_deadline(&deadline, e);
+            return deadline.finish(runtime, Err(error));
+        }
+    };
 
-    deno_core::scope!(scope, runtime);
-    let local = v8::Local::new(scope, global);
-    deno_core::serde_v8::from_v8(scope, local)
-        .map_err(|e| format!("RSC flight stream response did not match {{ status, headers }}: {e}"))
+    let result = {
+        deno_core::scope!(scope, runtime);
+        let local = v8::Local::new(scope, global);
+        deno_core::serde_v8::from_v8(scope, local).map_err(|e| {
+            format!("RSC flight stream response did not match {{ status, headers }}: {e}")
+        })
+    };
+    deadline.finish(runtime, result)
 }
 
 async fn cancel_page_stream(runtime: &mut JsRuntime, stream_id: u32) -> Result<(), String> {
     let code = format!("globalThis.__beaterCancelPageStream({stream_id})");
-    let promise = runtime
-        .execute_script("beater:cancel-page-stream", code)
-        .map_err(|e| format_js_error(&e))?;
+    let (promise, deadline) =
+        execute_script_with_deadline(runtime, "beater:cancel-page-stream", code, "stream cancel")?;
     let resolved = runtime.resolve(promise);
-    runtime
+    let result = match runtime
         .with_event_loop_promise(resolved, PollEventLoopOptions::default())
         .await
-        .map(|_| ())
-        .map_err(format_core_error)
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format_core_error_for_deadline(&deadline, e)),
+    };
+    deadline.finish(runtime, result)
 }
 
 async fn route_meta(runtime: &mut JsRuntime, specifier: &str) -> Result<Option<RouteMeta>, String> {
@@ -495,17 +721,25 @@ async fn route_meta(runtime: &mut JsRuntime, specifier: &str) -> Result<Option<R
         "globalThis.__beaterRouteMeta({})",
         serde_json::Value::String(specifier.to_string()),
     );
-    let promise = runtime
-        .execute_script("beater:route-meta", code)
-        .map_err(|e| format_js_error(&e))?;
+    let (promise, deadline) =
+        execute_script_with_deadline(runtime, "beater:route-meta", code, "route metadata")?;
     let resolved = runtime.resolve(promise);
-    let global = runtime
+    let global = match runtime
         .with_event_loop_promise(resolved, PollEventLoopOptions::default())
         .await
-        .map_err(format_core_error)?;
-    deno_core::scope!(scope, runtime);
-    let local = v8::Local::new(scope, global);
-    deno_core::serde_v8::from_v8(scope, local).map_err(|e| format!("bad agent metadata: {e}"))
+    {
+        Ok(global) => global,
+        Err(e) => {
+            let error = format_core_error_for_deadline(&deadline, e);
+            return deadline.finish(runtime, Err(error));
+        }
+    };
+    let result = {
+        deno_core::scope!(scope, runtime);
+        let local = v8::Local::new(scope, global);
+        deno_core::serde_v8::from_v8(scope, local).map_err(|e| format!("bad agent metadata: {e}"))
+    };
+    deadline.finish(runtime, result)
 }
 
 /// Render a JS exception with its (source-mapped) stack for dev output.
@@ -526,6 +760,42 @@ fn format_core_error(err: CoreError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("beater-worker-test-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn write(&self, rel: &str, contents: &str) {
+            let path = self.path.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn runtime_with_bootstrap() -> JsRuntime {
         let mut runtime = JsRuntime::new(RuntimeOptions {
@@ -566,6 +836,128 @@ mod tests {
             tx.try_send(Ok(Bytes::new())),
             Err(mpsc::error::TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn stream_ids_wrap_without_reusing_zero_or_saturating() {
+        let mut next = u32::MAX;
+
+        assert_eq!(allocate_stream_id(&mut next), u32::MAX);
+        assert_eq!(next, 1);
+        assert_eq!(allocate_stream_id(&mut next), 1);
+        assert_eq!(next, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_worker_drives_timers_without_a_followup_request() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<WorkerMsg>(4);
+                let worker = tokio::task::spawn_local(worker_main(rx));
+
+                let (reply, done) = oneshot::channel();
+                tx.send(WorkerMsg::EvalBool {
+                    code: "globalThis.__idleTimerFired = false; setTimeout(() => { globalThis.__idleTimerFired = true; }, 0); true".to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+                assert!(done.await.unwrap().unwrap());
+
+                tokio::time::sleep(Duration::from_millis(30)).await;
+
+                let (reply, done) = oneshot::channel();
+                tx.send(WorkerMsg::EvalBool {
+                    code: "globalThis.__idleTimerFired === true".to_string(),
+                    reply,
+                })
+                .await
+                .unwrap();
+                assert!(
+                    done.await.unwrap().unwrap(),
+                    "idle worker should poll the JS event loop while no streams are active"
+                );
+
+                drop(tx);
+                worker.await.unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wedged_route_handler_times_out_and_worker_recovers() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let app = TempDir::new();
+                app.write(
+                    "app/routes/api/spin.ts",
+                    "export function GET() { while (true) {} }",
+                );
+                app.write(
+                    "app/routes/api/ok.ts",
+                    "export function GET() { return { status: 200, body: 'ok' }; }",
+                );
+                let spin_specifier = deno_core::ModuleSpecifier::from_file_path(
+                    app.path().join("app/routes/api/spin.ts"),
+                )
+                .unwrap()
+                .to_string();
+                let ok_specifier = deno_core::ModuleSpecifier::from_file_path(
+                    app.path().join("app/routes/api/ok.ts"),
+                )
+                .unwrap()
+                .to_string();
+
+                let (tx, rx) = mpsc::channel::<WorkerMsg>(4);
+                let worker = tokio::task::spawn_local(worker_main(rx));
+
+                let (reply, done) = oneshot::channel();
+                tx.send(WorkerMsg::Route {
+                    specifier: spin_specifier,
+                    method: "GET".to_string(),
+                    request_json: "{}".to_string(),
+                    page: false,
+                    reply,
+                })
+                .await
+                .unwrap();
+                let err = tokio::time::timeout(Duration::from_millis(500), done)
+                    .await
+                    .expect("wedged route should be interrupted")
+                    .unwrap()
+                    .expect_err("wedged route should fail");
+                assert!(
+                    err.contains(WORKER_EXECUTION_TIMEOUT_ERROR),
+                    "unexpected route error: {err}"
+                );
+
+                let (reply, done) = oneshot::channel();
+                tx.send(WorkerMsg::Route {
+                    specifier: ok_specifier,
+                    method: "GET".to_string(),
+                    request_json: "{}".to_string(),
+                    page: false,
+                    reply,
+                })
+                .await
+                .unwrap();
+                let response = tokio::time::timeout(Duration::from_millis(500), done)
+                    .await
+                    .expect("worker should recover after rebuilding the isolate")
+                    .unwrap()
+                    .expect("healthy route should pass after timeout recycle");
+                assert_eq!(response.status, 200);
+                match response.body {
+                    RouteBody::Full(body) => assert_eq!(body, "ok"),
+                    other => panic!("expected full response body, got {other:?}"),
+                }
+
+                drop(tx);
+                worker.await.unwrap();
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -827,5 +1219,39 @@ mod tests {
             .expect_err("shutdown should abort the stream");
         assert_eq!(err.to_string(), WORKER_SHUTDOWN_STREAM_ERROR);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_channel_close_aborts_active_streams() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<WorkerMsg>(4);
+                let worker = tokio::task::spawn_local(worker_main(rx));
+                let mut streams = Vec::new();
+
+                for stream_id in [7, 8] {
+                    let (reply, done) = oneshot::channel();
+                    tx.send(WorkerMsg::RegisterTestStream { stream_id, reply })
+                        .await
+                        .unwrap();
+                    streams.push(done.await.unwrap());
+                }
+
+                drop(tx);
+
+                for mut stream in streams {
+                    let err = stream
+                        .recv()
+                        .await
+                        .expect("stream should receive shutdown result")
+                        .expect_err("shutdown should abort active stream");
+                    assert_eq!(err.to_string(), WORKER_SHUTDOWN_STREAM_ERROR);
+                    assert!(stream.recv().await.is_none());
+                }
+
+                worker.await.unwrap();
+            })
+            .await;
     }
 }

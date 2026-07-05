@@ -8,12 +8,12 @@ then emits the protocol and crawl surfaces agents need:
 - `/.well-known/beater.json`
 - `/.well-known/agent-card.json`
 - `/openapi.json`
-- `/mcp` catalog metadata
+- `/mcp/catalog.json` catalog metadata
 - `/llms.txt`
 - `/robots.txt`
 - `/sitemap.xml`
 - clean markdown/JSON resource views
-- action policy metadata for auth, confirmation, dry runs, and receipts
+- action policy metadata for auth, confirmation, dry runs, and future receipts
 
 The goal is simple: a Beater app should be usable by humans, APIs, crawlers, and
 AI agents without four separate integration projects.
@@ -79,13 +79,13 @@ let app = ConnectApp::new(
 ```
 
 From that single registry, Beater Connect generates crawl metadata, OpenAPI,
-A2A-style discovery, MCP-facing tools/resources metadata, and policy hints.
+A2A-style discovery, static MCP-facing tools/resources metadata, and policy hints.
 
 ## MVP Boundaries
 
 This repository currently implements the registry and static generators. It does
-not yet implement a live MCP JSON-RPC transport, OAuth server, or Beater Agents
-trace exporter. Those are the next integration layers.
+not yet implement a live MCP JSON-RPC transport, OAuth server, receipt store, or
+Beater Agents trace exporter. Those are the next integration layers.
 
 ## Design Rules
 

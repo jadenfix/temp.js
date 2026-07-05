@@ -198,7 +198,9 @@ fn spawn_reloader(app_dir: PathBuf, beatbox: BeatboxConfig, state: DevState) {
             tracing::error!("watch {}: {e}", watch_dir.display());
         }
         // keep the watcher alive forever; the dev process owns its lifetime
-        std::thread::park();
+        loop {
+            std::thread::park();
+        }
     });
 
     tokio::spawn(async move {
@@ -461,9 +463,9 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
 
     let page = kind == RouteKind::Page;
     if page && method != "GET" && method != "HEAD" {
-        return Ok(text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "page routes are GET-only".to_string(),
+        return Ok(method_not_allowed_response(
+            "GET, HEAD",
+            "page routes are GET-only",
         ));
     }
     let headers: HashMap<String, String> = req
@@ -476,11 +478,28 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
             )
         })
         .collect();
-    let body_bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await?;
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!("request body rejected: {e}");
+            return Ok(text_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeded the 8 MiB limit".to_string(),
+            ));
+        }
+    };
     let body = if body_bytes.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::Value::String(String::from_utf8_lossy(&body_bytes).into_owned())
+        match String::from_utf8(body_bytes.to_vec()) {
+            Ok(body) => serde_json::Value::String(body),
+            Err(_) => {
+                return Ok(text_response(
+                    StatusCode::BAD_REQUEST,
+                    "request body must be valid UTF-8".to_string(),
+                ));
+            }
+        }
     };
 
     let request_json = json!({
@@ -588,9 +607,9 @@ async fn rsc_flight_response(
     head: bool,
 ) -> Result<Response<Body>> {
     if method != "GET" && method != "HEAD" {
-        return Ok(text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "RSC flight streams are GET-only".to_string(),
+        return Ok(method_not_allowed_response(
+            "GET, HEAD",
+            "RSC flight streams are GET-only",
         ));
     }
 
@@ -652,9 +671,9 @@ async fn rsc_flight_response(
 
 fn client_module_response(app_dir: &Path, method: &str, path: &str) -> Result<Response<Body>> {
     if method != "GET" && method != "HEAD" {
-        return Ok(text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "client modules are GET-only".to_string(),
+        return Ok(method_not_allowed_response(
+            "GET, HEAD",
+            "client modules are GET-only",
         ));
     }
 
@@ -693,11 +712,7 @@ fn find_client_module(app_dir: &Path, route_path: &Path) -> Option<PathBuf> {
     let routes_dir = app_dir.join("app").join("routes");
     ["ts", "tsx", "js", "jsx", "mjs"]
         .into_iter()
-        .map(|ext| {
-            routes_dir
-                .join(route_path)
-                .with_extension(format!("client.{ext}"))
-        })
+        .map(|ext| route_companion_module_path(&routes_dir, route_path, "client", ext))
         .find(|path| path.is_file())
 }
 
@@ -716,20 +731,39 @@ fn find_rsc_server_module(
     let routes_dir = app_dir.join("app").join("routes");
     ["tsx", "ts", "jsx", "js", "mjs"]
         .into_iter()
-        .map(|ext| {
-            routes_dir
-                .join(route_path)
-                .with_extension(format!("server.{ext}"))
-        })
+        .map(|ext| route_companion_module_path(&routes_dir, route_path, "server", ext))
         .find(|path| path.is_file())
 }
 
 fn has_matching_page_route(app_dir: &Path, routes: &RouteTable, route_path: &Path) -> bool {
     let routes_dir = app_dir.join("app").join("routes");
-    let candidates = ["tsx", "jsx"].map(|ext| routes_dir.join(route_path).with_extension(ext));
+    let candidates = ["tsx", "jsx"].map(|ext| route_module_path(&routes_dir, route_path, ext));
     routes
         .iter()
         .any(|route| route.kind == RouteKind::Page && candidates.contains(&route.file))
+}
+
+fn route_module_path(routes_dir: &Path, route_path: &Path, ext: &str) -> PathBuf {
+    let mut path = routes_dir.join(route_path);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension(ext);
+    };
+    path.set_file_name(format!("{name}.{ext}"));
+    path
+}
+
+fn route_companion_module_path(
+    routes_dir: &Path,
+    route_path: &Path,
+    companion: &str,
+    ext: &str,
+) -> PathBuf {
+    let mut path = routes_dir.join(route_path);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension(format!("{companion}.{ext}"));
+    };
+    path.set_file_name(format!("{name}.{companion}.{ext}"));
+    path
 }
 
 fn route_scoped_internal_path(path: &str, prefix: &str, suffix: &str) -> Option<PathBuf> {
@@ -895,6 +929,15 @@ fn text_response(status: StatusCode, body: String) -> Response<Body> {
         .expect("static response")
 }
 
+fn method_not_allowed_response(allow: &'static str, body: &'static str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header("allow", allow)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(body.to_string()))
+        .expect("static response")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -914,8 +957,9 @@ mod tests {
     use super::{
         apply_route_security_headers, cancel_on_drop_body_stream, client_module_response,
         client_module_route_path, crawlable_route_targets, find_client_module,
-        find_rsc_server_module, route_response, route_response_body, rsc_flight_route_path,
-        secure_route_response, send_worker_msg, text_response, with_route_security_headers,
+        find_rsc_server_module, method_not_allowed_response, route_response, route_response_body,
+        rsc_flight_route_path, secure_route_response, send_worker_msg, text_response,
+        with_route_security_headers,
     };
     use crate::router::RouteTable;
     use crate::worker;
@@ -1250,6 +1294,23 @@ mod tests {
     }
 
     #[test]
+    fn finds_dotted_route_client_module_without_stripping_suffix() {
+        let app = TempDir::new("find-dotted");
+        app.write(
+            "app/routes/report.v2.client.ts",
+            "document.body.dataset.ready = 'true';",
+        );
+        app.write(
+            "app/routes/report.client.ts",
+            "throw new Error('wrong file');",
+        );
+
+        let found = find_client_module(app.path(), Path::new("report.v2")).unwrap();
+
+        assert_eq!(found, app.path().join("app/routes/report.v2.client.ts"));
+    }
+
+    #[test]
     fn finds_adjacent_route_server_component_module() {
         let app = TempDir::new("find-rsc");
         app.write(
@@ -1269,6 +1330,28 @@ mod tests {
             found,
             app.path().join("app/routes/dashboard/settings.server.tsx")
         );
+    }
+
+    #[test]
+    fn finds_dotted_route_server_component_module() {
+        let app = TempDir::new("find-rsc-dotted");
+        app.write(
+            "app/routes/report.v2.tsx",
+            "export default function ReportPage() {}",
+        );
+        app.write(
+            "app/routes/report.v2.server.tsx",
+            "export default function ReportFlight() {}",
+        );
+        app.write(
+            "app/routes/report.server.tsx",
+            "export default function WrongFlight() {}",
+        );
+        let table = RouteTable::scan(app.path()).unwrap();
+
+        let found = find_rsc_server_module(app.path(), &table, Path::new("report.v2")).unwrap();
+
+        assert_eq!(found, app.path().join("app/routes/report.v2.server.tsx"));
     }
 
     #[test]
@@ -1329,6 +1412,24 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("document.body.dataset.count"));
         assert!(!body.contains(": number"));
+    }
+
+    #[tokio::test]
+    async fn client_module_response_sets_allow_header_on_405() {
+        let response =
+            client_module_response(Path::new("/missing"), "POST", "/_beater/client/index.js")
+                .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get("allow").unwrap(), "GET, HEAD");
+    }
+
+    #[test]
+    fn method_not_allowed_response_sets_allow_header() {
+        let response = method_not_allowed_response("GET, HEAD", "GET-only");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get("allow").unwrap(), "GET, HEAD");
     }
 
     #[tokio::test]

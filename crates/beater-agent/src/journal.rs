@@ -22,6 +22,7 @@ pub struct RunRow {
     pub input: String,
     #[allow(dead_code)]
     pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug)]
@@ -93,7 +94,7 @@ impl Journal {
     pub fn run(&self, id: &str) -> Result<RunRow> {
         self.conn
             .query_row(
-                "SELECT id, agent, status, input, created_at FROM runs WHERE id = ?1",
+                "SELECT id, agent, status, input, created_at, updated_at FROM runs WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(RunRow {
@@ -102,6 +103,7 @@ impl Journal {
                         status: r.get(2)?,
                         input: r.get(3)?,
                         created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
                     })
                 },
             )
@@ -111,7 +113,7 @@ impl Journal {
 
     pub fn list_runs(&self) -> Result<Vec<(RunRow, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.agent, r.status, r.input, r.created_at,
+            "SELECT r.id, r.agent, r.status, r.input, r.created_at, r.updated_at,
                     (SELECT COUNT(*) FROM steps s WHERE s.run_id = r.id)
              FROM runs r ORDER BY r.created_at DESC",
         )?;
@@ -124,8 +126,9 @@ impl Journal {
                         status: r.get(2)?,
                         input: r.get(3)?,
                         created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
                     },
-                    r.get(5)?,
+                    r.get(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

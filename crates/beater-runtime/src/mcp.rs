@@ -7,6 +7,7 @@
 //! No sessions (`MCP-Session-Id` is a MAY), no SSE — every request gets a
 //! single JSON object back.
 
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
@@ -33,10 +34,22 @@ pub const DEFAULT_TRUSTED_ORIGINS_ENV: &str = "BEATER_MCP_TRUSTED_ORIGINS";
 /// MCP access policy. By default the endpoint remains local-dev friendly:
 /// non-browser clients may omit Origin and no token is required. Set
 /// BEATER_MCP_TOKEN before binding beyond loopback.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct AccessConfig {
     bearer_token: Option<String>,
     trusted_origins: Vec<String>,
+}
+
+impl fmt::Debug for AccessConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessConfig")
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trusted_origins", &self.trusted_origins)
+            .finish()
+    }
 }
 
 impl AccessConfig {
@@ -168,9 +181,12 @@ fn is_loopback_origin(origin: &str) -> bool {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
+    const MAX_TOKEN_BYTES: usize = 4096;
+    if left.len() > MAX_TOKEN_BYTES || right.len() > MAX_TOKEN_BYTES {
+        return false;
+    }
     let mut diff = left.len() ^ right.len();
-    for index in 0..max_len {
+    for index in 0..MAX_TOKEN_BYTES {
         let left_byte = left.get(index).copied().unwrap_or(0);
         let right_byte = right.get(index).copied().unwrap_or(0);
         diff |= usize::from(left_byte ^ right_byte);
@@ -208,7 +224,29 @@ pub async fn handle_post(
         }
     };
 
-    // Notifications and client responses carry no `id` → 202 Accepted, no body.
+    if !message.is_object() {
+        return with_cors(
+            http_response(
+                StatusCode::BAD_REQUEST,
+                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "invalid request: JSON-RPC message must be an object"}}),
+            ),
+            access,
+            headers,
+        );
+    }
+
+    if !message.get("method").is_some_and(Value::is_string) {
+        return with_cors(
+            http_response(
+                StatusCode::BAD_REQUEST,
+                json!({"jsonrpc": "2.0", "id": message.get("id").cloned().unwrap_or(Value::Null), "error": {"code": -32600, "message": "invalid request: method must be a string"}}),
+            ),
+            access,
+            headers,
+        );
+    }
+
+    // Notifications and client responses carry no `id` -> 202 Accepted, no body.
     let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
         return with_cors(
             Response::builder()
@@ -600,6 +638,71 @@ mod tests {
     }
 
     #[test]
+    fn debug_redacts_bearer_token() {
+        let access = AccessConfig::new(
+            Some("super-secret-token".to_string()),
+            vec!["https://ops.example.test".to_string()],
+        );
+
+        let rendered = format!("{access:?}");
+
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("super-secret-token"), "{rendered}");
+        assert!(rendered.contains("https://ops.example.test"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn non_object_json_rpc_is_invalid_request() {
+        let app = TempApp::new("invalid-non-object");
+        let registry = ToolRegistry::empty();
+
+        for body in [
+            br#"[]"#.as_slice(),
+            br#""hello""#.as_slice(),
+            br#"5"#.as_slice(),
+        ] {
+            let response = handle_post(
+                &registry,
+                &AccessConfig::default(),
+                app.path(),
+                &HeaderMap::new(),
+                body,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["id"], Value::Null);
+            assert_eq!(body["error"]["code"], -32600);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_non_string_method_is_invalid_request() {
+        let app = TempApp::new("invalid-method");
+        let registry = ToolRegistry::empty();
+
+        for body in [
+            br#"{"jsonrpc":"2.0","id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"method":7}"#.as_slice(),
+        ] {
+            let response = handle_post(
+                &registry,
+                &AccessConfig::default(),
+                app.path(),
+                &HeaderMap::new(),
+                body,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["id"], 1);
+            assert_eq!(body["error"]["code"], -32600);
+        }
+    }
+
+    #[test]
     fn mcp_tool_use_id_is_namespaced_and_unique() {
         let first = mcp_tool_use_id();
         let second = mcp_tool_use_id();
@@ -799,6 +902,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tools_call_journals_needs_review_tool_execution() {
+        let app = TempApp::new("journal-needs-review");
+        let remote = MockRemoteMcp::new_text("{not json");
+        let registry = ToolRegistry::build(
+            Path::new(""),
+            &[remote_decl_with_idempotent(
+                "crm.lookup",
+                &remote.endpoint,
+                false,
+            )],
+        )
+        .expect("remote MCP registry should build");
+
+        let response = handle_post(
+            &registry,
+            &AccessConfig::default(),
+            app.path(),
+            &HeaderMap::new(),
+            br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"crm.lookup","arguments":{"email":"ambiguous@example.com"}}}"#,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["id"], "1");
+        assert_eq!(body["result"]["isError"], true);
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("needs review")
+                || body["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("review the remote system"),
+            "{body}"
+        );
+
+        let journal = Journal::open(app.path()).unwrap();
+        let runs = journal.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let (run, step_count) = &runs[0];
+        assert_eq!(run.agent, "mcp");
+        assert_eq!(run.status, "needs_review");
+        assert_eq!(*step_count, 1);
+
+        let steps = journal.steps(&run.id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, "tool_call");
+        assert_eq!(steps[0].status, "failed");
+        assert_eq!(steps[0].tool_name.as_deref(), Some("crm.lookup"));
+    }
+
     #[test]
     fn get_requires_auth_before_reporting_no_stream() {
         let access = AccessConfig::new(Some("secret".to_string()), Vec::new());
@@ -938,6 +1095,28 @@ mod tests {
                     thread_requests.lock().unwrap().push(request);
                     let _ = write_response(&mut stream, &body);
                 }
+            });
+            Self {
+                endpoint,
+                requests,
+                handle: Some(handle),
+            }
+        }
+
+        fn new_text(response: &'static str) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!(
+                "http://127.0.0.1:{}/mcp",
+                listener.local_addr().unwrap().port()
+            );
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = requests.clone();
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = accept_with_deadline(&listener);
+                let request = read_request(&mut stream);
+                thread_requests.lock().unwrap().push(request);
+                let _ = write_response(&mut stream, response);
             });
             Self {
                 endpoint,
