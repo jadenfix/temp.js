@@ -69,7 +69,7 @@ The work below is not just about matching Node/Next request handling. The end st
 - [x] Add client hydration with a per-route client bundle.
 - [x] Add RSC flight protocol over the same chunk channel.
 - [x] Add npm/node-compat adoption wedge.
-- [ ] Add isolate pool behind the existing worker protocol.
+- [x] Add isolate pool behind the existing worker protocol.
 - [x] Add `beater build` runnable host-bundle foundation.
 - [ ] Prove the deploy story with a Linux container image and `docker run` cold-start gate.
 
@@ -195,7 +195,7 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 
 ### Portability (currently: works on this Mac)
 - [x] **Python discovery**: `.cargo/config.toml` no longer hardcodes `PYO3_PYTHON`; README documents macOS/Linux setup; `beater doctor` reports embedded Python + venv mismatches; remote macOS/Linux CI is green.
-- [x] **Concurrency**: one isolate = JS route requests serialize; one dev server = one app. The limitation is documented prominently in README and `docs/runtime-limits.md`; the isolate pool remains Phase C work.
+- [x] **Concurrency**: one isolate by default serializes JS route requests, and `[app].workers = N` can round-robin route work across a small pool; one dev server still serves one app. The default and the remaining scaling proof are documented prominently in README and `docs/runtime-limits.md`.
 - [x] **Port/host binding**: `beater dev --host <ip>` and `[app] host = "..."`; the no-key integration test binds `0.0.0.0` and curls through localhost.
 - [x] `beater new <app>` scaffolding command (embedded hello template) — the first-five-minutes experience is tested by scaffolding and serving a generated app.
 
@@ -216,7 +216,7 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 - [x] README quickstart actually runnable start-to-finish by a stranger (install Rust, install Python 3.11+, cargo build, `beater new`, `beater dev`)
 - [x] `docs/tools.md`: the pyTool/rustTool contract (TOOL dict, run(), idempotency rules)
 - [x] `docs/integrations.md`: one-registry contract for first-party tools, remote MCP sources, mock browser providers, production browser-provider acceptance criteria, secrets, retries, idempotency, egress, and journal audit rules
-- [x] `docs/runtime-limits.md`: current single-isolate route serialization, one-app-per-dev-server limit, operational guidance, and isolate-pool acceptance path
+- [x] `docs/runtime-limits.md`: default single-isolate route serialization, `[app].workers` pool support, one-app-per-dev-server limit, operational guidance, and the remaining scaling-proof acceptance path
 - [x] CHANGELOG + versioning policy (deno_core pin-bump cadence)
 
 ---
@@ -233,6 +233,7 @@ Phase C progress so far:
 - Route-scoped client modules can now live beside page routes as `*.client.ts` files and are served from `/_beater/client/<route>.js`; the hello page uses this to prove same-origin browser code can hydrate a counter without Node/npm. Full React hydration and bundling are still open.
 - Route-scoped server components can now live beside page routes as `*.server.tsx` files and stream `text/x-component` flight frames from `/_beater/rsc/<route>.flight`; this proves the transport and browser island path, not full official React Flight manifests.
 - Server routes can now import local ESM packages from `node_modules` with bare specifiers. This is the adoption wedge for real integrations and shared validation libraries without adding a Node sidecar; CommonJS, Node built-ins, install hooks, and client dependency bundling remain broader compatibility work.
+- `beater dev` can now start `[app].workers = N` JS isolates and round-robin route work across them; `dev_server_round_robins_js_routes_across_worker_pool` proves two workers keep separate module state. The near-linear `wrk` proof is still open.
 - Hot reload now aborts still-active SSR/RSC stream bodies if the old worker channel closes, so clients see a stream error instead of a cleanly truncated 200 response.
 - Worker sends now clone the current isolate channel before awaiting bounded-queue capacity, so a wedged worker cannot hold the hot-reload sender lock while the reloader tries to swap in a fresh isolate.
 - `beater build --out <dir>` now emits a runnable host-platform bundle with `bin/beater`, copied app assets, `run.sh`, `beater-build.json`, `.dockerignore`, and a non-root Dockerfile. Runtime state and common local credential files are excluded; symlinked app files and symlinked outputs are refused. `build_creates_runnable_bundle_and_refuses_unsafe_output` starts the generated launcher and hits `/api/health`; the Docker cold-start gate remains open.
@@ -267,5 +268,5 @@ Phase C progress so far:
 ## TL;DR
 
 - **To be e2e done (MVP):** install `ANTHROPIC_API_KEY`, run `scripts/m2-live-gate.sh`, preserve the emitted `evidence.md` + raw logs, then flip README.md/ARCHITECTURE.md/final.md from pending to done. Everything else is already built and verified.
-- **To ship v0.1:** tests + CI, portable Python config, isolate-pool-or-documented-limits, `beater new`.
+- **To ship v0.1:** tests + CI, portable Python config, isolate-pool support plus the remaining scaling proof, `beater new`.
 - **To kill Node/Next:** pay off punts 1–5 and finish the remaining Docker proof for 11, while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.

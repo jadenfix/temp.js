@@ -9,7 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -42,12 +42,14 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 struct DevState {
     routes: Arc<RwLock<RouteTable>>,
-    worker_tx: Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    worker_txs: Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+    next_worker: Arc<AtomicUsize>,
     agent_surfaces: Arc<RwLock<AgentSurfaces>>,
     app_name: String,
     base_url: String,
     mcp_access: mcp::AccessConfig,
     app_dir: PathBuf,
+    worker_count: usize,
 }
 
 #[derive(Clone)]
@@ -111,15 +113,17 @@ pub async fn serve(
         );
     }
 
-    let worker = worker::spawn()?;
+    let worker_txs = spawn_worker_pool(config.workers)?;
     let state = DevState {
         routes: Arc::new(RwLock::new(table)),
-        worker_tx: Arc::new(RwLock::new(worker.tx)),
+        worker_txs: Arc::new(RwLock::new(worker_txs)),
+        next_worker: Arc::new(AtomicUsize::new(0)),
         agent_surfaces: Arc::new(RwLock::new(AgentSurfaces::new(registry, agents))),
         app_name: config.name.clone(),
         base_url,
         mcp_access,
         app_dir: config.app_dir.clone(),
+        worker_count: config.workers,
     };
 
     spawn_reloader(
@@ -209,10 +213,13 @@ fn spawn_reloader(app_dir: PathBuf, beatbox: BeatboxConfig, state: DevState) {
             tokio::time::sleep(Duration::from_millis(120)).await;
             while rx.try_recv().is_ok() {}
             let mut reloaded_worker = false;
-            match (RouteTable::scan(&app_dir), worker::spawn()) {
-                (Ok(table), Ok(worker)) => {
+            match (
+                RouteTable::scan(&app_dir),
+                spawn_worker_pool(state.worker_count),
+            ) {
+                (Ok(table), Ok(worker_txs)) => {
                     *state.routes.write().await = table;
-                    *state.worker_tx.write().await = worker.tx;
+                    *state.worker_txs.write().await = worker_txs;
                     reloaded_worker = true;
                 }
                 (Err(e), _) => tracing::error!("reload: route scan failed: {e:#}"),
@@ -375,13 +382,11 @@ async fn agent_surfaces(state: &DevState) -> AgentSurfaces {
 async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
     let (reply_tx, reply_rx) = oneshot::channel();
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        send_worker_msg(
-            &state.worker_tx,
-            WorkerMsg::RouteMeta {
-                specifier,
-                reply: reply_tx,
-            },
-        )
+        let tx = first_worker_tx(&state.worker_txs).await;
+        tx.send(WorkerMsg::RouteMeta {
+            specifier,
+            reply: reply_tx,
+        })
         .await
         .ok()?;
         reply_rx.await.ok()
@@ -398,18 +403,43 @@ async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
     }
 }
 
+#[cfg(test)]
 async fn send_worker_msg(
-    worker_tx: &Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    worker_txs: &Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+    next_worker: &AtomicUsize,
     msg: WorkerMsg,
 ) -> std::result::Result<(), mpsc::error::SendError<WorkerMsg>> {
-    let tx = clone_worker_tx(worker_tx).await;
+    let tx = clone_worker_tx(worker_txs, next_worker).await;
     tx.send(msg).await
 }
 
 async fn clone_worker_tx(
-    worker_tx: &Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    worker_txs: &Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+    next_worker: &AtomicUsize,
 ) -> mpsc::Sender<WorkerMsg> {
-    worker_tx.read().await.clone()
+    let worker_txs = worker_txs.read().await;
+    assert!(!worker_txs.is_empty(), "worker pool should never be empty");
+    let index = next_worker.fetch_add(1, Ordering::Relaxed) % worker_txs.len();
+    worker_txs[index].clone()
+}
+
+async fn first_worker_tx(
+    worker_txs: &Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+) -> mpsc::Sender<WorkerMsg> {
+    let worker_txs = worker_txs.read().await;
+    assert!(!worker_txs.is_empty(), "worker pool should never be empty");
+    worker_txs[0].clone()
+}
+
+fn spawn_worker_pool(count: usize) -> Result<Vec<mpsc::Sender<WorkerMsg>>> {
+    let count = count.max(1);
+    let mut workers = Vec::with_capacity(count);
+    for index in 0..count {
+        let worker = worker::spawn().with_context(|| format!("spawn js worker {index}"))?;
+        workers.push(worker.tx);
+    }
+    tracing::info!("started {count} js worker isolate(s)");
+    Ok(workers)
 }
 
 // ---- route dispatch ---------------------------------------------------------
@@ -522,7 +552,7 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
         reply: reply_tx,
     };
 
-    let worker_tx = clone_worker_tx(&state.worker_tx).await;
+    let worker_tx = clone_worker_tx(&state.worker_txs, &state.next_worker).await;
     let send_tx = worker_tx.clone();
     let cancel_tx = worker_tx.downgrade();
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -644,7 +674,7 @@ async fn rsc_flight_response(
     .to_string();
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let worker_tx = clone_worker_tx(&state.worker_tx).await;
+    let worker_tx = clone_worker_tx(&state.worker_txs, &state.next_worker).await;
     let send_tx = worker_tx.clone();
     let cancel_tx = worker_tx.downgrade();
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -944,6 +974,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use axum::body::Body;
@@ -1042,21 +1073,28 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(worker::WorkerMsg::CancelStream { stream_id: 1 })
             .unwrap();
-        let worker_tx = Arc::new(RwLock::new(tx));
+        let worker_txs = Arc::new(RwLock::new(vec![tx]));
+        let next_worker = Arc::new(AtomicUsize::new(0));
 
         let blocked_send = tokio::spawn({
-            let worker_tx = Arc::clone(&worker_tx);
+            let worker_txs = Arc::clone(&worker_txs);
+            let next_worker = Arc::clone(&next_worker);
             async move {
-                send_worker_msg(&worker_tx, worker::WorkerMsg::CancelStream { stream_id: 2 }).await
+                send_worker_msg(
+                    &worker_txs,
+                    &next_worker,
+                    worker::WorkerMsg::CancelStream { stream_id: 2 },
+                )
+                .await
             }
         });
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         let (replacement_tx, _replacement_rx) = mpsc::channel(1);
-        let mut guard = tokio::time::timeout(Duration::from_millis(100), worker_tx.write())
+        let mut guard = tokio::time::timeout(Duration::from_millis(100), worker_txs.write())
             .await
             .expect("blocked worker sends should not hold the reload write lock");
-        *guard = replacement_tx;
+        *guard = vec![replacement_tx];
         drop(guard);
 
         match rx

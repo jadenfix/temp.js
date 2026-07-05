@@ -45,7 +45,7 @@ The agent loop deliberately lives in tier 3, not tier 1: it survives hot reloads
 | Web APIs in isolate | minimal shims: console, timers, TextEncoder, ReadableStream | route contract is plain objects, not WHATWG fetch classes (that fidelity comes with the npm-compat era). The stream shim is scoped to React SSR |
 | TS/TSX | `deno_ast` (SWC) transpile in the module loader, source maps wired into error stacks | useful errors are an acceptance criterion, not polish |
 | HTTP | axum 0.8; response bodies stream from the isolate over an mpsc channel | |
-| Threading | `JsRuntime` is `!Send` → one dedicated OS thread (current-thread tokio rt); host↔worker via mpsc | single isolate for now, so JS route work serializes; the channel protocol is already pool-shaped. See `docs/runtime-limits.md` |
+| Threading | `JsRuntime` is `!Send` → one dedicated OS thread per worker (current-thread tokio rt); host↔workers via mpsc | single worker by default; `[app].workers = N` starts a small isolate pool. See `docs/runtime-limits.md` |
 | Hot reload | `notify` watcher → drop worker thread → fresh isolate (~50–200ms) | trivially correct; agent runs are unaffected (loop lives in Rust) |
 | Python | pyo3 0.29 `auto-initialize` (Py_InitializeEx(0) — no Python signal handlers); one interpreter; every call via `spawn_blocking` + semaphore | GIL never touches the async runtime. Venv: **build-time** linking is `PYO3_PYTHON`; **runtime** packages come from `site.addsitedir(<venv>/site-packages)` with a version-match check (`beater doctor`) |
 | LLM | reqwest → Anthropic Messages API (`claude-opus-4-8`, adaptive thinking); non-streaming per step; loop on `stop_reason == "tool_use"` | each request is one journaled step |
@@ -142,7 +142,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **C++ tools** — via `cxx` on the Rust built-in path when a real use case appears.
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
 - **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. Full image building, target-OS binary selection, venv baking guarantees, and the `docker run` cold-start gate remain.
-- **Isolate pool / per-request isolation** — channel protocol already supports N workers; current serialization is documented in `docs/runtime-limits.md`.
+- **Isolate pool scaling proof / per-request isolation** — `[app].workers = N` starts N route isolates and smoke tests prove round-robin dispatch; the remaining acceptance proof is near-linear load-test scaling plus any per-request isolation hardening needed for production.
 - **LLM streaming (SSE to browser)** — journal needs partial-step records first.
 - **MCP sessions/SSE + the 2026-07-28 spec** — adopt when released.
 - **Observability/evals** — integrate beater-agents (OTLP out of the agent loop) rather than rebuilding.

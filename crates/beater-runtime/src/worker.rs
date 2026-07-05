@@ -1,6 +1,6 @@
 //! The JS worker: one dedicated OS thread owning a `JsRuntime` (it is !Send),
 //! driven by a current-thread tokio runtime. The host talks to it over an
-//! mpsc channel — the protocol is already pool-shaped for N workers later.
+//! mpsc channel; the dev server can keep a small pool of these workers hot.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
