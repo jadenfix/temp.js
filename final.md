@@ -195,7 +195,7 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 
 ### Portability (currently: works on this Mac)
 - [x] **Python discovery**: `.cargo/config.toml` no longer hardcodes `PYO3_PYTHON`; README documents macOS/Linux setup; `beater doctor` reports embedded Python + venv mismatches; remote macOS/Linux CI is green.
-- [x] **Concurrency**: one isolate by default serializes JS route requests, and `[app].workers = N` can round-robin route work across a small pool; one dev server still serves one app. The default and the remaining scaling proof are documented prominently in README and `docs/runtime-limits.md`.
+- [x] **Concurrency**: one isolate by default serializes JS route requests, and `[app].workers = N` can round-robin route work across a pool; one dev server still serves one app. The default and the scaling gate are documented prominently in README and `docs/runtime-limits.md`.
 - [x] **Port/host binding**: `beater dev --host <ip>` and `[app] host = "..."`; the no-key integration test binds `0.0.0.0` and curls through localhost.
 - [x] `beater new <app>` scaffolding command (embedded hello template) — the first-five-minutes experience is tested by scaffolding and serving a generated app.
 
@@ -233,7 +233,7 @@ Phase C progress so far:
 - Route-scoped client modules can now live beside page routes as `*.client.ts` files and are served from `/_beater/client/<route>.js`; the hello page uses this to prove same-origin browser code can hydrate a counter without Node/npm. Full React hydration and bundling are still open.
 - Route-scoped server components can now live beside page routes as `*.server.tsx` files and stream `text/x-component` flight frames from `/_beater/rsc/<route>.flight`; this proves the transport and browser island path, not full official React Flight manifests.
 - Server routes can now import local ESM packages from `node_modules` with bare specifiers. This is the adoption wedge for real integrations and shared validation libraries without adding a Node sidecar; CommonJS, Node built-ins, install hooks, and client dependency bundling remain broader compatibility work.
-- `beater dev` can now start `[app].workers = N` JS isolates and round-robin route work across them; `dev_server_round_robins_js_routes_across_worker_pool` proves two workers keep separate module state. The near-linear `wrk` proof is still open.
+- `beater dev` can now start `[app].workers = N` JS isolates and round-robin route work across them; `dev_server_round_robins_js_routes_across_worker_pool` proves two workers keep separate module state. `scripts/isolate-pool-scaling-gate.cjs` proved the load path on this 10-core machine: 103.53 rps with one worker, 792.10 rps with ten workers, 7.65x against a 6.0x threshold.
 - Hot reload now aborts still-active SSR/RSC stream bodies if the old worker channel closes, so clients see a stream error instead of a cleanly truncated 200 response.
 - Worker sends now clone the current isolate channel before awaiting bounded-queue capacity, so a wedged worker cannot hold the hot-reload sender lock while the reloader tries to swap in a fresh isolate.
 - `beater build --out <dir>` now emits a runnable host-platform bundle with `bin/beater`, copied app assets, `run.sh`, `beater-build.json`, `.dockerignore`, and a non-root Dockerfile. Runtime state and common local credential files are excluded; symlinked app files and symlinked outputs are refused. `build_creates_runnable_bundle_and_refuses_unsafe_output` starts the generated launcher and hits `/api/health`; `scripts/docker-cold-start-gate.sh` now codifies the Linux-builder plus `docker run` cold-start proof, but the gate remains open until it passes.
@@ -251,7 +251,7 @@ Phase C progress so far:
 | 2 | **Client hydration** — route-scoped client bundles (`/_beater/client/<route>.js`) | **done:** `/_beater/client/index.js` serves the route companion client module; the hello counter increments in the browser gate |
 | 3 | **RSC** — flight protocol over the same chunked channel | **partial:** `/_beater/rsc/index.flight` streams the hello server island and the browser gate renders it; official React Flight client references/manifests remain after npm-compat |
 | 4 | **npm/node-compat** — the adoption wedge (Deno-style compat layer, not a reimplementation) | **done for the wedge:** `import { z } from "zod"` works in a route; full CommonJS, Node built-ins, install hooks, and client bundling remain later work |
-| 5 | **Isolate pool** — N workers behind the existing channel protocol | wrk shows near-linear scaling to core count |
+| 5 | **Isolate pool** — N workers behind the existing channel protocol | **done:** `scripts/isolate-pool-scaling-gate.cjs` showed 7.65x route throughput on ten local workers versus one worker |
 | 6 | **Wasm sandbox tier** — Wasmtime as the 4th tool impl kind | **done for W0:** local `wasmtime` tools run hermetic scalar wasm with empty imports, no filesystem mounts, no network/env/secrets, and fuel/memory/wall limits; tests prove filesystem imports and mounts are denied |
 | 7 | **LLM streaming** — SSE to browser + partial-step journal records | tokens stream to a page while every step stays crash-resumable |
 | 8 | **MCP consume + sessions** — use remote MCP servers as tool sources; add session/auth plumbing for remote management; adopt the next MCP spec when released | an agent uses a third-party MCP server's tool via config only, with scoped credentials and resumable error handling |
@@ -269,5 +269,5 @@ Phase C progress so far:
 ## TL;DR
 
 - **To be e2e done (MVP):** install `ANTHROPIC_API_KEY`, run `scripts/m2-live-gate.sh`, preserve the emitted `evidence.md` + raw logs, then flip README.md/ARCHITECTURE.md/final.md from pending to done. Everything else is already built and verified.
-- **To ship v0.1:** tests + CI, portable Python config, isolate-pool support plus the remaining scaling proof, `beater new`.
-- **To kill Node/Next:** finish the #5 scaling proof and the #11 Docker proof, then pay off #7–#10 and #12–#14 while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.
+- **To ship v0.1:** tests + CI, portable Python config, isolate-pool support plus scaling gate, `beater new`.
+- **To kill Node/Next:** finish the #11 Docker proof, then pay off #7–#10 and #12–#14 while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.

@@ -142,7 +142,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **C++ tools** — via `cxx` on the Rust built-in path when a real use case appears.
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
 - **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.
-- **Isolate pool scaling proof / per-request isolation** — `[app].workers = N` starts N route isolates and smoke tests prove round-robin dispatch; the remaining acceptance proof is near-linear load-test scaling plus any per-request isolation hardening needed for production.
+- **Isolate pool production hardening / per-request isolation** — `[app].workers = N` starts N route isolates; smoke tests prove round-robin dispatch, and `scripts/isolate-pool-scaling-gate.cjs` proved 7.65x route throughput on ten local workers. Per-request isolation hardening and worker-count tuning remain production work.
 - **LLM streaming (SSE to browser)** — journal needs partial-step records first.
 - **MCP sessions/SSE + the 2026-07-28 spec** — adopt when released.
 - **Observability/evals** — integrate beater-agents (OTLP out of the agent loop) rather than rebuilding.

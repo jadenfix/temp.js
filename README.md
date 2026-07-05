@@ -55,7 +55,7 @@ export BEATER_MCP_TRUSTED_ORIGINS="https://ops.example.com" # browser-based oper
 
 ## Current limits
 
-`beater dev` defaults to one JS route isolate, so TS routes and React SSR serialize unless you set `[app].workers = N` in `beater.toml`. One dev server serves one app directory. See [Runtime limits](docs/runtime-limits.md) for the exact concurrency model and the remaining scaling proof.
+`beater dev` defaults to one JS route isolate, so TS routes and React SSR serialize unless you set `[app].workers = N` in `beater.toml`. One dev server serves one app directory. See [Runtime limits](docs/runtime-limits.md) for the exact concurrency model and scaling gate.
 
 Server-side routes can import local ESM packages from `node_modules` with bare package specifiers. The resolver handles basic/exact package `exports` entries with `node`, `import`, `module`, and `default` conditions, plus `module`/`main` fallbacks; CommonJS `require`, Node built-ins, and client-side dependency bundling are still outside this wedge.
 
