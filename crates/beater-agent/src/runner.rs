@@ -311,7 +311,16 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
             ctx.journal
                 .start_step(&ctx.run_id, "llm_call", &body, None, None, next_llm_attempt)?;
         next_llm_attempt = 1;
-        let response = match ctx.client.create_message(&body).await {
+        let response = match ctx
+            .client
+            .create_message_streaming(&body, |partial| {
+                let kind = partial["event"].as_str().unwrap_or("stream_event");
+                ctx.journal
+                    .append_step_partial(&ctx.run_id, seq, kind, partial)?;
+                Ok(())
+            })
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 ctx.journal.fail_step(&ctx.run_id, seq, &format!("{e:#}"))?;
@@ -647,7 +656,7 @@ def run(input):
             let server_requests = Arc::clone(&requests);
             let mut responses: VecDeque<String> = responses
                 .into_iter()
-                .map(|value| value.to_string())
+                .map(anthropic_stream_response)
                 .collect();
             let handle = thread::spawn(move || {
                 while let Some(response) = responses.pop_front() {
@@ -655,8 +664,7 @@ def run(input):
                     let body = read_http_body(&mut stream);
                     server_requests.lock().unwrap().push(body);
                     let reply = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        response.len(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
                         response
                     );
                     stream.write_all(reply.as_bytes()).unwrap();
@@ -678,6 +686,107 @@ def run(input):
                 .into_inner()
                 .unwrap()
         }
+    }
+
+    fn anthropic_stream_response(response: Value) -> String {
+        let content = response["content"].as_array().cloned().unwrap_or_default();
+        let mut out = String::new();
+        out.push_str(&sse(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": response["id"].as_str().unwrap_or("msg_mock"),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": response["model"].as_str().unwrap_or("mock"),
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 0}
+                }
+            }),
+        ));
+        for (index, block) in content.iter().enumerate() {
+            let index = index as u64;
+            let mut start_block = block.clone();
+            match block["type"].as_str().unwrap_or_default() {
+                "text" => {
+                    let text = block["text"].as_str().unwrap_or_default();
+                    start_block["text"] = Value::String(String::new());
+                    out.push_str(&sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": start_block,
+                        }),
+                    ));
+                    out.push_str(&sse(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "text_delta", "text": text},
+                        }),
+                    ));
+                }
+                "tool_use" => {
+                    let input = block["input"].clone();
+                    start_block["input"] = json!({});
+                    out.push_str(&sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": start_block,
+                        }),
+                    ));
+                    out.push_str(&sse(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input.to_string(),
+                            },
+                        }),
+                    ));
+                }
+                _ => {
+                    out.push_str(&sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": start_block,
+                        }),
+                    ));
+                }
+            }
+            out.push_str(&sse(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            ));
+        }
+        out.push_str(&sse(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": response["stop_reason"].as_str().unwrap_or("end_turn"),
+                    "stop_sequence": response.get("stop_sequence").cloned().unwrap_or(Value::Null),
+                },
+                "usage": {"output_tokens": 1},
+            }),
+        ));
+        out.push_str(&sse("message_stop", json!({"type": "message_stop"})));
+        out
+    }
+
+    fn sse(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
     }
 
     fn read_http_body(stream: &mut std::net::TcpStream) -> String {
@@ -1130,9 +1239,29 @@ def run(input):
         let journal = Journal::open(app.path()).unwrap();
         let (run, _) = journal.list_runs().unwrap().pop().unwrap();
         assert_eq!(run.status, "completed");
-        let tool_step = journal
-            .steps(&run.id)
-            .unwrap()
+        let steps = journal.steps(&run.id).unwrap();
+        let llm_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| step.kind == "llm_call")
+            .collect();
+        assert_eq!(llm_steps.len(), 2);
+        let first_partials = journal.step_partials(&run.id, llm_steps[0].seq).unwrap();
+        assert!(
+            first_partials.iter().any(|partial| {
+                partial.kind == "content_block_delta"
+                    && partial.payload["data"]["delta"]["type"] == "input_json_delta"
+            }),
+            "{first_partials:?}"
+        );
+        let final_partials = journal.step_partials(&run.id, llm_steps[1].seq).unwrap();
+        assert!(
+            final_partials.iter().any(|partial| {
+                partial.kind == "content_block_delta"
+                    && partial.payload["data"]["delta"]["text"] == "checkout verified"
+            }),
+            "{final_partials:?}"
+        );
+        let tool_step = steps
             .into_iter()
             .find(|step| step.kind == "tool_call")
             .expect("browser tool call step");

@@ -35,7 +35,7 @@ Do not run untrusted Python tools. Use `wasmtimeTool` for the current untrusted-
 
 ## Journal Data
 
-The journal is plaintext SQLite under `<app>/.beater/journal.db`. It stores prompts, model responses, tool inputs, tool outputs, run status, and step attempts.
+The journal is plaintext SQLite under `<app>/.beater/journal.db`. It stores prompts, model responses, LLM stream partials, tool inputs, tool outputs, run status, and step attempts.
 
 Operational implications:
 

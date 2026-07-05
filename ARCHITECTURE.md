@@ -48,8 +48,8 @@ The agent loop deliberately lives in tier 3, not tier 1: it survives hot reloads
 | Threading | `JsRuntime` is `!Send` → one dedicated OS thread per worker (current-thread tokio rt); host↔workers via mpsc | single worker by default; `[app].workers = N` starts a small isolate pool. See `docs/runtime-limits.md` |
 | Hot reload | `notify` watcher → drop worker thread → fresh isolate (~50–200ms) | trivially correct; agent runs are unaffected (loop lives in Rust) |
 | Python | pyo3 0.29 `auto-initialize` (Py_InitializeEx(0) — no Python signal handlers); one interpreter; every call via `spawn_blocking` + semaphore | GIL never touches the async runtime. Venv: **build-time** linking is `PYO3_PYTHON`; **runtime** packages come from `site.addsitedir(<venv>/site-packages)` with a version-match check (`beater doctor`) |
-| LLM | reqwest → Anthropic Messages API (`claude-opus-4-8`, adaptive thinking); non-streaming per step; loop on `stop_reason == "tool_use"` | each request is one journaled step |
-| Durability | rusqlite (bundled), step-lifecycle journal (§5); append committed **before** every side effect | crash-kill-9 between any two steps loses nothing |
+| LLM | reqwest → Anthropic Messages API (`claude-opus-4-8`, adaptive thinking); SSE streaming per step; loop on `stop_reason == "tool_use"` | each request is one journaled step, with stream events appended as partial-step records before final completion |
+| Durability | rusqlite (bundled), step-lifecycle journal (§5); append committed **before** every side effect; LLM stream partials committed before the final response | crash-kill-9 between any two steps loses nothing |
 | MCP | serve (not consume) the tool registry per spec **2025-11-25**, stateless | §6 |
 | Free-threaded Python | punted until ML wheels are reliable | flip pyo3 to 3.14t, replace spawn_blocking with parallel attach |
 
@@ -143,7 +143,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
 - **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.
 - **Isolate pool production hardening / per-request isolation** — `[app].workers = N` starts N route isolates; smoke tests prove round-robin dispatch, and `scripts/isolate-pool-scaling-gate.cjs` proved 7.65x route throughput on ten local workers. Per-request isolation hardening and worker-count tuning remain production work.
-- **LLM streaming (SSE to browser)** — journal needs partial-step records first.
+- **LLM streaming to browser** — Anthropic SSE ingestion and partial-step journal records are in place; expose those partials over a browser-facing run stream next.
 - **MCP sessions/SSE + the 2026-07-28 spec** — adopt when released.
 - **Observability/evals** — integrate beater-agents (OTLP out of the agent loop) rather than rebuilding.
 

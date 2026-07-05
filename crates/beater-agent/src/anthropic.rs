@@ -1,20 +1,19 @@
 //! Minimal Messages API client over raw reqwest (there is no official Rust
-//! SDK). Non-streaming: each request is exactly one journaled step.
+//! SDK). Each request is exactly one journaled step; streaming requests can
+//! additionally emit durable partial records before the final message lands.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
-const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(2);
-const MAX_ATTEMPTS: u32 = 3;
 
 pub struct Anthropic {
     http: reqwest::Client,
     api_key: String,
     messages_url: String,
-    retry_initial_delay: Duration,
 }
 
 impl Anthropic {
@@ -23,20 +22,10 @@ impl Anthropic {
             .context("ANTHROPIC_API_KEY is not set — required for `beater agent run`")?;
         let base_url =
             std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        Self::new(
-            api_key,
-            &base_url,
-            DEFAULT_REQUEST_TIMEOUT,
-            DEFAULT_RETRY_DELAY,
-        )
+        Self::new(api_key, &base_url, DEFAULT_REQUEST_TIMEOUT)
     }
 
-    fn new(
-        api_key: String,
-        base_url: &str,
-        request_timeout: Duration,
-        retry_initial_delay: Duration,
-    ) -> Result<Self> {
+    fn new(api_key: String, base_url: &str, request_timeout: Duration) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
             .build()
@@ -45,82 +34,276 @@ impl Anthropic {
             http,
             api_key,
             messages_url: messages_url(base_url),
-            retry_initial_delay,
         })
     }
 
-    pub async fn create_message(&self, body: &Value) -> Result<Value> {
-        let mut delay = self.retry_initial_delay;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self.create_message_once(body).await {
-                Ok(value) => return Ok(value),
-                Err(AttemptError::Retryable(error)) if attempt < MAX_ATTEMPTS => {
-                    tracing::warn!("anthropic request failed ({error:#}), retrying in {delay:?}");
-                    tokio::time::sleep(delay).await;
-                    delay *= 4;
-                }
-                Err(error) => return Err(error.into_error()),
-            }
-        }
-        unreachable!("retry loop returns or bails")
-    }
-
-    async fn create_message_once(&self, body: &Value) -> std::result::Result<Value, AttemptError> {
+    pub async fn create_message_streaming(
+        &self,
+        body: &Value,
+        mut on_partial: impl FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
+        let mut body = body.clone();
+        body.as_object_mut()
+            .context("anthropic request body must be a JSON object")?
+            .insert("stream".to_string(), Value::Bool(true));
         let resp = self
             .http
             .post(&self.messages_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .json(body)
+            .json(&body)
             .send()
             .await
-            .map_err(|error| {
-                AttemptError::Retryable(anyhow!("sending anthropic request: {error}"))
-            })?;
+            .context("sending anthropic streaming request")?;
         let status = resp.status();
-        let text = match resp.text().await {
-            Ok(text) => text,
-            Err(error) if is_retryable_status(status) || status.is_success() => {
-                return Err(AttemptError::Retryable(anyhow!(
-                    "reading anthropic response body: {error}"
-                )));
-            }
-            Err(error) => {
-                return Err(AttemptError::Fatal(anyhow!(
-                    "anthropic api error {status}: failed to read response body: {error}"
-                )));
-            }
-        };
-        // 429 / 500 / 529 are retryable per the API error reference.
-        if is_retryable_status(status) {
-            return Err(AttemptError::Retryable(anyhow!(
-                "anthropic api error {status}: {text}"
-            )));
-        }
         if !status.is_success() {
-            return Err(AttemptError::Fatal(anyhow!(
-                "anthropic api error {status}: {text}"
-            )));
+            let text = resp
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("failed to read response body: {error}"));
+            bail!("anthropic api error {status}: {text}");
         }
-        serde_json::from_str(&text)
-            .context("anthropic response was not JSON")
-            .map_err(AttemptError::Fatal)
+
+        let mut decoder = SseDecoder::default();
+        let mut assembler = MessageStreamAssembler::default();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading anthropic streaming response body")?;
+            for event in decoder.push(&chunk)? {
+                if event.data.trim() == "[DONE]" {
+                    continue;
+                }
+                let partial = event.as_partial()?;
+                on_partial(&partial)?;
+                assembler.apply(&partial["data"])?;
+            }
+        }
+        for event in decoder.finish()? {
+            if event.data.trim() == "[DONE]" {
+                continue;
+            }
+            let partial = event.as_partial()?;
+            on_partial(&partial)?;
+            assembler.apply(&partial["data"])?;
+        }
+        assembler.finish()
     }
 }
 
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    status.as_u16() == 429 || status.as_u16() >= 500
+#[derive(Default)]
+struct SseDecoder {
+    pending: Vec<u8>,
+    event: Option<String>,
+    data: Vec<String>,
 }
 
-enum AttemptError {
-    Retryable(anyhow::Error),
-    Fatal(anyhow::Error),
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>> {
+        self.pending.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(pos) = self.pending.iter().position(|b| *b == b'\n') {
+            let mut line = self.pending.drain(..=pos).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if let Some(event) = self.push_line(String::from_utf8(line)?)? {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish(mut self) -> Result<Vec<SseEvent>> {
+        let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            let line = String::from_utf8(std::mem::take(&mut self.pending))?;
+            if let Some(event) = self.push_line(line.trim_end_matches('\r').to_string())? {
+                events.push(event);
+            }
+        }
+        if let Some(event) = self.flush() {
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn push_line(&mut self, line: String) -> Result<Option<SseEvent>> {
+        if line.is_empty() {
+            return Ok(self.flush());
+        }
+        if line.starts_with(':') {
+            return Ok(None);
+        }
+        let (field, value) = line
+            .split_once(':')
+            .map(|(field, value)| (field, value.strip_prefix(' ').unwrap_or(value)))
+            .unwrap_or((line.as_str(), ""));
+        match field {
+            "event" => self.event = Some(value.to_string()),
+            "data" => self.data.push(value.to_string()),
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn flush(&mut self) -> Option<SseEvent> {
+        if self.event.is_none() && self.data.is_empty() {
+            return None;
+        }
+        Some(SseEvent {
+            event: self.event.take().unwrap_or_else(|| "message".to_string()),
+            data: std::mem::take(&mut self.data).join("\n"),
+        })
+    }
 }
 
-impl AttemptError {
-    fn into_error(self) -> anyhow::Error {
-        match self {
-            Self::Retryable(error) | Self::Fatal(error) => error,
+struct SseEvent {
+    event: String,
+    data: String,
+}
+
+impl SseEvent {
+    fn as_partial(&self) -> Result<Value> {
+        Ok(serde_json::json!({
+            "event": self.event,
+            "data": serde_json::from_str::<Value>(&self.data)
+                .with_context(|| format!("anthropic stream event {:?} was not JSON", self.event))?,
+        }))
+    }
+}
+
+#[derive(Default)]
+struct MessageStreamAssembler {
+    message: Option<Value>,
+    content: Vec<Option<ContentBlockState>>,
+}
+
+#[derive(Default)]
+struct ContentBlockState {
+    value: Value,
+    partial_json: String,
+}
+
+impl MessageStreamAssembler {
+    fn apply(&mut self, event: &Value) -> Result<()> {
+        match event["type"].as_str().unwrap_or_default() {
+            "message_start" => {
+                self.message = Some(event["message"].clone());
+            }
+            "content_block_start" => {
+                let index = event["index"]
+                    .as_u64()
+                    .context("content_block_start missing index")?
+                    as usize;
+                self.ensure_content_index(index);
+                self.content[index] = Some(ContentBlockState {
+                    value: event["content_block"].clone(),
+                    partial_json: String::new(),
+                });
+            }
+            "content_block_delta" => {
+                let index = event["index"]
+                    .as_u64()
+                    .context("content_block_delta missing index")?
+                    as usize;
+                self.ensure_content_index(index);
+                let block = self.content[index]
+                    .as_mut()
+                    .context("content_block_delta arrived before content_block_start")?;
+                let delta = &event["delta"];
+                match delta["type"].as_str().unwrap_or_default() {
+                    "text_delta" => {
+                        let next = delta["text"].as_str().unwrap_or_default();
+                        let text = block.value["text"].as_str().unwrap_or_default().to_string();
+                        block.value["text"] = Value::String(format!("{text}{next}"));
+                    }
+                    "input_json_delta" => {
+                        block
+                            .partial_json
+                            .push_str(delta["partial_json"].as_str().unwrap_or_default());
+                    }
+                    "thinking_delta" => {
+                        let next = delta["thinking"].as_str().unwrap_or_default();
+                        let thinking = block.value["thinking"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        block.value["thinking"] = Value::String(format!("{thinking}{next}"));
+                    }
+                    "signature_delta" => {
+                        if let Some(signature) = delta["signature"].as_str() {
+                            block.value["signature"] = Value::String(signature.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let index = event["index"]
+                    .as_u64()
+                    .context("content_block_stop missing index")?
+                    as usize;
+                if let Some(Some(block)) = self.content.get_mut(index)
+                    && block.value["type"] == "tool_use"
+                    && !block.partial_json.is_empty()
+                {
+                    block.value["input"] = serde_json::from_str(&block.partial_json)
+                        .context("tool_use input_json_delta did not form JSON")?;
+                }
+            }
+            "message_delta" => {
+                let message = self.message.get_or_insert_with(
+                    || serde_json::json!({"type": "message", "role": "assistant", "content": []}),
+                );
+                if event["delta"].get("stop_reason").is_some() {
+                    message["stop_reason"] = event["delta"]["stop_reason"].clone();
+                }
+                if event["delta"].get("stop_sequence").is_some() {
+                    message["stop_sequence"] = event["delta"]["stop_sequence"].clone();
+                }
+                if event.get("usage").is_some() {
+                    merge_object_field(message, "usage", &event["usage"]);
+                }
+            }
+            "message_stop" => {}
+            "error" => bail!("anthropic stream error: {}", event["error"]),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Value> {
+        let mut message = self
+            .message
+            .take()
+            .context("anthropic stream ended before message_start")?;
+        message["content"] = Value::Array(
+            self.content
+                .into_iter()
+                .flatten()
+                .map(|block| block.value)
+                .collect(),
+        );
+        Ok(message)
+    }
+
+    fn ensure_content_index(&mut self, index: usize) {
+        while self.content.len() <= index {
+            self.content.push(None);
+        }
+    }
+}
+
+fn merge_object_field(target: &mut Value, field: &str, update: &Value) {
+    if !target[field].is_object() {
+        target[field] = serde_json::json!({});
+    }
+    if let (Some(existing), Some(update)) = (target[field].as_object_mut(), update.as_object()) {
+        for (key, value) in update {
+            existing.insert(key.clone(), value.clone());
         }
     }
 }
@@ -164,78 +347,184 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn create_message_retries_after_request_timeout() {
-        let server = MockAnthropic::new(vec![
-            MockResponse::Stall(Duration::from_millis(100)),
-            MockResponse::Json(json!({"id": "msg_ok", "content": []})),
-        ]);
-        let client = Anthropic::new(
-            "test-key".to_string(),
-            &server.base_url,
-            Duration::from_millis(25),
-            Duration::from_millis(1),
-        )
-        .expect("test client should build");
-
-        let response = client
-            .create_message(&json!({"model": "mock", "messages": []}))
-            .await
-            .expect("timeout should retry and recover");
-
-        assert_eq!(response["id"], "msg_ok");
-        assert_eq!(server.join(), 2);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn create_message_retries_truncated_response_body() {
-        let server = MockAnthropic::new(vec![
-            MockResponse::TruncatedBody(200),
-            MockResponse::Json(json!({"id": "msg_after_body_error", "content": []})),
-        ]);
+    async fn create_message_streaming_records_partials_and_rebuilds_text_message() {
+        let server = MockAnthropic::new(vec![MockResponse::Sse(
+            [
+                sse(
+                    "message_start",
+                    json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_1",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "mock",
+                            "content": [],
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": {"input_tokens": 3, "output_tokens": 0}
+                        }
+                    }),
+                ),
+                sse(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                ),
+                sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "hel"}
+                    }),
+                ),
+                sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "lo"}
+                    }),
+                ),
+                sse(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 0}),
+                ),
+                sse(
+                    "message_delta",
+                    json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                        "usage": {"output_tokens": 2}
+                    }),
+                ),
+                sse("message_stop", json!({"type": "message_stop"})),
+            ]
+            .join(""),
+        )]);
         let client = Anthropic::new(
             "test-key".to_string(),
             &server.base_url,
             Duration::from_secs(5),
-            Duration::from_millis(1),
         )
         .expect("test client should build");
+        let mut partials = Vec::new();
 
         let response = client
-            .create_message(&json!({"model": "mock", "messages": []}))
+            .create_message_streaming(&json!({"model": "mock", "messages": []}), |partial| {
+                partials.push(partial.clone());
+                Ok(())
+            })
             .await
-            .expect("body error should retry and recover");
+            .expect("stream should assemble");
 
-        assert_eq!(response["id"], "msg_after_body_error");
-        assert_eq!(server.join(), 2);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn create_message_does_not_retry_truncated_non_retryable_error() {
-        let server = MockAnthropic::new(vec![MockResponse::TruncatedBody(401)]);
-        let client = Anthropic::new(
-            "test-key".to_string(),
-            &server.base_url,
-            Duration::from_secs(5),
-            Duration::from_millis(1),
-        )
-        .expect("test client should build");
-
-        let error = client
-            .create_message(&json!({"model": "mock", "messages": []}))
-            .await
-            .expect_err("non-retryable API statuses should not retry on body errors");
-
-        assert!(
-            format!("{error:#}").contains("anthropic api error 401 Unauthorized"),
-            "{error:#}"
+        assert_eq!(response["id"], "msg_1");
+        assert_eq!(response["content"][0]["text"], "hello");
+        assert_eq!(response["stop_reason"], "end_turn");
+        assert_eq!(response["usage"]["input_tokens"], 3);
+        assert_eq!(response["usage"]["output_tokens"], 2);
+        assert_eq!(
+            partials
+                .iter()
+                .filter(|partial| partial["event"] == "content_block_delta")
+                .count(),
+            2
         );
+        assert_eq!(partials[2]["data"]["delta"]["text"], "hel");
+        assert_eq!(server.join(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_message_streaming_rebuilds_tool_use_input_json_delta() {
+        let server = MockAnthropic::new(vec![MockResponse::Sse(
+            [
+                sse(
+                    "message_start",
+                    json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_tools",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "mock",
+                            "content": [],
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": {"input_tokens": 1, "output_tokens": 0}
+                        }
+                    }),
+                ),
+                sse(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "echo",
+                            "input": {}
+                        }
+                    }),
+                ),
+                sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": "{\"value\":"}
+                    }),
+                ),
+                sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": "\"ok\"}"}
+                    }),
+                ),
+                sse(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 0}),
+                ),
+                sse(
+                    "message_delta",
+                    json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                        "usage": {"output_tokens": 4}
+                    }),
+                ),
+                sse("message_stop", json!({"type": "message_stop"})),
+            ]
+            .join(""),
+        )]);
+        let client = Anthropic::new(
+            "test-key".to_string(),
+            &server.base_url,
+            Duration::from_secs(5),
+        )
+        .expect("test client should build");
+
+        let response = client
+            .create_message_streaming(&json!({"model": "mock", "messages": []}), |_| Ok(()))
+            .await
+            .expect("stream should assemble");
+
+        assert_eq!(response["content"][0]["type"], "tool_use");
+        assert_eq!(response["content"][0]["id"], "toolu_1");
+        assert_eq!(response["content"][0]["name"], "echo");
+        assert_eq!(response["content"][0]["input"]["value"], "ok");
+        assert_eq!(response["stop_reason"], "tool_use");
         assert_eq!(server.join(), 1);
     }
 
     enum MockResponse {
-        Json(Value),
-        Stall(Duration),
-        TruncatedBody(u16),
+        Sse(String),
     }
 
     struct MockAnthropic {
@@ -251,26 +540,13 @@ mod tests {
             let requests = Arc::new(AtomicUsize::new(0));
             let server_requests = Arc::clone(&requests);
             let handle = thread::spawn(move || {
-                let mut stall_handles = Vec::new();
                 for response in responses {
                     let (mut stream, _) = listener.accept().unwrap();
                     server_requests.fetch_add(1, Ordering::SeqCst);
                     read_http_headers(&mut stream);
                     match response {
-                        MockResponse::Json(value) => write_json_response(&mut stream, &value),
-                        MockResponse::Stall(duration) => {
-                            stall_handles.push(thread::spawn(move || {
-                                thread::sleep(duration);
-                                drop(stream);
-                            }));
-                        }
-                        MockResponse::TruncatedBody(status) => {
-                            write_truncated_response(&mut stream, status)
-                        }
+                        MockResponse::Sse(body) => write_sse_response(&mut stream, &body),
                     }
-                }
-                for handle in stall_handles {
-                    handle.join().unwrap();
                 }
             });
             Self {
@@ -314,26 +590,13 @@ mod tests {
         }
     }
 
-    fn write_json_response(stream: &mut TcpStream, value: &Value) {
-        let body = value.to_string();
-        let reply = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(reply.as_bytes()).unwrap();
+    fn sse(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
     }
 
-    fn write_truncated_response(stream: &mut TcpStream, status: u16) {
-        let reason = match status {
-            200 => "OK",
-            401 => "Unauthorized",
-            429 => "Too Many Requests",
-            500 => "Internal Server Error",
-            _ => "Error",
-        };
+    fn write_sse_response(stream: &mut TcpStream, body: &str) {
         let reply = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{{\"id\""
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
         );
         stream.write_all(reply.as_bytes()).unwrap();
     }
