@@ -7,6 +7,10 @@ on:
       - main
       - "codex/**"
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: Rust (${{ matrix.os }})
