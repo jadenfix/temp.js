@@ -77,11 +77,14 @@ pub(crate) fn build_registry(
             let value = load_agent_config(app_dir, &name)?;
             let config: beater_agent::AgentConfig = serde_json::from_value(value)
                 .with_context(|| format!("agents/{name}/agent.ts config shape"))?;
-            registry.extend(beater_agent::ToolRegistry::build_with_beatbox(
-                &dir,
-                &config.tools,
-                beatbox,
-            )?);
+            registry.extend(
+                beater_agent::ToolRegistry::build_with_beatbox_and_browser_session_dir(
+                    &dir,
+                    &config.tools,
+                    beatbox,
+                    Some(beater_agent::browser_session_dir(app_dir)),
+                )?,
+            );
             agents.push(name);
         }
     }

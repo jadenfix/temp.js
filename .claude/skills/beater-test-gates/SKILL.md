@@ -39,9 +39,20 @@ PYO3_CONFIG_FILE="$tmp_config" \
   cargo test -p beater-cli dev_server_serves_routes_ssr_and_mcp_without_api_key -- --nocapture
 ```
 
+For browser lifecycle work, run the focused agent cleanup filters before the full gate:
+
+```sh
+PYO3_CONFIG_FILE="$tmp_config" \
+  DYLD_FRAMEWORK_PATH=/Library/Developer/CommandLineTools/Library/Frameworks \
+  cargo test -p beater-agent browser_session -- --nocapture
+PYO3_CONFIG_FILE="$tmp_config" \
+  DYLD_FRAMEWORK_PATH=/Library/Developer/CommandLineTools/Library/Frameworks \
+  cargo test -p beater-agent resume_cleans_stale_browser_session_before_review -- --nocapture
+```
+
 ## Browser provider gate
 
-`scripts/playwright-browser-gate.cjs` is the live provider proof for `browserTool(..., {provider: "playwright"})`. It installs the upstream Playwright runner dependencies in a temp directory, starts a local browser fixture and Anthropic-compatible SSE mock, runs `beater agent run`, and verifies the completed Chromium tool result in SQLite.
+`scripts/playwright-browser-gate.cjs` is the live provider proof for `browserTool(..., {provider: "playwright"})`. It installs the upstream Playwright runner dependencies in a temp directory, starts a local browser fixture and Anthropic-compatible SSE mock, runs `beater agent run`, and verifies two completed Chromium tool results reused one run-scoped session in SQLite.
 
 Build the local binary with the same PyO3 settings first, then run the gate:
 

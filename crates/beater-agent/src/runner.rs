@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 
 use crate::anthropic::Anthropic;
 use crate::journal::Journal;
-use crate::registry::{AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry};
+use crate::registry::{
+    AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry,
+    browser_session_dir, cleanup_stale_browser_sessions,
+};
 use crate::trace_export;
 
 const MAX_TOKENS: u64 = 16000;
@@ -51,7 +54,12 @@ fn setup(
     let config: AgentConfig = serde_json::from_value(config_value)
         .context("agent.ts default export did not match defineAgent shape")?;
     let agent_dir = app_dir.join("agents").join(&config.name);
-    let registry = ToolRegistry::build_with_beatbox(&agent_dir, &config.tools, beatbox)?;
+    let registry = ToolRegistry::build_with_beatbox_and_browser_session_dir(
+        &agent_dir,
+        &config.tools,
+        beatbox,
+        Some(browser_session_dir(app_dir)),
+    )?;
     Ok((config, registry))
 }
 
@@ -107,6 +115,8 @@ pub fn resume(
             LIVE_RUN_RESUME_GRACE.as_secs()
         );
     }
+    cleanup_stale_browser_sessions(app_dir, run_id)
+        .with_context(|| format!("cleaning stale browser sessions for run {run_id}"))?;
     let config_value = load_config(&run.agent)?;
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     let steps = journal.steps(run_id)?;
@@ -1472,6 +1482,45 @@ def run(input):
         assert_eq!(tool_steps.len(), 1);
         assert_eq!(tool_steps[0].status, "started");
         assert_eq!(tool_steps[0].attempt, 1);
+    }
+
+    #[test]
+    fn resume_cleans_stale_browser_session_before_review() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("browser-stale-session");
+        seed_interrupted_tool_run_for(
+            &app,
+            "browser.checkout",
+            json!({"url": "https://shop.example/cart", "task": "verify checkout"}),
+        );
+        let session_dir = app.path().join(".beater/browser-sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let wrapper_path = session_dir.join("run-1-wrapper.cjs");
+        let marker_path = session_dir.join("run-1-marker.json");
+        fs::write(&wrapper_path, "setTimeout(() => {}, 30000);\n").unwrap();
+        fs::write(
+            &marker_path,
+            json!({
+                "session_id": "run-1",
+                "wrapper_script": wrapper_path.clone(),
+                "runner_script": "/dev/null",
+                "owner_pid": 1,
+                "created_at": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _env = EnvGuard::set("http://127.0.0.1:9");
+
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(browser_config())
+        })
+        .unwrap();
+
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
+        assert!(!marker_path.exists());
+        assert!(!wrapper_path.exists());
     }
 
     #[test]

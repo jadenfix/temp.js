@@ -5,14 +5,16 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
@@ -29,6 +31,7 @@ pub const DEFAULT_BEATBOX_URL: &str = "http://127.0.0.1:7300";
 const DEFAULT_PYTHON_TIMEOUT_MS: u64 = 10_000;
 const PLAYWRIGHT_NODE_ENV: &str = "BEATER_PLAYWRIGHT_NODE";
 const PLAYWRIGHT_RUNNER_ENV: &str = "BEATER_PLAYWRIGHT_RUNNER";
+const BROWSER_SESSION_DIR: &str = "browser-sessions";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct BeatboxConfig {
@@ -203,6 +206,24 @@ pub struct ToolRegistry {
     tools: Vec<ToolEntry>,
 }
 
+#[derive(Clone)]
+struct BrowserSessionStore {
+    root: PathBuf,
+}
+
+struct BrowserProcessLease {
+    marker_path: PathBuf,
+    wrapper_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct BrowserSessionMarker {
+    session_id: String,
+    wrapper_script: PathBuf,
+    #[serde(default)]
+    process_title: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct ToolNeedsReview {
@@ -218,6 +239,228 @@ impl ToolNeedsReview {
             ),
         }
     }
+}
+
+pub fn browser_session_dir(app_dir: &Path) -> PathBuf {
+    app_dir.join(".beater").join(BROWSER_SESSION_DIR)
+}
+
+pub fn cleanup_stale_browser_sessions(app_dir: &Path, run_id: &str) -> Result<()> {
+    BrowserSessionStore::new(browser_session_dir(app_dir)).cleanup_session(run_id)
+}
+
+impl BrowserSessionStore {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn lease(
+        &self,
+        session_id: &str,
+        config: &mut PlaywrightConfig,
+    ) -> Result<BrowserProcessLease> {
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating browser session dir {}", self.root.display()))?;
+        let suffix = unique_browser_session_suffix();
+        let safe_id = safe_browser_session_component(session_id);
+        let marker_path = self.root.join(format!("{safe_id}-{suffix}.json"));
+        let wrapper_path = self.root.join(format!("{safe_id}-{suffix}.cjs"));
+        let runner_script = config
+            .runner_script
+            .canonicalize()
+            .unwrap_or_else(|_| config.runner_script.clone());
+        let process_title = format!("beater-playwright:{session_id}");
+        let wrapper = format!(
+            "process.title = {};\nprocess.env.BEATER_BROWSER_SESSION_ID = {};\nrequire({});\n",
+            serde_json::to_string(&process_title)?,
+            serde_json::to_string(session_id)?,
+            serde_json::to_string(&runner_script.to_string_lossy())?,
+        );
+        fs::write(&wrapper_path, wrapper).with_context(|| {
+            format!(
+                "writing Playwright runner wrapper {}",
+                wrapper_path.display()
+            )
+        })?;
+        let marker = json!({
+            "session_id": session_id,
+            "wrapper_script": wrapper_path,
+            "process_title": process_title,
+            "runner_script": runner_script,
+            "owner_pid": process::id(),
+            "created_at": now_unix_secs(),
+        });
+        fs::write(&marker_path, serde_json::to_vec_pretty(&marker)?)
+            .with_context(|| format!("writing browser session marker {}", marker_path.display()))?;
+        config.runner_script = wrapper_path.clone();
+        Ok(BrowserProcessLease {
+            marker_path,
+            wrapper_path,
+        })
+    }
+
+    fn cleanup_session(&self, session_id: &str) -> Result<()> {
+        let markers = self.markers_for_session(session_id)?;
+        for marker in markers {
+            terminate_processes_matching(&marker.wrapper_script, marker.process_title.as_deref())
+                .with_context(|| {
+                format!(
+                    "terminating browser runner {}",
+                    marker.wrapper_script.display()
+                )
+            })?;
+            remove_file_if_exists(&marker.wrapper_script)?;
+            remove_file_if_exists(&marker.marker_path)?;
+        }
+        Ok(())
+    }
+
+    fn markers_for_session(&self, session_id: &str) -> Result<Vec<StoredBrowserSessionMarker>> {
+        if !self.root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut markers = Vec::new();
+        for entry in fs::read_dir(&self.root)
+            .with_context(|| format!("reading browser session dir {}", self.root.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(marker) = serde_json::from_slice::<BrowserSessionMarker>(&bytes) else {
+                continue;
+            };
+            if marker.session_id == session_id {
+                markers.push(StoredBrowserSessionMarker {
+                    marker_path: path,
+                    wrapper_script: marker.wrapper_script,
+                    process_title: marker.process_title,
+                });
+            }
+        }
+        Ok(markers)
+    }
+}
+
+struct StoredBrowserSessionMarker {
+    marker_path: PathBuf,
+    wrapper_script: PathBuf,
+    process_title: Option<String>,
+}
+
+impl BrowserProcessLease {
+    fn cleanup_files(&self) -> Result<()> {
+        remove_file_if_exists(&self.wrapper_path)?;
+        remove_file_if_exists(&self.marker_path)?;
+        Ok(())
+    }
+
+    fn cleanup_after_launch_failure(&self) -> Result<()> {
+        terminate_processes_matching(&self.wrapper_path, None)?;
+        self.cleanup_files()
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn unique_browser_session_suffix() -> String {
+    format!("{}-{}", process::id(), now_unix_nanos())
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn now_unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn safe_browser_session_component(session_id: &str) -> String {
+    let value: String = session_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '_',
+        })
+        .collect();
+    if value.is_empty() {
+        "session".to_string()
+    } else {
+        value
+    }
+}
+
+#[cfg(unix)]
+fn terminate_processes_matching(wrapper_path: &Path, process_title: Option<&str>) -> Result<()> {
+    let needle = wrapper_path.to_string_lossy();
+    let output = process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .context("listing processes for browser session cleanup")?;
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let current_pid = process::id();
+    let mut pids = Vec::new();
+    for line in listing.lines() {
+        let trimmed = line.trim_start();
+        let Some((pid, command)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        let matches_wrapper = command.contains(needle.as_ref());
+        let matches_title = process_title
+            .map(|title| command.contains(title))
+            .unwrap_or(false);
+        if pid != current_pid && (matches_wrapper || matches_title) {
+            pids.push(pid);
+        }
+    }
+    for pid in &pids {
+        let _ = process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    if !pids.is_empty() {
+        thread::sleep(Duration::from_millis(100));
+    }
+    for pid in pids {
+        if process_is_running(pid) {
+            let _ = process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_processes_matching(_wrapper_path: &Path, _process_title: Option<&str>) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Default)]
@@ -238,6 +481,26 @@ impl ToolRegistry {
         agent_dir: &Path,
         decls: &[ToolDecl],
         beatbox: &BeatboxConfig,
+    ) -> Result<Self> {
+        Self::build_inner(agent_dir, decls, beatbox, None)
+    }
+
+    pub fn build_with_beatbox_and_browser_session_dir(
+        agent_dir: &Path,
+        decls: &[ToolDecl],
+        beatbox: &BeatboxConfig,
+        browser_session_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        let browser_sessions =
+            browser_session_dir.map(|root| Arc::new(BrowserSessionStore::new(root)));
+        Self::build_inner(agent_dir, decls, beatbox, browser_sessions)
+    }
+
+    fn build_inner(
+        agent_dir: &Path,
+        decls: &[ToolDecl],
+        beatbox: &BeatboxConfig,
+        browser_sessions: Option<Arc<BrowserSessionStore>>,
     ) -> Result<Self> {
         let mut tools = Vec::new();
         for decl in decls {
@@ -299,7 +562,7 @@ impl ToolRegistry {
                     let input_schema = decl.input_schema.clone().with_context(|| {
                         format!("browser tool {} requires inputSchema", decl.name)
                     })?;
-                    let config = BrowserTool::from_decl(decl)?;
+                    let config = BrowserTool::from_decl(decl, browser_sessions.clone())?;
                     ToolEntry {
                         name: decl.name.clone(),
                         description,
@@ -1014,6 +1277,7 @@ pub struct BrowserTool {
     session: BrowserSessionPolicy,
     allowed_origins: Vec<String>,
     sessions: Arc<AsyncMutex<HashMap<String, BrowserSessionState>>>,
+    store: Option<Arc<BrowserSessionStore>>,
 }
 
 enum BrowserSessionState {
@@ -1024,6 +1288,7 @@ enum BrowserSessionState {
     Playwright {
         _guard: BrowserSessionGuard,
         driver: PlaywrightDriver,
+        lease: Option<BrowserProcessLease>,
         calls: u64,
     },
 }
@@ -1089,7 +1354,7 @@ fn active_browser_sessions() -> &'static Mutex<HashMap<String, usize>> {
 }
 
 impl BrowserTool {
-    fn from_decl(decl: &ToolDecl) -> Result<Self> {
+    fn from_decl(decl: &ToolDecl, store: Option<Arc<BrowserSessionStore>>) -> Result<Self> {
         let provider = match decl
             .provider
             .as_deref()
@@ -1133,6 +1398,7 @@ impl BrowserTool {
             session,
             allowed_origins,
             sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+            store,
         })
     }
 
@@ -1232,15 +1498,22 @@ impl BrowserTool {
             let mut sessions = self.sessions.lock().await;
             let reused = sessions.contains_key(session_id);
             if !reused {
-                let driver = PlaywrightDriver::launch(playwright_config())
-                    .await
-                    .map_err(anyhow::Error::new)?
-                    .with_policy(UrlPolicy::allow_all());
+                let (config, lease) = self.playwright_config_for_session(session_id)?;
+                let driver = match PlaywrightDriver::launch(config).await {
+                    Ok(driver) => driver.with_policy(UrlPolicy::allow_all()),
+                    Err(error) => {
+                        if let Some(lease) = &lease {
+                            let _ = lease.cleanup_after_launch_failure();
+                        }
+                        return Err(anyhow::Error::new(error));
+                    }
+                };
                 sessions.insert(
                     session_id.to_string(),
                     BrowserSessionState::Playwright {
                         _guard: BrowserSessionGuard::start(session_id),
                         driver,
+                        lease,
                         calls: 0,
                     },
                 );
@@ -1259,14 +1532,23 @@ impl BrowserTool {
         }
 
         let guard = BrowserSessionGuard::start(session_id);
-        let mut driver = PlaywrightDriver::launch(playwright_config())
-            .await
-            .map_err(anyhow::Error::new)?
-            .with_policy(UrlPolicy::allow_all());
+        let (config, lease) = self.playwright_config_for_session(session_id)?;
+        let mut driver = match PlaywrightDriver::launch(config).await {
+            Ok(driver) => driver.with_policy(UrlPolicy::allow_all()),
+            Err(error) => {
+                if let Some(lease) = &lease {
+                    let _ = lease.cleanup_after_launch_failure();
+                }
+                return Err(anyhow::Error::new(error));
+            }
+        };
         let result = self
             .execute_playwright_with_driver(&mut driver, input, guard.id(), 1, false)
             .await;
         let close_result = driver.close().await.map_err(anyhow::Error::new);
+        if let Some(lease) = &lease {
+            let _ = lease.cleanup_files();
+        }
         drop(guard);
         match (result, close_result) {
             (Ok(output), Ok(())) => Ok(output),
@@ -1342,13 +1624,33 @@ impl BrowserTool {
     async fn close_session(&self, session_id: &str) -> Result<()> {
         let state = self.sessions.lock().await.remove(session_id);
         match state {
-            Some(BrowserSessionState::Playwright { mut driver, .. }) => driver
-                .close()
-                .await
-                .map_err(anyhow::Error::new)
-                .context("closing Playwright browser session"),
+            Some(BrowserSessionState::Playwright {
+                mut driver, lease, ..
+            }) => {
+                let close = driver
+                    .close()
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("closing Playwright browser session");
+                if let Some(lease) = &lease {
+                    let _ = lease.cleanup_files();
+                }
+                close
+            }
             Some(BrowserSessionState::Mock { .. }) | None => Ok(()),
         }
+    }
+
+    fn playwright_config_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(PlaywrightConfig, Option<BrowserProcessLease>)> {
+        let mut config = playwright_config();
+        let lease = match &self.store {
+            Some(store) => Some(store.lease(session_id, &mut config)?),
+            None => None,
+        };
+        Ok((config, lease))
     }
 }
 
@@ -2456,8 +2758,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        BrowserSessionGuard, ToolCallContext, ToolDecl, ToolImpl, ToolNeedsReview, ToolRegistry,
-        browser_action_from_input, browser_session_active_for_tests,
+        BrowserSessionGuard, BrowserSessionStore, ToolCallContext, ToolDecl, ToolImpl,
+        ToolNeedsReview, ToolRegistry, browser_action_from_input, browser_session_active_for_tests,
         browser_session_count_for_tests,
     };
 
@@ -3158,6 +3460,48 @@ def run(input):
         assert_eq!(browser_session_count_for_tests("duplicate-session"), 1);
         drop(second);
         assert_eq!(browser_session_count_for_tests("duplicate-session"), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_browser_session_cleanup_kills_marked_runner_and_removes_files() {
+        let temp = TempAgentDir::new("browser-session-cleanup");
+        let root = temp.path.join(".beater/browser-sessions");
+        fs::create_dir_all(&root).unwrap();
+        let wrapper_path = root.join("run-browser-cleanup.cjs");
+        let marker_path = root.join("run-browser-cleanup.json");
+        fs::write(&wrapper_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg(&wrapper_path)
+            .spawn()
+            .unwrap();
+        fs::write(
+            &marker_path,
+            json!({
+                "session_id": "run-browser-cleanup",
+                "wrapper_script": wrapper_path.clone(),
+                "runner_script": "/dev/null",
+                "owner_pid": 1,
+                "created_at": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        BrowserSessionStore::new(root)
+            .cleanup_session("run-browser-cleanup")
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!marker_path.exists());
+        assert!(!wrapper_path.exists());
     }
 
     #[test]

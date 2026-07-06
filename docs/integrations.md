@@ -150,6 +150,7 @@ Implemented behavior:
 - `allowedOrigins` blocks navigation outside the declared origins
 - `session: {scope: "run", cleanup: "always"}` uses the journal run id as the session id and reuses the session across multiple browser calls in that run
 - browser sessions are cleaned up when an agent run or synthetic MCP run reaches a terminal state
+- app-scoped Playwright runs write per-session runner markers under `.beater/browser-sessions`; `beater agent resume` removes stale markers and terminates marked runners for the run before replay/review
 - `provider: "playwright"` reuses the pinned upstream `beater-browser` / `beater-browser-playwright` crates and launches Chromium through the upstream Node runner
 - the Playwright input path supports `input.url` plus one optional driver action such as `click`, `type`, `extract`, `wait`, `scroll`, `select`, or `goto`
 - non-empty `secrets` are rejected by `mock_cdp` and `playwright`; credential scoping remains production work
@@ -159,9 +160,8 @@ Implemented behavior:
 
 Production Playwright/CDP release criteria:
 
-- session cleanup survives process interruption and resume
 - credentials are scoped to the provider/session
-- richer browser e2e tests cover authenticated actions and crash/restart cleanup
+- richer browser e2e tests cover authenticated actions and credential use
 
 ## Coexistence
 
