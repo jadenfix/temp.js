@@ -193,7 +193,7 @@ Each discovered provider tool is exposed as `<prefix>.<provider tool name>` in `
 
 ## Browser tools
 
-Use `browserTool` for browser-provider declarations. The current `mock_cdp` provider is deterministic and intended for CI coverage of the browser contract:
+Use `browserTool` for browser-provider declarations. `mock_cdp` is deterministic and intended for CI coverage of the browser contract:
 
 ```ts
 browserTool("browser.checkout", {
@@ -211,6 +211,14 @@ browserTool("browser.checkout", {
 })
 ```
 
-Browser tools default to non-idempotent because they create sessions and may perform side effects. `allowedOrigins` is enforced before navigation, and mock sessions are per tool call with cleanup on success, failure, and timeout. `mock_cdp` rejects non-empty `secrets`; real providers must validate and scope credentials explicitly.
+For native browser execution, set `provider: "playwright"`. The Playwright provider reuses the pinned `beater-browser` / `beater-browser-playwright` driver contract, launches Chromium through the upstream Node runner, navigates to `input.url`, and can execute one optional action:
+
+```json
+{"url": "https://shop.example/cart", "action": "click", "selector": "#checkout"}
+```
+
+The optional action also accepts the upstream driver shape, for example `{"action": {"action": "type", "args": {"selector": "#email", "text": "a@example.com"}}}`. Install the upstream runner dependencies before live use; default tests do not launch Playwright.
+
+Browser tools default to non-idempotent because they create sessions and may perform side effects. `allowedOrigins` is enforced before navigation. Mock sessions are per tool call with cleanup on success, failure, and timeout; Playwright sessions are closed after each tool call. `mock_cdp` and `playwright` currently reject non-empty `secrets`; credential scoping remains production work.
 
 See [Integration Registry](integrations.md) for the full contract and target declaration shapes.

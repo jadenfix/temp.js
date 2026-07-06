@@ -61,6 +61,8 @@ beater-runtime = { path = "crates/beater-runtime" }
 beater-agent = { path = "crates/beater-agent" }
 beater-py = { path = "crates/beater-py" }
 beater-connect = { path = "crates/beater-connect" }
+beater-browser = { git = "https://github.com/jadenfix/beater", rev = "d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e" }
+beater-browser-playwright = { git = "https://github.com/jadenfix/beater", rev = "d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e" }
 beatbox-client = { git = "https://github.com/jadenfix/beatbox", rev = "dc2ddd9d93542737627210a05eeae96e008a1aad" }
 wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
 

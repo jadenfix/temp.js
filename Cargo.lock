@@ -247,7 +247,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -266,6 +266,8 @@ dependencies = [
  "anyhow",
  "base64",
  "beatbox-client",
+ "beater-browser",
+ "beater-browser-playwright",
  "beater-py",
  "chrono",
  "cxx",
@@ -275,11 +277,36 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
  "wasmtime",
+]
+
+[[package]]
+name = "beater-browser"
+version = "0.1.0"
+source = "git+https://github.com/jadenfix/beater?rev=d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e#d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "beater-browser-playwright"
+version = "0.1.0"
+source = "git+https://github.com/jadenfix/beater?rev=d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e#d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e"
+dependencies = [
+ "async-trait",
+ "beater-browser",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -331,7 +358,7 @@ dependencies = [
  "notify",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "toml",
@@ -596,7 +623,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -954,7 +981,7 @@ dependencies = [
  "swc_sourcemap",
  "swc_visit",
  "text_lines",
- "thiserror",
+ "thiserror 2.0.18",
  "unicode-width",
  "url",
 ]
@@ -994,7 +1021,7 @@ dependencies = [
  "sourcemap",
  "static_assertions",
  "sys_traits",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "url",
  "v8",
@@ -1052,7 +1079,7 @@ dependencies = [
  "strum_macros",
  "syn",
  "syn-match",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1064,7 +1091,7 @@ dependencies = [
  "deno_error",
  "percent-encoding",
  "sys_traits",
- "thiserror",
+ "thiserror 2.0.18",
  "url",
 ]
 
@@ -2491,7 +2518,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "web-time",
@@ -2512,7 +2539,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror",
+ "thiserror 2.0.18",
  "tinyvec",
  "tracing",
  "web-time",
@@ -2729,7 +2756,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
 dependencies = [
  "hashbrown 0.16.1",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2967,7 +2994,7 @@ dependencies = [
  "num-bigint",
  "serde",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.18",
  "v8",
 ]
 
@@ -3695,11 +3722,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.18",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -4221,7 +4268,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a10e6b67c951a84de7029487e0e0a496860dae49f6699edd279d5ff35b8fbf54"
 dependencies = [
  "deno_error",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4365,7 +4412,7 @@ dependencies = [
  "pulley-interpreter",
  "smallvec",
  "target-lexicon",
- "thiserror",
+ "thiserror 2.0.18",
  "wasmparser 0.251.0",
  "wasmtime-environ",
  "wasmtime-internal-core",

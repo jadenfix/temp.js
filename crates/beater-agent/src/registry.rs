@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
+use beater_browser::{
+    BrowserAction, BrowserDriver, BrowserEngine, Observation, StepOutcome, StepStatus,
+};
+use beater_browser_playwright::{PlaywrightConfig, PlaywrightDriver};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
@@ -997,6 +1001,7 @@ pub struct BrowserTool {
 
 enum BrowserProvider {
     MockCdp,
+    Playwright,
 }
 
 struct BrowserSessionPolicy {
@@ -1063,8 +1068,9 @@ impl BrowserTool {
             .filter(|provider| !provider.is_empty())
         {
             Some("mock_cdp") => BrowserProvider::MockCdp,
+            Some("playwright") => BrowserProvider::Playwright,
             Some(other) => bail!(
-                "browser tool {} unsupported provider {other:?}; supported providers: mock_cdp",
+                "browser tool {} unsupported provider {other:?}; supported providers: mock_cdp, playwright",
                 decl.name
             ),
             None => bail!("browser tool {} requires provider", decl.name),
@@ -1082,11 +1088,16 @@ impl BrowserTool {
             .map(|origin| canonical_origin(origin))
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("browser tool {} has invalid allowedOrigins", decl.name))?;
-        ensure!(
-            browser_secrets_empty(&decl.secrets),
-            "browser tool {} provider mock_cdp does not support secrets",
-            decl.name
-        );
+        if !browser_secrets_empty(&decl.secrets) {
+            let provider_name = match provider {
+                BrowserProvider::MockCdp => "mock_cdp",
+                BrowserProvider::Playwright => "playwright",
+            };
+            bail!(
+                "browser tool {} provider {provider_name} does not support secrets",
+                decl.name
+            );
+        }
         Ok(Self {
             provider,
             timeout: Duration::from_millis(timeout_ms),
@@ -1101,6 +1112,7 @@ impl BrowserTool {
             let session = BrowserSessionGuard::start(session_id);
             let result = match self.provider {
                 BrowserProvider::MockCdp => self.execute_mock_cdp(input, session.id()).await,
+                BrowserProvider::Playwright => self.execute_playwright(input, session.id()).await,
             };
             drop(session);
             result
@@ -1141,6 +1153,62 @@ impl BrowserTool {
         .to_string())
     }
 
+    async fn execute_playwright(&self, input: &Value, session_id: &str) -> Result<String> {
+        let url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .context("playwright browser tool requires string input.url")?;
+        self.ensure_url_allowed(url)?;
+
+        let action = browser_action_from_input(input)?;
+        if let Some(BrowserAction::Goto { url }) = &action {
+            self.ensure_url_allowed(url)?;
+        }
+        let mut driver = PlaywrightDriver::launch(PlaywrightConfig::new(BrowserEngine::Chromium))
+            .await
+            .map_err(anyhow::Error::new)?;
+        let result = async {
+            let mut observation = driver.goto(url).await.map_err(anyhow::Error::new)?;
+            let mut outcome = None;
+            if let Some(action) = action {
+                let step_outcome = driver.act(&action).await.map_err(anyhow::Error::new)?;
+                observation = step_outcome.observation.clone();
+                outcome = Some(json!({
+                    "action": action,
+                    "status": browser_step_status(&step_outcome),
+                    "error": step_outcome.error,
+                    "grounding": step_outcome.grounding,
+                }));
+            }
+            Ok::<_, anyhow::Error>(
+                json!({
+                    "provider": "playwright",
+                    "engine": "chromium",
+                    "session": {
+                        "id": session_id,
+                        "scope": self.session.scope.as_str(),
+                        "cleanup": self.session.cleanup.as_str(),
+                    },
+                    "url": observation.url,
+                    "title": observation.title,
+                    "text": browser_observation_text(&observation),
+                    "domHtml": observation.dom_html.as_deref().map(truncate_browser_text),
+                    "console": observation.console,
+                    "network": observation.network,
+                    "outcome": outcome,
+                })
+                .to_string(),
+            )
+        }
+        .await;
+        let close_result = driver.close().await.map_err(anyhow::Error::new);
+        match (result, close_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(_), Err(error)) => Err(error).context("closing Playwright browser session"),
+            (Err(error), _) => Err(error),
+        }
+    }
+
     fn ensure_url_allowed(&self, raw_url: &str) -> Result<()> {
         let origin = origin_from_url(raw_url)?;
         ensure!(
@@ -1152,6 +1220,93 @@ impl BrowserTool {
         );
         Ok(())
     }
+}
+
+fn browser_action_from_input(input: &Value) -> Result<Option<BrowserAction>> {
+    let Some(action_value) = input.get("action") else {
+        return Ok(None);
+    };
+    if action_value.is_object()
+        && let Ok(action) = serde_json::from_value::<BrowserAction>(action_value.clone())
+    {
+        return Ok(Some(action));
+    }
+    let (verb, source) = match action_value.as_str() {
+        Some(verb) => (verb, input),
+        None => {
+            let verb = action_value
+                .get("type")
+                .or_else(|| action_value.get("action"))
+                .and_then(Value::as_str)
+                .context("browser action object requires string type or action")?;
+            (verb, action_value)
+        }
+    };
+    Ok(Some(browser_action_from_parts(verb, source)?))
+}
+
+fn browser_action_from_parts(verb: &str, source: &Value) -> Result<BrowserAction> {
+    match verb {
+        "goto" => Ok(BrowserAction::Goto {
+            url: required_browser_str(source, "url")?.to_string(),
+        }),
+        "click" => Ok(BrowserAction::Click {
+            selector: required_browser_str(source, "selector")?.to_string(),
+        }),
+        "type" => Ok(BrowserAction::Type {
+            selector: required_browser_str(source, "selector")?.to_string(),
+            text: required_browser_str(source, "text")?.to_string(),
+        }),
+        "scroll" => Ok(BrowserAction::Scroll {
+            x: source.get("x").and_then(Value::as_i64).unwrap_or(0),
+            y: source.get("y").and_then(Value::as_i64).unwrap_or(0),
+        }),
+        "select" => Ok(BrowserAction::Select {
+            selector: required_browser_str(source, "selector")?.to_string(),
+            value: required_browser_str(source, "value")?.to_string(),
+        }),
+        "wait" => Ok(BrowserAction::Wait {
+            millis: source
+                .get("millis")
+                .or_else(|| source.get("ms"))
+                .and_then(Value::as_u64)
+                .context("browser wait action requires integer millis or ms")?,
+        }),
+        "extract" => Ok(BrowserAction::Extract {
+            selector: required_browser_str(source, "selector")?.to_string(),
+        }),
+        other => bail!("unsupported browser action {other:?}"),
+    }
+}
+
+fn required_browser_str<'a>(source: &'a Value, field: &str) -> Result<&'a str> {
+    source
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("browser action requires string {field}"))
+}
+
+fn browser_step_status(outcome: &StepOutcome) -> &'static str {
+    match outcome.status {
+        StepStatus::Ok => "ok",
+        StepStatus::Error => "error",
+    }
+}
+
+fn browser_observation_text(observation: &Observation) -> Option<String> {
+    observation.dom_html.as_deref().map(truncate_browser_text)
+}
+
+fn truncate_browser_text(text: &str) -> String {
+    const MAX_BROWSER_TEXT: usize = 16 * 1024;
+    if text.len() <= MAX_BROWSER_TEXT {
+        return text.to_string();
+    }
+    let mut end = MAX_BROWSER_TEXT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &text[..end])
 }
 
 impl BrowserSessionPolicy {
@@ -2135,11 +2290,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use beater_browser::BrowserAction;
     use serde_json::{Value, json};
 
     use super::{
         BrowserSessionGuard, ToolCallContext, ToolDecl, ToolImpl, ToolNeedsReview, ToolRegistry,
-        browser_session_active_for_tests, browser_session_count_for_tests,
+        browser_action_from_input, browser_session_active_for_tests,
+        browser_session_count_for_tests,
     };
 
     #[test]
@@ -2632,6 +2789,55 @@ def run(input):
         assert!(
             format!("{error:#}").contains("unsupported session.scope"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn browser_playwright_provider_builds_and_rejects_secrets() {
+        let mut decl = browser_decl();
+        decl.provider = Some("playwright".to_string());
+        ToolRegistry::build(PathBuf::new().as_path(), &[decl])
+            .expect("playwright browser registry should build");
+
+        let mut decl = browser_decl();
+        decl.provider = Some("playwright".to_string());
+        decl.secrets = json!({"cookies": "BROWSER_COOKIES"});
+        let error = match ToolRegistry::build(PathBuf::new().as_path(), &[decl]) {
+            Ok(_) => panic!("playwright provider should reject unscoped secrets"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("provider playwright does not support secrets"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn browser_action_input_supports_compact_and_driver_shapes() {
+        assert_eq!(
+            browser_action_from_input(&json!({"action": "click", "selector": "#buy"}))
+                .unwrap()
+                .unwrap(),
+            BrowserAction::Click {
+                selector: "#buy".to_string()
+            }
+        );
+        assert_eq!(
+            browser_action_from_input(&json!({
+                "action": {"action": "type", "args": {"selector": "#email", "text": "a@example.com"}}
+            }))
+            .unwrap()
+            .unwrap(),
+            BrowserAction::Type {
+                selector: "#email".to_string(),
+                text: "a@example.com".to_string()
+            }
+        );
+        assert_eq!(
+            browser_action_from_input(&json!({"action": {"type": "wait", "ms": 50}}))
+                .unwrap()
+                .unwrap(),
+            BrowserAction::Wait { millis: 50 }
         );
     }
 

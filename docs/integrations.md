@@ -150,13 +150,15 @@ Implemented behavior:
 - `allowedOrigins` blocks navigation outside the declared origins
 - `session: {scope: "run", cleanup: "always"}` is accepted as the target provider policy
 - mock browser sessions are cleaned up on success, failure, and timeout
-- non-empty `secrets` are rejected by `mock_cdp`; real providers must validate and scope credentials explicitly
+- `provider: "playwright"` reuses the pinned upstream `beater-browser` / `beater-browser-playwright` crates, launches Chromium through the upstream Node runner, and closes the session after each tool call
+- the Playwright input path supports `input.url` plus one optional driver action such as `click`, `type`, `extract`, `wait`, `scroll`, `select`, or `goto`
+- non-empty `secrets` are rejected by `mock_cdp` and `playwright`; credential scoping remains production work
 - a mocked agent-loop test proves an agent can complete a browser task through a tool declaration
 - destructive actions require non-idempotent handling or explicit review semantics
 
 Production Playwright/CDP release criteria:
 
-- real browser sessions are attached to run IDs
+- real browser sessions are attached to run IDs rather than one tool call
 - session cleanup survives process interruption and resume
 - credentials are scoped to the provider/session
 - browser e2e tests prove an agent can complete a real browser task
