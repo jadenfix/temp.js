@@ -55,7 +55,7 @@ cleanup() {
     docker rm -f "$CID" >/dev/null 2>&1 || true
   fi
   if [ "$status" -eq 0 ] && [ "${BEATER_DOCKER_KEEP:-0}" != "1" ]; then
-    rm -rf "$WORKDIR/target"
+    rm -rf "$WORKDIR/target" >/dev/null 2>&1 || true
     if [ "$CLEAN_IMAGE" = "1" ]; then
       docker image rm "$IMAGE" >/dev/null 2>&1 || true
     fi
@@ -141,6 +141,8 @@ docker run --rm \
   --mount "type=bind,src=$ROOT,dst=/src,readonly" \
   --mount "type=bind,src=$WORKDIR/target,dst=/target" \
   --mount "type=bind,src=$WORKDIR/out,dst=/out" \
+  -e "HOST_UID=$(id -u)" \
+  -e "HOST_GID=$(id -g)" \
   -w /src \
   "$RUST_IMAGE" \
   bash -lc 'set -euo pipefail
@@ -151,6 +153,7 @@ docker run --rm \
     rm -rf /out/bundle
     /target/release/beater build /src/examples/hello --out /out/bundle --force
     file /out/bundle/bin/beater
+    chown -R "$HOST_UID:$HOST_GID" /target /out
   ' 2>&1 | tee "$WORKDIR/logs/linux-bundle-build.log"
 
 echo "building runtime image $IMAGE"
