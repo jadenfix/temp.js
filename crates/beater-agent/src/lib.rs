@@ -1,4 +1,4 @@
-//! Durable agent runtime: tool registry, Anthropic tool loop,
+//! Durable agent runtime: tool registry, provider-adapted LLM tool loop,
 //! step-lifecycle journal (SQLite).
 //!
 //! The loop lives in Rust — not in the JS isolate — so it survives hot
@@ -7,6 +7,7 @@
 mod anthropic;
 mod cpp_bridge;
 mod journal;
+mod llm;
 mod registry;
 mod runner;
 mod trace_export;

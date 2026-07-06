@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::anthropic::Anthropic;
 use crate::journal::Journal;
+use crate::llm::{LlmClient, LlmSelection};
 use crate::registry::{
     AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry,
     browser_session_dir, cleanup_stale_browser_sessions,
@@ -21,9 +21,10 @@ const LIVE_RUN_RESUME_GRACE: Duration = Duration::from_secs(30);
 
 struct Ctx {
     journal: Journal,
-    client: Anthropic,
+    client: LlmClient,
     registry: ToolRegistry,
     config: AgentConfig,
+    model: String,
     run_id: String,
 }
 
@@ -77,7 +78,8 @@ pub fn run(
         "agent.ts declares name {:?} but directory is {agent_name:?}",
         config.name
     );
-    let client = Anthropic::from_env()?;
+    let llm = LlmSelection::from_config(&config);
+    let client = LlmClient::from_provider(&llm.provider)?;
     let journal = Journal::open(app_dir)?;
     let run_id = uuid::Uuid::new_v4().to_string();
     journal.create_run(&run_id, agent_name, prompt)?;
@@ -88,6 +90,7 @@ pub fn run(
         client,
         registry,
         config,
+        model: llm.model,
         run_id,
     };
     let messages = vec![json!({"role": "user", "content": prompt})];
@@ -120,12 +123,14 @@ pub fn resume(
     let config_value = load_config(&run.agent)?;
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     let steps = journal.steps(run_id)?;
+    let llm = LlmSelection::from_config(&config);
 
     let ctx = Ctx {
         journal,
-        client: Anthropic::from_env()?,
+        client: LlmClient::from_provider(&llm.provider)?,
         registry,
         config,
+        model: llm.model,
         run_id: run_id.to_string(),
     };
     let result = runtime()?.block_on(resume_async(&ctx, run, steps));
@@ -325,7 +330,7 @@ pub fn list_runs(app_dir: &Path) -> Result<()> {
 async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i64) -> Result<()> {
     for _ in 0..MAX_LOOP_STEPS {
         let body = json!({
-            "model": ctx.config.model,
+            "model": ctx.model,
             "max_tokens": MAX_TOKENS,
             "system": ctx.config.system,
             "thinking": {"type": "adaptive"},
@@ -368,10 +373,12 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
         match response["stop_reason"].as_str().unwrap_or_default() {
             "tool_use" => {
                 let mut tool_results = Vec::new();
+                let mut saw_tool_use = false;
                 for block in content.as_array().into_iter().flatten() {
                     if block["type"] != "tool_use" {
                         continue;
                     }
+                    saw_tool_use = true;
                     let id = block["id"].as_str().unwrap_or_default();
                     let name = block["name"].as_str().unwrap_or_default();
                     println!("→ tool {name} {}", block["input"]);
@@ -397,6 +404,11 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                             }));
                         }
                     }
+                }
+                if !saw_tool_use {
+                    ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+                    close_browser_sessions_best_effort(ctx).await;
+                    bail!("model returned stop_reason \"tool_use\" with no tool_use blocks");
                 }
                 messages.push(json!({"role": "user", "content": tool_results}));
             }
@@ -618,6 +630,7 @@ def run(input):
             unsafe {
                 std::env::set_var("ANTHROPIC_API_KEY", "test-key");
                 std::env::set_var("ANTHROPIC_BASE_URL", base_url);
+                std::env::set_var("BEATER_ANTHROPIC_ALLOW_INSECURE_LOOPBACK", "1");
             }
             Self
         }
@@ -628,6 +641,7 @@ def run(input):
             unsafe {
                 std::env::remove_var("ANTHROPIC_API_KEY");
                 std::env::remove_var("ANTHROPIC_BASE_URL");
+                std::env::remove_var("BEATER_ANTHROPIC_ALLOW_INSECURE_LOOPBACK");
                 std::env::remove_var("BEATER_TRACE_EXPORT_URL");
                 std::env::remove_var("BEATER_TENANT_ID");
                 std::env::remove_var("BEATER_PROJECT_ID");

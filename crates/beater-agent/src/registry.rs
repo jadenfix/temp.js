@@ -70,12 +70,18 @@ impl BeatboxConfig {
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
     pub name: String,
+    #[serde(default = "default_provider")]
+    pub provider: String,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default)]
     pub system: String,
     #[serde(default)]
     pub tools: Vec<ToolDecl>,
+}
+
+fn default_provider() -> String {
+    "anthropic".to_string()
 }
 
 fn default_model() -> String {
