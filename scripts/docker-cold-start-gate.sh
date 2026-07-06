@@ -123,7 +123,7 @@ if [ "$available" -lt "$MIN_FREE_KIB" ]; then
   exit 1
 fi
 
-mkdir -p "$WORKDIR/target" "$WORKDIR/bundle" "$WORKDIR/logs"
+mkdir -p "$WORKDIR/target" "$WORKDIR/out" "$WORKDIR/logs"
 
 if ! docker image inspect "$RUST_IMAGE" >/dev/null 2>"$WORKDIR/logs/rust-image-inspect.err"; then
   if grep -qi "No such image" "$WORKDIR/logs/rust-image-inspect.err"; then
@@ -140,7 +140,7 @@ echo "building Linux beater bundle in $RUST_IMAGE"
 docker run --rm \
   --mount "type=bind,src=$ROOT,dst=/src,readonly" \
   --mount "type=bind,src=$WORKDIR/target,dst=/target" \
-  --mount "type=bind,src=$WORKDIR/bundle,dst=/bundle" \
+  --mount "type=bind,src=$WORKDIR/out,dst=/out" \
   -w /src \
   "$RUST_IMAGE" \
   bash -lc 'set -euo pipefail
@@ -148,12 +148,13 @@ docker run --rm \
     apt-get update
     apt-get install -y --no-install-recommends ca-certificates file pkg-config python3-dev
     PYO3_PYTHON=/usr/bin/python3 CARGO_TARGET_DIR=/target cargo build --locked --release -p beater-cli
-    /target/release/beater build /src/examples/hello --out /bundle --force
-    file /bundle/bin/beater
+    rm -rf /out/bundle
+    /target/release/beater build /src/examples/hello --out /out/bundle --force
+    file /out/bundle/bin/beater
   ' 2>&1 | tee "$WORKDIR/logs/linux-bundle-build.log"
 
 echo "building runtime image $IMAGE"
-docker build -t "$IMAGE" "$WORKDIR/bundle" 2>&1 | tee "$WORKDIR/logs/docker-build.log"
+docker build -t "$IMAGE" "$WORKDIR/out/bundle" 2>&1 | tee "$WORKDIR/logs/docker-build.log"
 
 PORT=$(free_port)
 start=$(now_ms)
