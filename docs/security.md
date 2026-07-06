@@ -31,11 +31,11 @@ Do not put MCP bearer tokens in `beater.toml`. Keep them in the process environm
 
 Python tools are first-party code and run with the same OS privileges as the beater process. They can read files, open sockets, import packages from the configured venv, and mutate external systems.
 
-Do not run untrusted Python tools. The planned Wasmtime tier is the sandbox path for untrusted or agent-generated code.
+Do not run untrusted Python tools. Use `wasmtimeTool` for the current untrusted-code path: it runs hermetic scalar wasm with an empty linker, denied host imports, no filesystem mounts, no network, no environment variables, no secrets, and fuel/memory/wall-clock limits.
 
 ## Journal Data
 
-The journal is plaintext SQLite under `<app>/.beater/journal.db`. It stores prompts, model responses, tool inputs, tool outputs, run status, and step attempts.
+The journal is plaintext SQLite under `<app>/.beater/journal.db`. It stores prompts, model responses, LLM stream partials, tool inputs, tool outputs, run status, and step attempts.
 
 Operational implications:
 
@@ -44,10 +44,14 @@ Operational implications:
 - redact secrets before passing them to agents or tools
 - add redaction hooks before production deployments that handle private data
 
+The optional Beater trace exporter reads from the same journal data and posts prompts, tool inputs, model responses, and tool outputs to the configured Beater ingest endpoint. Treat `BEATER_TRACE_EXPORT_URL` as a sensitive deployment decision, set `BEATER_API_KEY` through the environment or secret manager when required, and do not enable export for private data until redaction policy is in place.
+
 ## Remote Integrations
 
 Networked tools have explicit timeouts, retry policy, idempotency keys, secret handling, and egress allowlists. Remote MCP tools read bearer tokens from environment variables, require HTTPS for bearer auth except loopback test servers, fail before connecting when a required secret is missing, and never follow redirects. Transient failures retry only when the tool is idempotent or a configured `tool_use_id` idempotency key is available; ambiguous non-idempotent failures park the run as `needs_review`. SaaS API integrations and browser automation sessions should follow the same registry path so calls are journaled before side effects happen.
 
+`GET /_beater/agent/runs`, `GET /_beater/agent/runs/<run_id>`, and `GET /_beater/agent/runs/<run_id>/events` expose journaled run history and LLM partials for browser run UIs. They contain the same sensitive content as the journal and reuse the MCP origin and bearer-token policy.
+
 ## Agentic Browsing
 
-Browser automation is powerful enough to read authenticated pages and perform destructive actions. The current `mock_cdp` provider is only a deterministic contract and lifecycle test provider. Production Playwright/CDP providers must include real session cleanup across crashes, scoped credentials, and browser e2e tests before they are considered production-ready.
+Browser automation is powerful enough to read authenticated pages and perform destructive actions. The `mock_cdp` provider is only a deterministic contract and lifecycle test provider. The `playwright` provider launches a real Chromium session through the upstream Beater browser driver, reuses it within the same run, writes app-scoped runner markers for resume cleanup, and can resolve env-backed `textSecret` values for `type` actions while redacting result payloads. Richer credential modes such as cookies or extra HTTP headers must stay scoped to the provider/session when added.

@@ -2,16 +2,22 @@
 //! reloads and every LLM/tool step is journaled before it executes.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::anthropic::Anthropic;
 use crate::journal::Journal;
-use crate::registry::{AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry};
+use crate::registry::{
+    AgentConfig, BeatboxConfig, ToolCallContext, ToolNeedsReview, ToolRegistry,
+    browser_session_dir, cleanup_stale_browser_sessions,
+};
+use crate::trace_export;
 
 const MAX_TOKENS: u64 = 16000;
 const MAX_LOOP_STEPS: usize = 50;
+const LIVE_RUN_RESUME_GRACE: Duration = Duration::from_secs(30);
 
 struct Ctx {
     journal: Journal,
@@ -48,7 +54,12 @@ fn setup(
     let config: AgentConfig = serde_json::from_value(config_value)
         .context("agent.ts default export did not match defineAgent shape")?;
     let agent_dir = app_dir.join("agents").join(&config.name);
-    let registry = ToolRegistry::build_with_beatbox(&agent_dir, &config.tools, beatbox)?;
+    let registry = ToolRegistry::build_with_beatbox_and_browser_session_dir(
+        &agent_dir,
+        &config.tools,
+        beatbox,
+        Some(browser_session_dir(app_dir)),
+    )?;
     Ok((config, registry))
 }
 
@@ -80,7 +91,9 @@ pub fn run(
         run_id,
     };
     let messages = vec![json!({"role": "user", "content": prompt})];
-    runtime()?.block_on(agent_loop(&ctx, messages))
+    let result = runtime()?.block_on(agent_loop(&ctx, messages, 1));
+    export_run_trace_best_effort(app_dir, &ctx.run_id);
+    result
 }
 
 pub fn resume(
@@ -96,6 +109,14 @@ pub fn resume(
         println!("run {run_id} already completed");
         return Ok(());
     }
+    if run.status == "running" && run.updated_at + LIVE_RUN_RESUME_GRACE.as_secs() as i64 > now() {
+        bail!(
+            "run {run_id} still appears active; wait at least {}s after its last journal update before resuming",
+            LIVE_RUN_RESUME_GRACE.as_secs()
+        );
+    }
+    cleanup_stale_browser_sessions(app_dir, run_id)
+        .with_context(|| format!("cleaning stale browser sessions for run {run_id}"))?;
     let config_value = load_config(&run.agent)?;
     let (config, registry) = setup(app_dir, config_value, venv.as_ref(), &beatbox)?;
     let steps = journal.steps(run_id)?;
@@ -107,7 +128,19 @@ pub fn resume(
         config,
         run_id: run_id.to_string(),
     };
-    runtime()?.block_on(resume_async(&ctx, run, steps))
+    let result = runtime()?.block_on(resume_async(&ctx, run, steps));
+    export_run_trace_best_effort(app_dir, &ctx.run_id);
+    result
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn export_run_trace_best_effort(app_dir: &Path, run_id: &str) {
+    if let Err(error) = trace_export::export_run_if_configured(app_dir, run_id) {
+        tracing::warn!("trace export for run {run_id} failed: {error:#}");
+    }
 }
 
 async fn resume_async(
@@ -119,14 +152,16 @@ async fn resume_async(
     // Rebuild conversation state from the journal. The last llm_call's request
     // body carries the exact messages[] at that point — no delta replay needed.
     let last_llm = steps.iter().rev().find(|s| s.kind == "llm_call");
+    let mut next_llm_attempt = 1;
     let messages = match last_llm {
         None => vec![json!({"role": "user", "content": run.input})],
         Some(step) if step.status != "completed" => {
             // Dangling LLM call: we own the request and it had no observable
             // side effect on our state — always safe to re-issue.
+            next_llm_attempt = step.attempt + 1;
             println!(
                 "resuming: re-issuing interrupted LLM call (attempt {})",
-                step.attempt + 1
+                next_llm_attempt
             );
             step.request["messages"]
                 .as_array()
@@ -147,6 +182,7 @@ async fn resume_async(
                 // The last response needed no tools; the run actually finished.
                 ctx.journal.set_run_status(run_id, "completed")?;
                 println!("run {run_id} was already finished — marked completed");
+                close_browser_sessions_best_effort(ctx).await;
                 return Ok(());
             }
             if stop_reason == "pause_turn" {
@@ -155,6 +191,7 @@ async fn resume_async(
                 messages
             } else if stop_reason != "tool_use" {
                 ctx.journal.set_run_status(run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 if stop_reason == "refusal" {
                     bail!(
                         "run {run_id} failed before resume: model refused: {}",
@@ -177,6 +214,7 @@ async fn resume_async(
                     .unwrap_or_default();
                 if tool_uses.is_empty() {
                     ctx.journal.set_run_status(run_id, "failed")?;
+                    close_browser_sessions_best_effort(ctx).await;
                     bail!(
                         "run {run_id} failed before resume: stop_reason \"tool_use\" had no tool_use blocks"
                     );
@@ -214,6 +252,7 @@ async fn resume_async(
                                     "run {run_id} needs review: tool {name} ({id}) may have executed \
                                      before the crash and is not declared idempotent — not re-running"
                                 );
+                                close_browser_sessions_best_effort(ctx).await;
                                 return Ok(());
                             }
                             let prior_attempts = steps
@@ -235,6 +274,7 @@ async fn resume_async(
                                 Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
                                     println!("← needs review: {e:#}");
                                     ctx.journal.set_run_status(run_id, "needs_review")?;
+                                    close_browser_sessions_best_effort(ctx).await;
                                     return Ok(());
                                 }
                                 Err(e) => {
@@ -258,7 +298,7 @@ async fn resume_async(
     };
 
     ctx.journal.set_run_status(run_id, "running")?;
-    agent_loop(ctx, messages).await
+    agent_loop(ctx, messages, next_llm_attempt).await
 }
 
 pub fn list_runs(app_dir: &Path) -> Result<()> {
@@ -282,7 +322,7 @@ pub fn list_runs(app_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>) -> Result<()> {
+async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i64) -> Result<()> {
     for _ in 0..MAX_LOOP_STEPS {
         let body = json!({
             "model": ctx.config.model,
@@ -293,14 +333,25 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>) -> Result<()> {
             "messages": messages,
         });
 
-        let seq = ctx
-            .journal
-            .start_step(&ctx.run_id, "llm_call", &body, None, None, 1)?;
-        let response = match ctx.client.create_message(&body).await {
+        let seq =
+            ctx.journal
+                .start_step(&ctx.run_id, "llm_call", &body, None, None, next_llm_attempt)?;
+        next_llm_attempt = 1;
+        let response = match ctx
+            .client
+            .create_message_streaming(&body, |partial| {
+                let kind = partial["event"].as_str().unwrap_or("stream_event");
+                ctx.journal
+                    .append_step_partial(&ctx.run_id, seq, kind, partial)?;
+                Ok(())
+            })
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 ctx.journal.fail_step(&ctx.run_id, seq, &format!("{e:#}"))?;
                 ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 return Err(e);
             }
         };
@@ -335,6 +386,7 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>) -> Result<()> {
                         Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
                             println!("← needs review: {e:#}");
                             ctx.journal.set_run_status(&ctx.run_id, "needs_review")?;
+                            close_browser_sessions_best_effort(ctx).await;
                             return Ok(());
                         }
                         Err(e) => {
@@ -350,22 +402,35 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>) -> Result<()> {
             }
             "end_turn" => {
                 ctx.journal.set_run_status(&ctx.run_id, "completed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 return Ok(());
             }
             // server-side pause: assistant turn is already appended; re-send as-is
             "pause_turn" => continue,
             "refusal" => {
                 ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 bail!("model refused: {}", response["stop_details"]);
             }
             other => {
                 ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 bail!("unexpected stop_reason {other:?} — raise max_tokens or inspect the journal");
             }
         }
     }
     ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+    close_browser_sessions_best_effort(ctx).await;
     bail!("agent exceeded {MAX_LOOP_STEPS} loop steps")
+}
+
+async fn close_browser_sessions_best_effort(ctx: &Ctx) {
+    if let Err(error) = ctx.registry.close_browser_sessions(&ctx.run_id).await {
+        tracing::warn!(
+            "browser session cleanup for run {} failed: {error:#}",
+            ctx.run_id
+        );
+    }
 }
 
 /// Journal-wrapped tool execution: started row committed before the tool runs.
@@ -398,6 +463,7 @@ pub fn start_journaled_tool_call(
     Ok(JournaledToolCall {
         seq,
         context: ToolCallContext {
+            run_id: Some(run_id.to_string()),
             tool_use_id: Some(tool_use_id.to_string()),
             idempotency_key,
         },
@@ -461,9 +527,10 @@ fn tool_idempotency_key(run_id: &str, tool_use_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resume, run, tool_idempotency_key};
+    use super::{LIVE_RUN_RESUME_GRACE, resume, run, tool_idempotency_key};
     use crate::journal::Journal;
     use crate::registry::BeatboxConfig;
+    use rusqlite::params;
     use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::fs;
@@ -472,6 +539,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -560,6 +628,11 @@ def run(input):
             unsafe {
                 std::env::remove_var("ANTHROPIC_API_KEY");
                 std::env::remove_var("ANTHROPIC_BASE_URL");
+                std::env::remove_var("BEATER_TRACE_EXPORT_URL");
+                std::env::remove_var("BEATER_TENANT_ID");
+                std::env::remove_var("BEATER_PROJECT_ID");
+                std::env::remove_var("BEATER_ENVIRONMENT_ID");
+                std::env::remove_var("BEATER_API_KEY");
             }
         }
     }
@@ -573,6 +646,7 @@ def run(input):
     #[derive(Debug)]
     struct CapturedRequest {
         request_line: String,
+        headers: String,
         body: String,
     }
 
@@ -631,7 +705,7 @@ def run(input):
             let server_requests = Arc::clone(&requests);
             let mut responses: VecDeque<String> = responses
                 .into_iter()
-                .map(|value| value.to_string())
+                .map(anthropic_stream_response)
                 .collect();
             let handle = thread::spawn(move || {
                 while let Some(response) = responses.pop_front() {
@@ -639,8 +713,7 @@ def run(input):
                     let body = read_http_body(&mut stream);
                     server_requests.lock().unwrap().push(body);
                     let reply = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        response.len(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
                         response
                     );
                     stream.write_all(reply.as_bytes()).unwrap();
@@ -662,6 +735,172 @@ def run(input):
                 .into_inner()
                 .unwrap()
         }
+    }
+
+    struct MockTraceIngest {
+        base_url: String,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockTraceIngest {
+        fn new(expected_requests: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = Arc::clone(&requests);
+            let handle = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while server_requests.lock().unwrap().len() < expected_requests {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let request = read_http_request(&mut stream);
+                            server_requests.lock().unwrap().push(request);
+                            let response = json!({
+                                "ack": {
+                                    "accepted_raw": 1,
+                                    "accepted_spans": 1,
+                                    "duplicate_raw": 0,
+                                    "duplicate_spans": 0,
+                                },
+                                "downstream_queued": false,
+                            })
+                            .to_string();
+                            let reply = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                response.len(),
+                                response
+                            );
+                            stream.write_all(reply.as_bytes()).unwrap();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("mock trace ingest accept failed: {error}"),
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://{addr}"),
+                requests,
+                handle: Some(handle),
+            }
+        }
+
+        fn join(mut self) -> Vec<CapturedRequest> {
+            if let Some(handle) = self.handle.take() {
+                handle.join().unwrap();
+            }
+            Arc::try_unwrap(self.requests)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+        }
+    }
+
+    fn anthropic_stream_response(response: Value) -> String {
+        let content = response["content"].as_array().cloned().unwrap_or_default();
+        let mut out = String::new();
+        out.push_str(&sse(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": response["id"].as_str().unwrap_or("msg_mock"),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": response["model"].as_str().unwrap_or("mock"),
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 0}
+                }
+            }),
+        ));
+        for (index, block) in content.iter().enumerate() {
+            let index = index as u64;
+            let mut start_block = block.clone();
+            match block["type"].as_str().unwrap_or_default() {
+                "text" => {
+                    let text = block["text"].as_str().unwrap_or_default();
+                    start_block["text"] = Value::String(String::new());
+                    out.push_str(&sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": start_block,
+                        }),
+                    ));
+                    out.push_str(&sse(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "text_delta", "text": text},
+                        }),
+                    ));
+                }
+                "tool_use" => {
+                    let input = block["input"].clone();
+                    start_block["input"] = json!({});
+                    out.push_str(&sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": start_block,
+                        }),
+                    ));
+                    out.push_str(&sse(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": input.to_string(),
+                            },
+                        }),
+                    ));
+                }
+                _ => {
+                    out.push_str(&sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": start_block,
+                        }),
+                    ));
+                }
+            }
+            out.push_str(&sse(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            ));
+        }
+        out.push_str(&sse(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": response["stop_reason"].as_str().unwrap_or("end_turn"),
+                    "stop_sequence": response.get("stop_sequence").cloned().unwrap_or(Value::Null),
+                },
+                "usage": {"output_tokens": 1},
+            }),
+        ));
+        out.push_str(&sse("message_stop", json!({"type": "message_stop"})));
+        out
+    }
+
+    fn sse(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
     }
 
     fn read_http_body(stream: &mut std::net::TcpStream) -> String {
@@ -691,24 +930,20 @@ def run(input):
             if let Some(end) = headers_end
                 && content_len.is_none()
             {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
                 return CapturedRequest {
-                    request_line: String::from_utf8_lossy(&bytes[..end])
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
+                    request_line: headers.lines().next().unwrap_or_default().to_string(),
+                    headers,
                     body: String::new(),
                 };
             }
             if let (Some(end), Some(len)) = (headers_end, content_len) {
                 let body_start = end + 4;
                 if bytes.len() >= body_start + len {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
                     return CapturedRequest {
-                        request_line: String::from_utf8_lossy(&bytes[..end])
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
-                            .to_string(),
+                        request_line: headers.lines().next().unwrap_or_default().to_string(),
+                        headers,
                         body: String::from_utf8(bytes[body_start..body_start + len].to_vec())
                             .unwrap(),
                     };
@@ -812,6 +1047,30 @@ def run(input):
                 1,
             )
             .unwrap();
+        mark_run_stale(app, "run-1");
+    }
+
+    fn seed_interrupted_llm_run(app: &TempApp) {
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "continue interrupted llm")
+            .unwrap();
+        journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": "continue interrupted llm",
+                    }],
+                }),
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+        mark_run_stale(app, "run-1");
     }
 
     fn seed_completed_llm_run(app: &TempApp, status: &str, response: Value) {
@@ -836,6 +1095,20 @@ def run(input):
             .unwrap();
         journal.complete_step("run-1", llm, &response).unwrap();
         journal.set_run_status("run-1", status).unwrap();
+        if status == "running" {
+            mark_run_stale(app, "run-1");
+        }
+    }
+
+    fn mark_run_stale(app: &TempApp, run_id: &str) {
+        let stale_updated_at =
+            chrono::Utc::now().timestamp() - LIVE_RUN_RESUME_GRACE.as_secs() as i64 - 1;
+        let conn = rusqlite::Connection::open(app.path().join(".beater/journal.db")).unwrap();
+        conn.execute(
+            "UPDATE runs SET updated_at = ?2 WHERE id = ?1",
+            params![run_id, stale_updated_at],
+        )
+        .unwrap();
     }
 
     fn execution_result_json(value: i64) -> Value {
@@ -1076,14 +1349,114 @@ def run(input):
         let journal = Journal::open(app.path()).unwrap();
         let (run, _) = journal.list_runs().unwrap().pop().unwrap();
         assert_eq!(run.status, "completed");
-        let tool_step = journal
-            .steps(&run.id)
-            .unwrap()
+        let steps = journal.steps(&run.id).unwrap();
+        let llm_steps: Vec<_> = steps
+            .iter()
+            .filter(|step| step.kind == "llm_call")
+            .collect();
+        assert_eq!(llm_steps.len(), 2);
+        let first_partials = journal.step_partials(&run.id, llm_steps[0].seq).unwrap();
+        assert!(
+            first_partials.iter().any(|partial| {
+                partial.kind == "content_block_delta"
+                    && partial.payload["data"]["delta"]["type"] == "input_json_delta"
+            }),
+            "{first_partials:?}"
+        );
+        let final_partials = journal.step_partials(&run.id, llm_steps[1].seq).unwrap();
+        assert!(
+            final_partials.iter().any(|partial| {
+                partial.kind == "content_block_delta"
+                    && partial.payload["data"]["delta"]["text"] == "checkout verified"
+            }),
+            "{final_partials:?}"
+        );
+        let tool_step = steps
             .into_iter()
             .find(|step| step.kind == "tool_call")
             .expect("browser tool call step");
         assert_eq!(tool_step.status, "completed");
         assert_eq!(tool_step.tool_use_id.as_deref(), Some("toolu_browser"));
+    }
+
+    #[test]
+    fn run_exports_beater_native_trace_when_configured() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("trace-export");
+        let anthropic = MockAnthropic::new(vec![
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_browser",
+                    "name": "browser.checkout",
+                    "input": {
+                        "url": "https://shop.example/cart",
+                        "task": "verify checkout"
+                    },
+                }],
+                "stop_reason": "tool_use",
+            }),
+            json!({
+                "content": [{"type": "text", "text": "checkout verified"}],
+                "stop_reason": "end_turn",
+            }),
+        ]);
+        let trace_ingest = MockTraceIngest::new(4);
+        let _env = EnvGuard::set(&anthropic.base_url);
+        unsafe {
+            std::env::set_var("BEATER_TRACE_EXPORT_URL", &trace_ingest.base_url);
+            std::env::set_var("BEATER_TENANT_ID", "tenant");
+            std::env::set_var("BEATER_PROJECT_ID", "project");
+            std::env::set_var("BEATER_ENVIRONMENT_ID", "prod");
+            std::env::set_var("BEATER_API_KEY", "trace-key");
+        }
+
+        run(
+            app.path(),
+            "support",
+            browser_config(),
+            None,
+            BeatboxConfig::default(),
+            "verify checkout",
+        )
+        .unwrap();
+        let _anthropic_requests = anthropic.join();
+        let trace_requests = trace_ingest.join();
+
+        assert_eq!(trace_requests.len(), 4);
+        assert!(
+            trace_requests
+                .iter()
+                .all(|request| request.request_line == "POST /v1/traces/native HTTP/1.1")
+        );
+        assert!(
+            trace_requests[0]
+                .headers
+                .to_ascii_lowercase()
+                .contains("x-beater-api-key: trace-key")
+        );
+        let spans: Vec<Value> = trace_requests
+            .iter()
+            .map(|request| serde_json::from_str(&request.body).unwrap())
+            .collect();
+        assert!(spans.iter().any(|span| span["kind"] == "agent.run"));
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span["kind"] == "llm.call")
+                .count(),
+            2
+        );
+        let tool = spans
+            .iter()
+            .find(|span| span["kind"] == "tool.call")
+            .expect("tool span");
+        assert_eq!(tool["scope"]["tenant_id"], "tenant");
+        assert_eq!(tool["scope"]["project_id"], "project");
+        assert_eq!(tool["scope"]["environment_id"], "prod");
+        assert_eq!(tool["parent_span_id"], "run");
+        assert_eq!(tool["attributes"]["beater.tool_name"], "browser.checkout");
+        assert_eq!(tool["attributes"]["beater.tool_use_id"], "toolu_browser");
     }
 
     #[test]
@@ -1109,6 +1482,45 @@ def run(input):
         assert_eq!(tool_steps.len(), 1);
         assert_eq!(tool_steps[0].status, "started");
         assert_eq!(tool_steps[0].attempt, 1);
+    }
+
+    #[test]
+    fn resume_cleans_stale_browser_session_before_review() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("browser-stale-session");
+        seed_interrupted_tool_run_for(
+            &app,
+            "browser.checkout",
+            json!({"url": "https://shop.example/cart", "task": "verify checkout"}),
+        );
+        let session_dir = app.path().join(".beater/browser-sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let wrapper_path = session_dir.join("run-1-wrapper.cjs");
+        let marker_path = session_dir.join("run-1-marker.json");
+        fs::write(&wrapper_path, "setTimeout(() => {}, 30000);\n").unwrap();
+        fs::write(
+            &marker_path,
+            json!({
+                "session_id": "run-1",
+                "wrapper_script": wrapper_path.clone(),
+                "runner_script": "/dev/null",
+                "owner_pid": 1,
+                "created_at": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _env = EnvGuard::set("http://127.0.0.1:9");
+
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(browser_config())
+        })
+        .unwrap();
+
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "needs_review");
+        assert!(!marker_path.exists());
+        assert!(!wrapper_path.exists());
     }
 
     #[test]
@@ -1167,6 +1579,56 @@ def run(input):
         let steps = journal.steps("run-1").unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].kind, "llm_call");
+    }
+
+    #[test]
+    fn resume_reissues_interrupted_llm_with_incremented_attempt() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("interrupted-llm-attempt");
+        seed_interrupted_llm_run(&app);
+        let server = MockAnthropic::new(vec![json!({
+            "content": [{"type": "text", "text": "continued"}],
+            "stop_reason": "end_turn",
+        })]);
+        let _env = EnvGuard::set(&server.base_url);
+
+        resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            Ok(config(true))
+        })
+        .unwrap();
+        let requests = server.join();
+
+        assert_eq!(requests.len(), 1);
+        let journal = Journal::open(app.path()).unwrap();
+        assert_eq!(journal.run("run-1").unwrap().status, "completed");
+        let llm_attempts: Vec<_> = journal
+            .steps("run-1")
+            .unwrap()
+            .into_iter()
+            .filter(|step| step.kind == "llm_call")
+            .map(|step| (step.status, step.attempt))
+            .collect();
+        assert_eq!(
+            llm_attempts,
+            vec![("started".to_string(), 2), ("completed".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn resume_refuses_recently_updated_running_run() {
+        let app = TempApp::new("fresh-running-run");
+        let journal = Journal::open(app.path()).unwrap();
+        journal
+            .create_run("run-1", "support", "still active")
+            .unwrap();
+
+        let err = resume(app.path(), "run-1", None, BeatboxConfig::default(), |_| {
+            panic!("fresh running guard should reject before loading config")
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("still appears active"));
+        assert_eq!(journal.run("run-1").unwrap().status, "running");
     }
 
     #[test]

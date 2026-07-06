@@ -125,6 +125,7 @@ export default defineAgent({
       auth: {type: "bearer", env: "CRM_MCP_TOKEN"},
       timeoutMs: 5000,
       retry: {attempts: 2, backoffMs: 25, idempotencyKey: "tool_use_id"},
+      session: {scope: "run", cleanup: "always"},
       egress: ["127.0.0.1:9000"],
       idempotent: false,
     }),
@@ -152,6 +153,50 @@ export default defineAgent({
                 "auth": {"type": "bearer", "env": "CRM_MCP_TOKEN"},
                 "timeoutMs": 5000,
                 "retry": {"attempts": 2, "backoffMs": 25, "idempotencyKey": "tool_use_id"},
+                "session": {"scope": "run", "cleanup": "always"},
+                "egress": ["127.0.0.1:9000"]
+            })
+        );
+    }
+
+    #[test]
+    fn remote_mcp_provider_serializes_discovery_contract() {
+        let app = TempApp::new("remote-mcp-provider");
+        fs::write(
+            app.path().join("agents/operator/agent.ts"),
+            r#"
+import { defineAgent, remoteMcpProvider } from "beater:agent";
+
+export default defineAgent({
+  name: "operator",
+  tools: [
+    remoteMcpProvider("crm", {
+      endpoint: "http://127.0.0.1:9000/mcp",
+      auth: {type: "bearer", env: "CRM_MCP_TOKEN"},
+      timeoutMs: 5000,
+      retry: {attempts: 2, backoffMs: 25, idempotencyKey: "tool_use_id"},
+      session: {scope: "run", cleanup: "always"},
+      egress: ["127.0.0.1:9000"],
+      idempotent: true,
+    }),
+  ],
+});
+"#,
+        )
+        .unwrap();
+
+        let config = load_agent_config(app.path(), "operator").unwrap();
+        assert_eq!(
+            config["tools"][0],
+            json!({
+                "kind": "remote_mcp_provider",
+                "name": "crm",
+                "idempotent": true,
+                "endpoint": "http://127.0.0.1:9000/mcp",
+                "auth": {"type": "bearer", "env": "CRM_MCP_TOKEN"},
+                "timeoutMs": 5000,
+                "retry": {"attempts": 2, "backoffMs": 25, "idempotencyKey": "tool_use_id"},
+                "session": {"scope": "run", "cleanup": "always"},
                 "egress": ["127.0.0.1:9000"]
             })
         );
@@ -211,6 +256,63 @@ export default defineAgent({
                 "allowedOrigins": ["https://shop.example"],
                 "timeoutMs": 5000,
                 "secrets": {}
+            })
+        );
+    }
+
+    #[test]
+    fn wasmtime_tool_serializes_hermetic_contract() {
+        let app = TempApp::new("wasmtime-tool");
+        fs::write(
+            app.path().join("agents/operator/agent.ts"),
+            r#"
+import { defineAgent, wasmtimeTool } from "beater:agent";
+
+export default defineAgent({
+  name: "operator",
+  tools: [
+    wasmtimeTool("double_wasm", {
+      source: {
+        kind: "wasm_wat",
+        text: "(module (func (export \"run\") (param i64) (result i64) local.get 0))",
+      },
+      description: "Double an integer in a hermetic wasm sandbox.",
+      inputSchema: {
+        type: "object",
+        properties: {n: {type: "integer"}},
+        required: ["n"],
+      },
+      policy: {
+        limits: {wall_ms: 1000, memory_bytes: 1048576, fuel: 100000},
+      },
+      idempotent: true,
+    }),
+  ],
+});
+"#,
+        )
+        .unwrap();
+
+        let config = load_agent_config(app.path(), "operator").unwrap();
+        assert_eq!(
+            config["tools"][0],
+            json!({
+                "kind": "wasmtime",
+                "name": "double_wasm",
+                "idempotent": true,
+                "source": {
+                    "kind": "wasm_wat",
+                    "text": "(module (func (export \"run\") (param i64) (result i64) local.get 0))"
+                },
+                "description": "Double an integer in a hermetic wasm sandbox.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer"}},
+                    "required": ["n"]
+                },
+                "policy": {
+                    "limits": {"wall_ms": 1000, "memory_bytes": 1048576, "fuel": 100000}
+                }
             })
         );
     }

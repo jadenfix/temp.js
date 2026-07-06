@@ -79,6 +79,9 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         "{home}"
     );
     assert!(home.contains("data-beater-counter"), "{home}");
+    assert!(home.contains("data-beater-run-events"), "{home}");
+    assert!(home.contains("data-run-history"), "{home}");
+    assert!(home.contains("data-beater-action-form"), "{home}");
 
     let client =
         http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
@@ -91,7 +94,17 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         client.contains("root.dataset.state = \"hydrated\""),
         "{client}"
     );
+    assert!(client.contains("new EventSource"), "{client}");
+    assert!(client.contains("fetch(\"/_beater/agent/runs\""), "{client}");
     assert!(!client.contains(": number"), "{client}");
+
+    let runs = http_request(port, "GET", "/_beater/agent/runs", None).expect("GET run history");
+    assert!(runs.starts_with("HTTP/1.1 200"), "{runs}");
+    assert!(runs.contains("\"runs\":["), "{runs}");
+
+    let missing_run =
+        http_request(port, "GET", "/_beater/agent/runs/not-a-run", None).expect("GET missing run");
+    assert!(missing_run.starts_with("HTTP/1.1 404"), "{missing_run}");
 
     let missing = http_request(port, "GET", "/not-a-route", None).expect("GET /not-a-route");
     assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
@@ -130,8 +143,169 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
     assert!(tools_call.contains("\"isError\":false"), "{tools_call}");
     assert!(tools_call.contains("\\\"unix\\\""), "{tools_call}");
 
+    let route_action_form = http_request_with_headers(
+        port,
+        "POST",
+        "/api/actions/contact",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        Some("email=agent%40example.test&message=hello&confirm=true&idempotency_key=form-1"),
+    )
+    .expect("POST route action form");
+    assert!(
+        route_action_form.starts_with("HTTP/1.1 200"),
+        "{route_action_form}"
+    );
+    assert!(route_action_form.contains("\"action\":\"hello.contact\""));
+    assert!(route_action_form.contains("\"email\":\"agent@example.test\""));
+    assert!(route_action_form.contains("\"idempotency_key\":\"form-1\""));
+
+    let tools_list = http_request(
+        port,
+        "POST",
+        "/mcp",
+        Some(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#),
+    )
+    .expect("POST /mcp tools/list");
+    assert!(tools_list.starts_with("HTTP/1.1 200"), "{tools_list}");
+    assert!(
+        tools_list.contains("\"name\":\"hello.contact\""),
+        "{tools_list}"
+    );
+    assert!(
+        tools_list.contains("\"idempotencyRequired\":true"),
+        "{tools_list}"
+    );
+
+    let route_action_tool = http_request(
+        port,
+        "POST",
+        "/mcp",
+        Some(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"hello.contact","arguments":{"email":"agent@example.test","message":"hello from mcp","confirm":true}}}"#,
+        ),
+    )
+    .expect("POST /mcp route action tools/call");
+    assert!(
+        route_action_tool.starts_with("HTTP/1.1 200"),
+        "{route_action_tool}"
+    );
+    assert!(
+        route_action_tool.contains("\"isError\":false"),
+        "{route_action_tool}"
+    );
+    assert!(
+        route_action_tool.contains("\\\"action\\\":\\\"hello.contact\\\""),
+        "{route_action_tool}"
+    );
+
+    let openapi = http_request(port, "GET", "/openapi.json", None).expect("GET /openapi.json");
+    assert!(openapi.starts_with("HTTP/1.1 200"), "{openapi}");
+    assert!(openapi.contains("\"openapi\":\"3.1.0\""), "{openapi}");
+    assert!(
+        openapi.contains("\"operationId\":\"hello.contact\""),
+        "{openapi}"
+    );
+    assert!(openapi.contains("\"/api/actions/contact\""), "{openapi}");
+    assert!(
+        openapi.contains("\"idempotencyRequired\":true"),
+        "{openapi}"
+    );
+
+    let manifest =
+        http_request(port, "GET", "/.well-known/beater.json", None).expect("GET manifest");
+    assert!(manifest.starts_with("HTTP/1.1 200"), "{manifest}");
+    assert!(manifest.contains("\"openapi\""), "{manifest}");
+    assert!(
+        manifest.contains(&format!("\"http://127.0.0.1:{port}/openapi.json\"")),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("\"name\":\"hello.contact\""),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("\"path\":\"/api/actions/contact\""),
+        "{manifest}"
+    );
+
+    let llms = http_request(port, "GET", "/llms.txt", None).expect("GET /llms.txt");
+    assert!(llms.starts_with("HTTP/1.1 200"), "{llms}");
+    assert!(llms.contains("## Actions"), "{llms}");
+    assert!(llms.contains("hello.contact"), "{llms}");
+    assert!(llms.contains("/api/actions/contact"), "{llms}");
+
     let mcp_get = http_request(port, "GET", "/mcp", None).expect("GET /mcp");
     assert!(mcp_get.starts_with("HTTP/1.1 405"), "{mcp_get}");
+}
+
+#[test]
+fn dev_server_round_robins_js_routes_across_worker_pool() {
+    let port = free_port();
+    let workspace = workspace();
+    let beater = beater_bin(&workspace);
+    let temp = temp_dir("worker-pool");
+    let app = temp.path.join("pool-app");
+    let output = Command::new(&beater)
+        .arg("new")
+        .arg(&app)
+        .output()
+        .expect("run beater new");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_path = app.join("beater.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read beater.toml");
+    let config = config.replace("port = 3000\n", "port = 3000\nworkers = 2\n");
+    std::fs::write(&config_path, config).expect("write pooled beater.toml");
+    std::fs::write(
+        app.join("app/routes/api/pool.ts"),
+        r#"
+globalThis.__beaterPoolCount = globalThis.__beaterPoolCount ?? 0;
+
+export function GET() {
+  globalThis.__beaterPoolCount += 1;
+  return { status: 200, body: String(globalThis.__beaterPoolCount) };
+}
+"#,
+    )
+    .expect("write pool route");
+
+    let child = Command::new(&beater)
+        .arg("dev")
+        .arg(&app)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("BEATER_BASE_URL")
+        .env_remove("BEATER_MCP_TOKEN")
+        .env_remove("BEATER_MCP_TRUSTED_ORIGINS")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pooled beater dev");
+    let _child = ChildGuard { child };
+
+    let ready = wait_for_http(port, "GET", "/api/health", None);
+    assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+
+    let first = http_request(port, "GET", "/api/pool", None).expect("GET /api/pool #1");
+    let second = http_request(port, "GET", "/api/pool", None).expect("GET /api/pool #2");
+    let third = http_request(port, "GET", "/api/pool", None).expect("GET /api/pool #3");
+    let fourth = http_request(port, "GET", "/api/pool", None).expect("GET /api/pool #4");
+
+    for response in [&first, &second, &third, &fourth] {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+    assert_eq!(http_body(&first), "1");
+    assert_eq!(http_body(&second), "1");
+    assert_eq!(http_body(&third), "2");
+    assert_eq!(http_body(&fourth), "2");
 }
 
 #[test]
@@ -319,6 +493,7 @@ fn new_scaffolds_runnable_app_and_refuses_overwrite() {
         "app/routes/index.server.tsx",
         "app/routes/api/health.ts",
         "app/routes/api/boom.ts",
+        "app/routes/api/actions/contact.ts",
         "agents/support/agent.ts",
         "agents/support/tools/summarize_numbers.py",
         "agents/support/tools/slow_summarize.py",
@@ -402,6 +577,9 @@ export function GET() {
         home.contains(r#"<script type="module" src="/_beater/client/index.js"></script>"#),
         "{home}"
     );
+    assert!(home.contains("data-beater-run-events"), "{home}");
+    assert!(home.contains("data-run-history"), "{home}");
+    assert!(home.contains("data-beater-action-form"), "{home}");
 
     let client =
         http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
@@ -414,6 +592,8 @@ export function GET() {
         client.contains("root.dataset.state = \"hydrated\""),
         "{client}"
     );
+    assert!(client.contains("new EventSource"), "{client}");
+    assert!(client.contains("fetch(\"/_beater/agent/runs\""), "{client}");
     assert!(!client.contains(": number"), "{client}");
 
     let flight =
@@ -1073,8 +1253,16 @@ fn http_request_with_headers(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let body = body.unwrap_or("");
+    let has_content_type = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    let content_type = if has_content_type {
+        String::new()
+    } else {
+        "\r\ncontent-type: application/json".to_string()
+    };
     let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}{content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     for (name, value) in headers {
@@ -1088,4 +1276,8 @@ fn http_request_with_headers(
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+fn http_body(response: &str) -> &str {
+    response.split("\r\n\r\n").nth(1).unwrap_or_default().trim()
 }

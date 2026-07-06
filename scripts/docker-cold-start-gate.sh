@@ -1,31 +1,23 @@
 #!/usr/bin/env bash
-# Build a beater bundle, build its Docker image, and prove the container serves
-# the generated app from a cold start.
+# Build a Linux beater bundle, build its Docker image, and prove the container
+# serves the generated app and MCP endpoint from a cold start.
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODE="${BEATER_DOCKER_GATE_MODE:-auto}" # auto | local | builder
-BIN="${BEATER_BIN:-$ROOT/target/debug/beater}"
-COLD_START_MS="${BEATER_DOCKER_COLD_START_MS:-1000}"
-BUILDER_IMAGE="${BEATER_DOCKER_BUILDER_IMAGE:-rust:bookworm}"
-if [[ -n "${BEATER_DOCKER_IMAGE:-}" ]]; then
-  IMAGE="$BEATER_DOCKER_IMAGE"
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+RUST_IMAGE=${BEATER_DOCKER_RUST_IMAGE:-rust:1-bookworm}
+if [ -n "${BEATER_DOCKER_IMAGE:-}" ]; then
+  IMAGE=$BEATER_DOCKER_IMAGE
   CLEAN_IMAGE=0
 else
-  IMAGE="beater-docker-cold-start-gate:$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  IMAGE="beater-hello:docker-gate-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   CLEAN_IMAGE=1
 fi
-if [[ -n "${BEATER_DOCKER_GATE_TMP:-}" ]]; then
-  TMP="$BEATER_DOCKER_GATE_TMP"
-  CLEAN_TMP=0
-else
-  TMP="$(mktemp -d "${TMPDIR:-/tmp}/beater-docker-gate.XXXXXX")"
-  CLEAN_TMP=1
-fi
-APP="$TMP/app"
-BUNDLE="$TMP/bundle"
-CONTAINER=""
+COLD_START_MS=${BEATER_DOCKER_COLD_START_MS:-1000}
+MIN_FREE_KIB=${BEATER_DOCKER_MIN_FREE_KIB:-12582912}
+WORKDIR=${BEATER_DOCKER_GATE_WORKDIR:-}
+MCP_TOKEN=${BEATER_DOCKER_MCP_TOKEN:-docker-gate-token}
+CID=""
 
 fail() {
   echo "error: $*" >&2
@@ -33,196 +25,192 @@ fail() {
 }
 
 need() {
-  command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"
+  command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
 now_ms() {
-  python3 -c 'import time; print(int(time.monotonic() * 1000))'
+  python3 - <<'PY'
+import time
+print(int(time.monotonic() * 1000))
+PY
+}
+
+free_kib() {
+  df -Pk "$1" | awk 'NR == 2 { print $4 }'
+}
+
+free_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
 }
 
 cleanup() {
-  if [[ -n "$CONTAINER" ]]; then
-    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  status=$?
+  if [ -n "$CID" ]; then
+    docker rm -f "$CID" >/dev/null 2>&1 || true
   fi
-  if [[ "$CLEAN_IMAGE" == "1" ]]; then
-    docker image rm "$IMAGE" >/dev/null 2>&1 || true
-  fi
-  if [[ "$CLEAN_TMP" == "1" && "${BEATER_DOCKER_GATE_KEEP:-}" != "1" ]]; then
-    rm -rf "$TMP"
-  else
-    echo "kept gate workspace: $TMP"
-  fi
-}
-
-choose_mode() {
-  case "$MODE" in
-    auto)
-      if [[ "$(uname -s)" == "Linux" ]]; then
-        echo local
-      else
-        echo builder
-      fi
-      ;;
-    local | builder)
-      echo "$MODE"
-      ;;
-    *)
-      fail "BEATER_DOCKER_GATE_MODE must be auto, local, or builder"
-      ;;
-  esac
-}
-
-assert_linux_binary() {
-  local binary="$1"
-  if command -v file >/dev/null 2>&1; then
-    local description
-    description="$(file "$binary")"
-    [[ "$description" == *"ELF"* ]] || fail "bundle binary is not a Linux ELF executable: $description"
-  fi
-}
-
-build_bundle_local() {
-  need cargo
-  [[ "$(uname -s)" == "Linux" ]] || fail "local mode requires a Linux host-built beater binary; use BEATER_DOCKER_GATE_MODE=builder on this host"
-
-  cargo build --locked -p beater-cli
-  [[ -x "$BIN" ]] || fail "missing executable $BIN"
-  "$BIN" new "$APP"
-  "$BIN" build "$APP" --out "$BUNDLE"
-  assert_linux_binary "$BUNDLE/bin/beater"
-}
-
-build_bundle_in_builder() {
-  echo "building Linux bundle in Docker builder image: $BUILDER_IMAGE"
-  docker run --rm \
-    -v "$ROOT:/workspace:ro" \
-    -v "$TMP:/out" \
-    -w /workspace \
-    "$BUILDER_IMAGE" \
-    bash -lc '
-      set -euo pipefail
-      export PATH="/usr/local/cargo/bin:$PATH"
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        pkg-config \
-        python3 \
-        python3-dev \
-        python3-venv \
-        build-essential
-      export PYO3_PYTHON="$(command -v python3)"
-      export CARGO_TARGET_DIR=/tmp/beater-target
-      command -v cargo >/dev/null
-      cargo build --locked -p beater-cli
-      /tmp/beater-target/debug/beater new /out/app
-      /tmp/beater-target/debug/beater build /out/app --out /out/bundle
-    '
-  assert_linux_binary "$BUNDLE/bin/beater"
-}
-
-wait_for_container_port() {
-  local mapping
-  for _ in $(seq 1 100); do
-    mapping="$(docker port "$CONTAINER" 3000/tcp 2>/dev/null | head -n1 || true)"
-    if [[ -n "$mapping" ]]; then
-      echo "${mapping##*:}"
-      return 0
+  if [ "$status" -eq 0 ] && [ "${BEATER_DOCKER_KEEP:-0}" != "1" ]; then
+    rm -rf "$WORKDIR/target"
+    if [ "$CLEAN_IMAGE" = "1" ]; then
+      docker image rm "$IMAGE" >/dev/null 2>&1 || true
     fi
-    sleep 0.1
-  done
-  fail "timed out waiting for Docker to publish container port 3000"
-}
-
-wait_for_health() {
-  local port="$1"
-  local deadline_ms="$2"
-  local last=""
-
-  while (( $(now_ms) <= deadline_ms )); do
-    if last="$(curl -fsS --max-time 0.5 "http://127.0.0.1:$port/api/health" 2>&1)"; then
-      if [[ "$last" == *'"runtime":"beater.js"'* ]]; then
-        return 0
-      fi
-    fi
-    sleep 0.05
-  done
-
-  echo "last /api/health response:" >&2
-  echo "$last" >&2
-  echo "container logs:" >&2
-  docker logs "$CONTAINER" >&2 || true
-  fail "container did not serve /api/health within ${COLD_START_MS}ms"
+  fi
+  if [ "$status" -ne 0 ]; then
+    echo "kept gate workdir: $WORKDIR" >&2
+  fi
 }
 
 verify_mcp_auth() {
-  local port="$1"
-  local body='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-  local missing_auth
-  local authed
+  port=$1
+  python3 - "$port" "$MCP_TOKEN" >"$WORKDIR/logs/mcp-auth.json" 2>"$WORKDIR/logs/mcp-auth.err" <<'PY'
+import sys
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
-  missing_auth="$(curl -sS -o /dev/null -w '%{http_code}' \
-    --max-time 2 \
-    -H 'accept: application/json, text/event-stream' \
-    -H 'content-type: application/json' \
-    --data "$body" \
-    "http://127.0.0.1:$port/mcp")"
-  [[ "$missing_auth" == "401" ]] || fail "expected unauthenticated /mcp to return 401, got $missing_auth"
+port, token = sys.argv[1], sys.argv[2]
+body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+headers = {
+    "accept": "application/json, text/event-stream",
+    "content-type": "application/json",
+}
+url = f"http://127.0.0.1:{port}/mcp"
 
-  authed="$(curl -fsS \
-    --max-time 2 \
-    -H 'accept: application/json, text/event-stream' \
-    -H 'authorization: Bearer docker-gate-token' \
-    -H 'content-type: application/json' \
-    --data "$body" \
-    "http://127.0.0.1:$port/mcp")"
-  [[ "$authed" == *'"tools"'* ]] || fail "authenticated /mcp response did not include tools"
+try:
+    urlopen(Request(url, data=body, headers=headers, method="POST"), timeout=2)
+except HTTPError as exc:
+    if exc.code != 401:
+        raise SystemExit(f"expected unauthenticated /mcp to return 401, got {exc.code}")
+else:
+    raise SystemExit("expected unauthenticated /mcp to return 401, got success")
+
+headers["authorization"] = f"Bearer {token}"
+with urlopen(Request(url, data=body, headers=headers, method="POST"), timeout=2) as response:
+    payload = response.read().decode("utf-8")
+    if response.status != 200 or '"tools"' not in payload:
+        raise SystemExit(f"authenticated /mcp response did not include tools: {response.status} {payload}")
+    print(payload)
+PY
 }
 
-main() {
-  trap cleanup EXIT
-  need docker
-  need curl
-  need python3
+need docker
+need python3
 
-  case "$TMP" in
+if ! docker version >/dev/null 2>&1; then
+  fail "docker daemon is not available"
+fi
+
+if [ -z "$WORKDIR" ]; then
+  WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/beater-docker-gate.XXXXXX")
+else
+  case "$WORKDIR" in
     "" | "/")
-      fail "refusing unsafe gate workspace: $TMP"
+      fail "refusing unsafe gate workdir: $WORKDIR"
       ;;
   esac
-  mkdir -p "$TMP"
+  mkdir -p "$WORKDIR"
+fi
+trap cleanup EXIT
 
-  local selected_mode
-  selected_mode="$(choose_mode)"
-  case "$selected_mode" in
-    local)
-      build_bundle_local
-      ;;
-    builder)
-      build_bundle_in_builder
-      ;;
-  esac
+available=$(free_kib "$WORKDIR")
+if [ "$available" -lt "$MIN_FREE_KIB" ]; then
+  echo "not enough free space for Linux release build: ${available} KiB available, ${MIN_FREE_KIB} KiB required" >&2
+  echo "set BEATER_DOCKER_GATE_WORKDIR to a filesystem with more room, or lower BEATER_DOCKER_MIN_FREE_KIB after validating locally" >&2
+  exit 1
+fi
 
-  echo "building Docker image: $IMAGE"
-  docker build -t "$IMAGE" "$BUNDLE"
+mkdir -p "$WORKDIR/target" "$WORKDIR/bundle" "$WORKDIR/logs"
 
-  local start_ms
-  start_ms="$(now_ms)"
-  CONTAINER="$(docker run --rm -d \
-    -e BEATER_MCP_TOKEN=docker-gate-token \
-    -p 127.0.0.1::3000 \
-    "$IMAGE")"
+if ! docker image inspect "$RUST_IMAGE" >/dev/null 2>"$WORKDIR/logs/rust-image-inspect.err"; then
+  if grep -qi "No such image" "$WORKDIR/logs/rust-image-inspect.err"; then
+    docker pull "$RUST_IMAGE" 2>&1 | tee "$WORKDIR/logs/rust-image-pull.log"
+  else
+    echo "docker cannot inspect builder image $RUST_IMAGE" >&2
+    cat "$WORKDIR/logs/rust-image-inspect.err" >&2
+    echo "logs: $WORKDIR/logs" >&2
+    exit 1
+  fi
+fi
 
-  local port
-  port="$(wait_for_container_port)"
-  wait_for_health "$port" "$((start_ms + COLD_START_MS))"
-  local elapsed_ms
-  elapsed_ms="$(( $(now_ms) - start_ms ))"
-  verify_mcp_auth "$port"
+echo "building Linux beater bundle in $RUST_IMAGE"
+docker run --rm \
+  --mount "type=bind,src=$ROOT,dst=/src,readonly" \
+  --mount "type=bind,src=$WORKDIR/target,dst=/target" \
+  --mount "type=bind,src=$WORKDIR/bundle,dst=/bundle" \
+  -w /src \
+  "$RUST_IMAGE" \
+  bash -lc 'set -euo pipefail
+    export PATH=/usr/local/cargo/bin:$PATH
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates file pkg-config python3-dev
+    PYO3_PYTHON=/usr/bin/python3 CARGO_TARGET_DIR=/target cargo build --locked --release -p beater-cli
+    /target/release/beater build /src/examples/hello --out /bundle --force
+    file /bundle/bin/beater
+  ' 2>&1 | tee "$WORKDIR/logs/linux-bundle-build.log"
 
-  echo "docker cold-start gate passed: $IMAGE served /api/health on port $port in ${elapsed_ms}ms"
-}
+echo "building runtime image $IMAGE"
+docker build -t "$IMAGE" "$WORKDIR/bundle" 2>&1 | tee "$WORKDIR/logs/docker-build.log"
 
-main "$@"
+PORT=$(free_port)
+start=$(now_ms)
+CID=$(docker run -d --rm \
+  -e "BEATER_MCP_TOKEN=$MCP_TOKEN" \
+  -p "127.0.0.1:$PORT:3000" \
+  "$IMAGE")
+
+deadline=$((start + 10000))
+while :; do
+  if python3 - "$PORT" >"$WORKDIR/logs/health.json" 2>"$WORKDIR/logs/health.err" <<'PY'
+import sys
+from urllib.request import urlopen
+
+port = sys.argv[1]
+with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=0.5) as response:
+    body = response.read().decode("utf-8")
+    if response.status != 200 or '"runtime":"beater.js"' not in body:
+        raise SystemExit(f"unexpected health response: {response.status} {body}")
+    print(body)
+PY
+  then
+    end=$(now_ms)
+    elapsed=$((end - start))
+    break
+  fi
+  if [ "$(now_ms)" -ge "$deadline" ]; then
+    docker logs "$CID" >"$WORKDIR/logs/container.log" 2>&1 || true
+    echo "container did not serve /api/health within 10s" >&2
+    echo "logs: $WORKDIR/logs" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+
+docker logs "$CID" >"$WORKDIR/logs/container.log" 2>&1 || true
+
+if [ "$elapsed" -gt "$COLD_START_MS" ]; then
+  echo "docker cold start exceeded ${COLD_START_MS}ms: ${elapsed}ms" >&2
+  echo "logs: $WORKDIR/logs" >&2
+  exit 1
+fi
+
+verify_mcp_auth "$PORT"
+
+cat >"$WORKDIR/evidence.md" <<EOF2
+# Docker Cold-Start Gate
+
+- image: \`$IMAGE\`
+- rust builder: \`$RUST_IMAGE\`
+- health route: \`/api/health\`
+- MCP route: \`/mcp\`
+- MCP auth: unauthenticated 401 plus bearer-token tools/list success
+- cold start: \`${elapsed}ms\`
+- limit: \`${COLD_START_MS}ms\`
+- logs: \`$WORKDIR/logs\`
+EOF2
+
+echo "docker cold-start gate passed in ${elapsed}ms"
+echo "evidence: $WORKDIR/evidence.md"

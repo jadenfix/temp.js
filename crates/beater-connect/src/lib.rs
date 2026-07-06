@@ -355,6 +355,7 @@ impl ConnectApp {
             agent_card: self.agent_card_json(),
             openapi: self.openapi_json(),
             mcp_catalog: self.mcp_catalog_json(),
+            forms: self.forms_html(),
             llms: self.llms_txt(),
             robots: self.robots_txt(),
             sitemap: self.sitemap_xml(),
@@ -375,7 +376,7 @@ impl ConnectApp {
         writeln!(out, "  \"version\": \"{}\",", json_escape(&self.version)).ok();
         writeln!(out, "  \"base_url\": \"{}\",", json_escape(&self.base_url)).ok();
         writeln!(out, "  \"endpoints\": {{").ok();
-        writeln!(out, "    \"mcp\": \"/mcp\",").ok();
+        writeln!(out, "    \"mcp_catalog\": \"/mcp/catalog.json\",").ok();
         writeln!(out, "    \"openapi\": \"/openapi.json\",").ok();
         writeln!(out, "    \"agent_card\": \"/.well-known/agent-card.json\",").ok();
         writeln!(out, "    \"llms\": \"/llms.txt\",").ok();
@@ -384,14 +385,9 @@ impl ConnectApp {
         writeln!(out, "  }},").ok();
         writeln!(
             out,
-            "  \"capabilities\": [\"resources\", \"actions\", \"openapi\", \"mcp\", \"a2a\", \"crawl\", \"receipts\"],"
+            "  \"capabilities\": [\"resources\", \"actions\", \"openapi\", \"mcp_catalog\", \"a2a\", \"crawl\"],"
         )
         .ok();
-        writeln!(out, "  \"auth\": {{").ok();
-        writeln!(out, "    \"type\": \"oauth2\",").ok();
-        writeln!(out, "    \"authorization_url\": \"/oauth/authorize\",").ok();
-        writeln!(out, "    \"token_url\": \"/oauth/token\"").ok();
-        writeln!(out, "  }},").ok();
         writeln!(out, "  \"resources\": {},", self.resources_json(2)).ok();
         writeln!(out, "  \"actions\": {}", self.actions_json(2)).ok();
         writeln!(out, "}}").ok();
@@ -410,9 +406,8 @@ impl ConnectApp {
         .ok();
         writeln!(out, "  \"url\": \"{}\",", json_escape(&self.base_url)).ok();
         writeln!(out, "  \"version\": \"{}\",", json_escape(&self.version)).ok();
-        writeln!(out, "  \"preferred_transport\": \"mcp\",").ok();
+        writeln!(out, "  \"preferred_transport\": \"openapi\",").ok();
         writeln!(out, "  \"interfaces\": [").ok();
-        writeln!(out, "    {{ \"type\": \"mcp\", \"url\": \"/mcp\" }},").ok();
         writeln!(
             out,
             "    {{ \"type\": \"openapi\", \"url\": \"/openapi.json\" }}"
@@ -444,14 +439,7 @@ impl ConnectApp {
             ));
         }
         writeln!(out, "{}", rows.join(",\n")).ok();
-        writeln!(out, "  ],").ok();
-        writeln!(out, "  \"security_schemes\": {{").ok();
-        writeln!(out, "    \"oauth2\": {{").ok();
-        writeln!(out, "      \"type\": \"oauth2\",").ok();
-        writeln!(out, "      \"authorization_url\": \"/oauth/authorize\",").ok();
-        writeln!(out, "      \"token_url\": \"/oauth/token\"").ok();
-        writeln!(out, "    }}").ok();
-        writeln!(out, "  }}").ok();
+        writeln!(out, "  ]").ok();
         writeln!(out, "}}").ok();
         out
     }
@@ -481,24 +469,7 @@ impl ConnectApp {
         let path_rows = self.openapi_path_rows();
         writeln!(out, "{}", path_rows.join(",\n")).ok();
         writeln!(out, "  }},").ok();
-        writeln!(out, "  \"components\": {{").ok();
-        writeln!(out, "    \"securitySchemes\": {{").ok();
-        writeln!(out, "      \"oauth2\": {{").ok();
-        writeln!(out, "        \"type\": \"oauth2\",").ok();
-        writeln!(out, "        \"flows\": {{").ok();
-        writeln!(out, "          \"authorizationCode\": {{").ok();
-        writeln!(
-            out,
-            "            \"authorizationUrl\": \"/oauth/authorize\","
-        )
-        .ok();
-        writeln!(out, "            \"tokenUrl\": \"/oauth/token\",").ok();
-        writeln!(out, "            \"scopes\": {}", self.scopes_json(12)).ok();
-        writeln!(out, "          }}").ok();
-        writeln!(out, "        }}").ok();
-        writeln!(out, "      }}").ok();
-        writeln!(out, "    }}").ok();
-        writeln!(out, "  }}").ok();
+        writeln!(out, "  \"components\": {{}}").ok();
         writeln!(out, "}}").ok();
         out
     }
@@ -551,6 +522,32 @@ impl ConnectApp {
         .ok();
         writeln!(out, "  ]").ok();
         writeln!(out, "}}").ok();
+        out
+    }
+
+    pub fn forms_html(&self) -> String {
+        let mut out = String::new();
+        writeln!(out, "<!doctype html>").ok();
+        writeln!(out, "<html lang=\"en\">").ok();
+        writeln!(out, "<head>").ok();
+        writeln!(out, "  <meta charset=\"utf-8\">").ok();
+        writeln!(
+            out,
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        )
+        .ok();
+        writeln!(out, "  <title>{} actions</title>", html_escape(&self.name)).ok();
+        writeln!(out, "</head>").ok();
+        writeln!(out, "<body>").ok();
+        writeln!(out, "  <main>").ok();
+        writeln!(out, "    <h1>{} actions</h1>", html_escape(&self.name)).ok();
+        writeln!(out, "    <p>{}</p>", html_escape(&self.description)).ok();
+        for action in &self.actions {
+            self.write_action_form(&mut out, action);
+        }
+        writeln!(out, "  </main>").ok();
+        writeln!(out, "</body>").ok();
+        writeln!(out, "</html>").ok();
         out
     }
 
@@ -794,20 +791,14 @@ impl ConnectApp {
 
     fn action_operation_json(&self, action: &Action) -> String {
         let method = action.method.to_ascii_lowercase();
-        let security = match action.auth {
-            Auth::Public => "[]".to_string(),
-            _ => format!(
-                "[{{ \"oauth2\": {} }}]",
-                string_array_json(action.auth.scopes())
-            ),
-        };
+        let security = "[]";
         let idempotency_header = if action.idempotency_required {
             "\n        \"parameters\": [\n          {\n            \"name\": \"Idempotency-Key\",\n            \"in\": \"header\",\n            \"required\": true,\n            \"schema\": { \"type\": \"string\" }\n          }\n        ],"
         } else {
             ""
         };
         format!(
-            "      \"{}\": {{\n        \"operationId\": \"{}\",\n        \"summary\": \"{}\",\n        \"description\": \"{}\",\n        \"security\": {},{}\n        \"x-beater-connect\": {{\n          \"sideEffect\": \"{}\",\n          \"confirm\": {},\n          \"dryRun\": {},\n          \"idempotencyRequired\": {}\n        }},\n        \"requestBody\": {{\n          \"required\": true,\n          \"content\": {{\n            \"application/json\": {{\n              \"schema\": {}\n            }}\n          }}\n        }},\n        \"responses\": {{\n          \"200\": {{ \"description\": \"Action result\" }}\n        }}\n      }}",
+            "      \"{}\": {{\n        \"operationId\": \"{}\",\n        \"summary\": \"{}\",\n        \"description\": \"{}\",\n        \"security\": {},{}\n        \"x-beater-connect\": {{\n          \"sideEffect\": \"{}\",\n          \"confirm\": {},\n          \"dryRun\": {},\n          \"idempotencyRequired\": {},\n          \"auth\": {}\n        }},\n        \"requestBody\": {{\n          \"required\": true,\n          \"content\": {{\n            \"application/json\": {{\n              \"schema\": {}\n            }}\n          }}\n        }},\n        \"responses\": {{\n          \"200\": {{ \"description\": \"Action result\" }}\n        }}\n      }}",
             json_escape(&method),
             json_escape(&action.id),
             json_escape(&action.title),
@@ -818,35 +809,76 @@ impl ConnectApp {
             action.confirm,
             action.dry_run,
             action.idempotency_required,
+            auth_json(&action.auth, 10),
             action.input.json_schema(14)
         )
     }
 
-    fn scopes_json(&self, indent: usize) -> String {
-        let pad = " ".repeat(indent);
-        let inner = " ".repeat(indent + 2);
-        let mut scopes = Vec::new();
-        for action in &self.actions {
-            for scope in action.auth.scopes() {
-                if !scopes.contains(scope) {
-                    scopes.push(scope.to_string());
-                }
-            }
-        }
-        let mut out = String::new();
-        writeln!(out, "{{").ok();
-        for (index, scope) in scopes.iter().enumerate() {
-            let comma = if index + 1 == scopes.len() { "" } else { "," };
+    fn write_action_form(&self, out: &mut String, action: &Action) {
+        let html_method = if action.method.eq_ignore_ascii_case("GET") {
+            "get"
+        } else {
+            "post"
+        };
+        let scopes = action.auth.scopes().join(" ");
+        writeln!(
+            out,
+            "    <section id=\"action-{}\">",
+            html_escape(&action.id)
+        )
+        .ok();
+        writeln!(out, "      <h2>{}</h2>", html_escape(&action.title)).ok();
+        writeln!(out, "      <p>{}</p>", html_escape(&action.description)).ok();
+        writeln!(
+            out,
+            "      <form method=\"{}\" action=\"{}\" data-action-id=\"{}\" data-method=\"{}\" data-side-effect=\"{}\" data-auth=\"{}\" data-scopes=\"{}\" data-confirm=\"{}\" data-dry-run=\"{}\" data-idempotency-required=\"{}\">",
+            html_method,
+            html_escape(&action.path),
+            html_escape(&action.id),
+            html_escape(&action.method),
+            action.side_effect.as_str(),
+            action.auth.kind(),
+            html_escape(&scopes),
+            action.confirm,
+            action.dry_run,
+            action.idempotency_required
+        )
+        .ok();
+        if !action.method.eq_ignore_ascii_case("GET") && !action.method.eq_ignore_ascii_case("POST")
+        {
             writeln!(
                 out,
-                "{inner}\"{}\": \"{}\"{comma}",
-                json_escape(scope),
-                json_escape(&format!("Access scope {scope}"))
+                "        <input type=\"hidden\" name=\"_method\" value=\"{}\">",
+                html_escape(&action.method)
             )
             .ok();
         }
-        write!(out, "{pad}}}").ok();
-        out
+        if action.confirm {
+            writeln!(
+                out,
+                "        <label><input type=\"checkbox\" name=\"confirm\" value=\"true\" required> Confirm {}</label>",
+                html_escape(action.side_effect.as_str())
+            )
+            .ok();
+        }
+        if action.idempotency_required {
+            writeln!(
+                out,
+                "        <label>Idempotency key <input name=\"idempotency_key\" autocomplete=\"off\" required></label>"
+            )
+            .ok();
+        }
+        for field in &action.input.fields {
+            write_form_field(out, field);
+        }
+        writeln!(
+            out,
+            "        <button type=\"submit\">{}</button>",
+            html_escape(&action.title)
+        )
+        .ok();
+        writeln!(out, "      </form>").ok();
+        writeln!(out, "    </section>").ok();
     }
 }
 
@@ -909,6 +941,7 @@ pub struct ConnectBundle {
     pub agent_card: String,
     pub openapi: String,
     pub mcp_catalog: String,
+    pub forms: String,
     pub llms: String,
     pub robots: String,
     pub sitemap: String,
@@ -1008,6 +1041,56 @@ fn string_array_json(values: &[String]) -> String {
     format!("[{body}]")
 }
 
+fn write_form_field(out: &mut String, field: &Field) {
+    let required = if field.required { " required" } else { "" };
+    let input_type = match field.kind {
+        FieldKind::String => "text",
+        FieldKind::Number | FieldKind::Integer => "number",
+        FieldKind::Boolean => "checkbox",
+        FieldKind::Object | FieldKind::Array => "textarea",
+    };
+    let description = field.description.as_deref().unwrap_or("");
+    if matches!(field.kind, FieldKind::Object | FieldKind::Array) {
+        writeln!(
+            out,
+            "        <label>{} <textarea name=\"{}\"{} aria-description=\"{}\"></textarea></label>",
+            html_escape(&field.name),
+            html_escape(&field.name),
+            required,
+            html_escape(description)
+        )
+        .ok();
+    } else if matches!(field.kind, FieldKind::Boolean) {
+        writeln!(
+            out,
+            "        <label><input type=\"{}\" name=\"{}\" value=\"true\"{} aria-description=\"{}\"> {}</label>",
+            input_type,
+            html_escape(&field.name),
+            required,
+            html_escape(description),
+            html_escape(&field.name)
+        )
+        .ok();
+    } else {
+        let step = if matches!(field.kind, FieldKind::Number) {
+            " step=\"any\""
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "        <label>{} <input type=\"{}\" name=\"{}\"{}{} aria-description=\"{}\"></label>",
+            html_escape(&field.name),
+            input_type,
+            html_escape(&field.name),
+            step,
+            required,
+            html_escape(description)
+        )
+        .ok();
+    }
+}
+
 fn json_escape(value: &str) -> String {
     let mut out = String::new();
     for character in value.chars() {
@@ -1020,6 +1103,21 @@ fn json_escape(value: &str) -> String {
             character if character.is_control() => {
                 write!(out, "\\u{:04x}", character as u32).ok();
             }
+            character => out.push(character),
+        }
+    }
+    out
+}
+
+fn html_escape(value: &str) -> String {
+    let mut out = String::new();
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
             character => out.push(character),
         }
     }
@@ -1074,8 +1172,44 @@ mod tests {
             assert!(bundle.agent_card.contains(action));
             assert!(bundle.openapi.contains(action));
             assert!(bundle.mcp_catalog.contains(action));
+            assert!(bundle.forms.contains(action));
             assert!(bundle.llms.contains(action));
         }
+    }
+
+    #[test]
+    fn generated_forms_post_actions_with_mcp_semantics() {
+        let app = demo_app();
+        let forms = app.forms_html();
+        let mcp: serde_json::Value =
+            serde_json::from_str(&app.mcp_catalog_json()).expect("mcp catalog should be JSON");
+        let book_demo = mcp["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "book_demo")
+            .expect("book_demo should be in MCP catalog");
+
+        assert!(
+            forms.contains("action=\"/agent/actions/book-demo\""),
+            "{forms}"
+        );
+        assert!(forms.contains("method=\"post\""), "{forms}");
+        assert!(forms.contains("data-action-id=\"book_demo\""), "{forms}");
+        assert!(forms.contains("data-auth=\"user\""), "{forms}");
+        assert!(forms.contains("data-scopes=\"demo:book\""), "{forms}");
+        assert!(forms.contains("data-confirm=\"true\""), "{forms}");
+        assert!(forms.contains("data-dry-run=\"true\""), "{forms}");
+        assert!(
+            forms.contains("data-idempotency-required=\"true\""),
+            "{forms}"
+        );
+        assert!(forms.contains("name=\"idempotency_key\""), "{forms}");
+        assert!(forms.contains("name=\"confirm\""), "{forms}");
+        assert_eq!(book_demo["auth"]["type"], "user");
+        assert_eq!(book_demo["confirm"], true);
+        assert_eq!(book_demo["dryRun"], true);
+        assert_eq!(book_demo["idempotencyRequired"], true);
     }
 
     #[test]
@@ -1083,6 +1217,44 @@ mod tests {
         let openapi = demo_app().openapi_json();
         assert!(openapi.contains("\"Idempotency-Key\""));
         assert!(openapi.contains("\"idempotencyRequired\": true"));
+    }
+
+    #[test]
+    fn generated_discovery_only_advertises_implemented_static_surfaces() {
+        let app = demo_app();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&app.beater_manifest_json()).expect("manifest should be JSON");
+        assert_eq!(manifest["endpoints"]["mcp_catalog"], "/mcp/catalog.json");
+        assert!(manifest["endpoints"].get("mcp").is_none());
+        assert!(manifest.get("auth").is_none());
+        let capabilities = manifest["capabilities"]
+            .as_array()
+            .expect("capabilities should be an array");
+        assert!(capabilities.iter().any(|value| value == "mcp_catalog"));
+        assert!(!capabilities.iter().any(|value| value == "mcp"));
+        assert!(!capabilities.iter().any(|value| value == "receipts"));
+
+        let agent_card: serde_json::Value =
+            serde_json::from_str(&app.agent_card_json()).expect("agent card should be JSON");
+        assert_eq!(agent_card["preferred_transport"], "openapi");
+        assert!(agent_card.get("security_schemes").is_none());
+        assert!(
+            agent_card["interfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|interface| interface["type"] != "mcp")
+        );
+
+        let openapi: serde_json::Value =
+            serde_json::from_str(&app.openapi_json()).expect("openapi should be JSON");
+        assert!(openapi["components"]["securitySchemes"].is_null());
+        assert!(!app.openapi_json().contains("/oauth/"));
+        assert_eq!(
+            openapi["paths"]["/agent/actions/book-demo"]["post"]["x-beater-connect"]["auth"]["type"],
+            "user"
+        );
     }
 
     #[test]

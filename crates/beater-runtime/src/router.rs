@@ -108,12 +108,21 @@ impl RouteTable {
                 );
             }
         }
-        // static segments win over params at the same depth
-        routes.sort_by_key(|r| {
-            r.segments
+        // Static segments win over params at each depth; ties are stable across
+        // filesystems so route precedence does not depend on walk order.
+        routes.sort_by(|left, right| {
+            left.segments
                 .iter()
-                .filter(|s| matches!(s, Segment::Param(_)))
-                .count()
+                .zip(&right.segments)
+                .map(|(left, right)| segment_rank(left).cmp(&segment_rank(right)))
+                .find(|ordering| !ordering.is_eq())
+                .unwrap_or_else(|| {
+                    left.segments
+                        .len()
+                        .cmp(&right.segments.len())
+                        .then_with(|| left.pattern.cmp(&right.pattern))
+                        .then_with(|| left.file.cmp(&right.file))
+                })
         });
         Ok(Self { routes })
     }
@@ -146,6 +155,13 @@ impl RouteTable {
             return Some((route, params));
         }
         None
+    }
+}
+
+fn segment_rank(segment: &Segment) -> (u8, &str) {
+    match segment {
+        Segment::Static(value) => (0, value.as_str()),
+        Segment::Param(value) => (1, value.as_str()),
     }
 }
 
@@ -290,6 +306,26 @@ mod tests {
 
         assert_eq!(route.pattern, "/users/settings");
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn static_segments_win_at_the_same_depth_before_total_param_count() {
+        let app = TempDir::new("specificity");
+        app.write(
+            "app/routes/[tenant]/profile/edit.tsx",
+            "export default function TenantProfileEdit() {}",
+        );
+        app.write(
+            "app/routes/users/[id]/[tab].tsx",
+            "export default function UserTab() {}",
+        );
+
+        let table = RouteTable::scan(app.path()).unwrap();
+        let (route, params) = table.match_path("/users/profile/edit").unwrap();
+
+        assert_eq!(route.pattern, "/users/[id]/[tab]");
+        assert_eq!(params.get("id").map(String::as_str), Some("profile"));
+        assert_eq!(params.get("tab").map(String::as_str), Some("edit"));
     }
 
     #[test]

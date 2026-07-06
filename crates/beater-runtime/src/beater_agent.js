@@ -13,6 +13,26 @@ export function defineAgent(cfg) {
   };
 }
 
+export function defineAction(cfg) {
+  if (!cfg || typeof cfg !== "object") {
+    throw new Error("defineAction(config) requires a config object");
+  }
+  if (typeof cfg.name !== "string" || cfg.name.trim() === "") {
+    throw new Error("defineAction requires config.name");
+  }
+  return {
+    name: cfg.name,
+    description: cfg.description ?? `Call ${cfg.name}.`,
+    method: cfg.method ?? "POST",
+    inputSchema: cfg.inputSchema ?? { type: "object", properties: {} },
+    sideEffect: cfg.sideEffect ?? "write",
+    confirm: cfg.confirm === true,
+    dryRun: cfg.dryRun === true,
+    idempotencyRequired: cfg.idempotencyRequired === true,
+    auth: cfg.auth ?? { type: "public" },
+  };
+}
+
 // Python tool: full-fat CPython embedded in the host (numpy/torch work).
 // Not idempotent unless declared — the resume-safety contract.
 export function pyTool(name, path, opts = {}) {
@@ -52,6 +72,32 @@ export function sandboxTool(name, opts = {}) {
   return tool;
 }
 
+// Local Wasmtime tool: hermetic W0 sandbox with no host imports, filesystem,
+// network, env, or secrets. Use this for untrusted scalar wasm functions.
+export function wasmtimeTool(name, opts = {}) {
+  if (!opts || typeof opts !== "object") {
+    throw new Error("wasmtimeTool(name, options) requires an options object");
+  }
+  if (opts.path && opts.source) {
+    throw new Error("wasmtimeTool accepts either path or source, not both");
+  }
+  if (!opts.path && !opts.source) {
+    throw new Error("wasmtimeTool requires a path or source");
+  }
+  const tool = {
+    kind: "wasmtime",
+    name,
+    policy: opts.policy ?? {},
+    idempotent: opts.idempotent ?? false,
+  };
+  if (opts.path) tool.path = opts.path;
+  if (opts.source) tool.source = opts.source;
+  if (opts.entrypoint) tool.entrypoint = opts.entrypoint;
+  if (opts.description) tool.description = opts.description;
+  if (opts.inputSchema) tool.inputSchema = opts.inputSchema;
+  return tool;
+}
+
 // Remote MCP tool source. Metadata is declared locally so the agent can expose
 // stable tool schemas before it calls the networked provider.
 export function remoteMcpTool(name, opts = {}) {
@@ -78,6 +124,26 @@ export function remoteMcpTool(name, opts = {}) {
     auth: opts.auth ?? null,
     timeoutMs: opts.timeoutMs ?? 10000,
     retry: opts.retry ?? null,
+    session: opts.session ?? null,
+    egress: opts.egress ?? [],
+  };
+}
+
+// Remote MCP provider discovery. The Rust registry calls tools/list at startup
+// and imports every provider tool as `${prefix}.${remoteToolName}`.
+export function remoteMcpProvider(prefix, opts = {}) {
+  if (!opts.endpoint) {
+    throw new Error("remoteMcpProvider requires opts.endpoint");
+  }
+  return {
+    kind: "remote_mcp_provider",
+    name: prefix,
+    idempotent: opts.idempotent ?? false,
+    endpoint: opts.endpoint,
+    auth: opts.auth ?? null,
+    timeoutMs: opts.timeoutMs ?? 10000,
+    retry: opts.retry ?? null,
+    session: opts.session ?? null,
     egress: opts.egress ?? [],
   };
 }

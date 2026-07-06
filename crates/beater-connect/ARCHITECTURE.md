@@ -90,13 +90,15 @@ changing the top-level registry concepts.
 | `/.well-known/beater.json` | Canonical Beater discovery manifest. |
 | `/.well-known/agent-card.json` | Agent discovery metadata for task-capable clients. |
 | `/openapi.json` | HTTP API contract for resources and actions. |
-| `/mcp` metadata | Tool, resource, and prompt catalog for MCP integration. |
+| `/mcp/catalog.json` metadata | Static tool, resource, and prompt catalog for future MCP integration. |
 | `/llms.txt` | Curated LLM-readable site and action map. |
 | `/robots.txt` | Crawler policy with pointers to discovery files. |
 | `/sitemap.xml` | Public crawlable URL inventory. |
 
 The current crate generates static metadata for these surfaces. Runtime
-integration will decide how each file or endpoint is served.
+integration will decide how each file or endpoint is served; the live MCP
+transport, OAuth endpoints, and receipt persistence are not advertised until
+they exist.
 
 ## Safety Model
 

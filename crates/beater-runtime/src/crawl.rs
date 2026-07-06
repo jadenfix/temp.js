@@ -73,6 +73,7 @@ pub fn llms_txt(
     app_name: &str,
     base_url: &str,
     routes: &[(String, Option<RouteMeta>)],
+    actions: &[crate::mcp::RouteActionTool],
     agents: &[String],
     mcp_access: &crate::mcp::AccessConfig,
 ) -> String {
@@ -83,12 +84,33 @@ pub fn llms_txt(
             Some(m) if !m.crawl => continue,
             Some(m) => {
                 let title = m.title.clone().unwrap_or_else(|| pattern.clone());
+                let href = markdown_link_destination(&format!("{base_url}{pattern}"));
+                let title = markdown_link_text(&title);
                 match &m.description {
-                    Some(d) => out.push_str(&format!("- [{title}]({base_url}{pattern}): {d}\n")),
-                    None => out.push_str(&format!("- [{title}]({base_url}{pattern})\n")),
+                    Some(d) => out.push_str(&format!("- [{title}]({href}): {d}\n")),
+                    None => out.push_str(&format!("- [{title}]({href})\n")),
                 }
             }
-            None => out.push_str(&format!("- [{pattern}]({base_url}{pattern})\n")),
+            None => {
+                let href = markdown_link_destination(&format!("{base_url}{pattern}"));
+                let title = markdown_link_text(pattern);
+                out.push_str(&format!("- [{title}]({href})\n"));
+            }
+        }
+    }
+    if !actions.is_empty() {
+        out.push_str("\n## Actions\n\n");
+        for action in actions {
+            let href = markdown_link_destination(&format!("{}{}", base_url, action.path));
+            let name = markdown_link_text(&action.name);
+            out.push_str(&format!(
+                "- [{name}]({href}): {} ({} {}; confirm: {}; idempotency: {})\n",
+                action.description,
+                action.method,
+                action.side_effect,
+                action.confirm,
+                action.idempotency_required
+            ));
         }
     }
     if !agents.is_empty() {
@@ -113,6 +135,7 @@ pub fn well_known(
     app_name: &str,
     base_url: &str,
     agents: &[String],
+    actions: &[crate::mcp::RouteActionTool],
     mcp_access: &crate::mcp::AccessConfig,
 ) -> serde_json::Value {
     let auth = if mcp_access.auth_required() {
@@ -133,9 +156,74 @@ pub fn well_known(
                 "loopbackOrigins": true,
             },
         },
+        "openapi": format!("{base_url}/openapi.json"),
         "sitemap": format!("{base_url}/sitemap.xml"),
         "llms": format!("{base_url}/llms.txt"),
         "agents": agents,
+        "actions": actions.iter().map(|action| {
+            json!({
+                "name": action.name,
+                "description": action.description,
+                "method": action.method,
+                "path": action.path,
+                "sideEffect": action.side_effect,
+                "confirm": action.confirm,
+                "dryRun": action.dry_run,
+                "idempotencyRequired": action.idempotency_required,
+                "auth": action.auth,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+pub fn openapi_json(
+    app_name: &str,
+    base_url: &str,
+    actions: &[crate::mcp::RouteActionTool],
+) -> serde_json::Value {
+    let mut paths = serde_json::Map::new();
+    for action in actions {
+        let method = action.method.to_ascii_lowercase();
+        let operation = json!({
+            "operationId": action.name,
+            "summary": action.name,
+            "description": action.description,
+            "security": [],
+            "x-beater-action": {
+                "sideEffect": action.side_effect,
+                "confirm": action.confirm,
+                "dryRun": action.dry_run,
+                "idempotencyRequired": action.idempotency_required,
+                "auth": action.auth,
+            },
+            "requestBody": {
+                "required": true,
+                "content": {
+                    "application/json": {
+                        "schema": action.input_schema,
+                    }
+                }
+            },
+            "responses": {
+                "200": {"description": "Action result"}
+            }
+        });
+        let entry = paths
+            .entry(action.path.clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let serde_json::Value::Object(path_item) = entry {
+            path_item.insert(method, operation);
+        }
+    }
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": app_name,
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "servers": [{"url": base_url}],
+        "paths": paths,
+        "components": {"securitySchemes": {}},
     })
 }
 
@@ -154,6 +242,26 @@ fn escape_xml_text(value: &str) -> String {
     out
 }
 
+fn markdown_link_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn markdown_link_destination(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            ' ' => out.push_str("%20"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,7 +272,30 @@ mod tests {
             title: None,
             description: None,
             crawl,
+            actions: Vec::new(),
         })
+    }
+
+    fn action() -> crate::mcp::RouteActionTool {
+        crate::mcp::RouteActionTool {
+            name: "hello.contact".to_string(),
+            description: "Send a contact request.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string"},
+                    "confirm": {"type": "boolean"},
+                },
+                "required": ["email", "confirm"],
+            }),
+            method: "POST".to_string(),
+            path: "/api/actions/contact".to_string(),
+            side_effect: "write".to_string(),
+            confirm: true,
+            dry_run: false,
+            idempotency_required: true,
+            auth: serde_json::json!({"type": "public"}),
+        }
     }
 
     #[test]
@@ -187,10 +318,51 @@ mod tests {
     }
 
     #[test]
+    fn llms_txt_escapes_markdown_link_text_and_destination() {
+        let llms = llms_txt(
+            "hello",
+            "https://example.test/root",
+            &[(
+                "/docs/(draft)".to_string(),
+                Some(RouteMeta {
+                    title: Some("Docs [draft]".to_string()),
+                    description: None,
+                    crawl: true,
+                    actions: Vec::new(),
+                }),
+            )],
+            &[],
+            &[],
+            &crate::mcp::AccessConfig::default(),
+        );
+
+        assert!(llms.contains("- [Docs \\[draft\\]](https://example.test/root/docs/%28draft%29)"));
+    }
+
+    #[test]
+    fn llms_txt_includes_route_actions() {
+        let llms = llms_txt(
+            "hello",
+            "https://example.test",
+            &[],
+            &[action()],
+            &[],
+            &crate::mcp::AccessConfig::default(),
+        );
+
+        assert!(llms.contains("## Actions"), "{llms}");
+        assert!(
+            llms.contains("- [hello.contact](https://example.test/api/actions/contact): Send a contact request. (POST write; confirm: true; idempotency: true)"),
+            "{llms}"
+        );
+    }
+
+    #[test]
     fn well_known_does_not_disclose_trusted_origins() {
         let manifest = well_known(
             "hello",
             "https://hello.example.test",
+            &[],
             &[],
             &crate::mcp::AccessConfig::new(
                 Some("test-secret".to_string()),
@@ -206,6 +378,51 @@ mod tests {
                 .is_some_and(|policy| !policy.contains_key("trustedOrigins"))
         );
         assert!(!manifest.to_string().contains("https://ops.example.test"));
+    }
+
+    #[test]
+    fn well_known_includes_openapi_and_route_actions() {
+        let manifest = well_known(
+            "hello",
+            "https://example.test",
+            &["support".to_string()],
+            &[action()],
+            &crate::mcp::AccessConfig::default(),
+        );
+
+        assert_eq!(manifest["openapi"], "https://example.test/openapi.json");
+        assert_eq!(manifest["actions"][0]["name"], "hello.contact");
+        assert_eq!(manifest["actions"][0]["path"], "/api/actions/contact");
+        assert_eq!(manifest["actions"][0]["idempotencyRequired"], true);
+        assert_eq!(manifest["actions"][0]["auth"]["type"], "public");
+    }
+
+    #[test]
+    fn openapi_json_groups_route_actions_by_path() {
+        let mut delete = action();
+        delete.name = "hello.contact.delete".to_string();
+        delete.method = "DELETE".to_string();
+        let openapi = openapi_json("hello", "https://example.test", &[action(), delete]);
+
+        assert_eq!(openapi["openapi"], "3.1.0");
+        assert_eq!(openapi["servers"][0]["url"], "https://example.test");
+        assert_eq!(
+            openapi["paths"]["/api/actions/contact"]["post"]["operationId"],
+            "hello.contact"
+        );
+        assert_eq!(
+            openapi["paths"]["/api/actions/contact"]["delete"]["operationId"],
+            "hello.contact.delete"
+        );
+        assert_eq!(
+            openapi["paths"]["/api/actions/contact"]["post"]["x-beater-action"]["idempotencyRequired"],
+            true
+        );
+        assert_eq!(
+            openapi["paths"]["/api/actions/contact"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["required"][0],
+            "email"
+        );
     }
 
     #[test]

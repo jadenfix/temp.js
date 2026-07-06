@@ -4,21 +4,22 @@ beater.js is pre-alpha. The current runtime is optimized for a correct vertical 
 
 ## Current Concurrency Model
 
-`beater dev` accepts concurrent HTTP connections through axum, but all user JS/TS route work is sent to one V8 worker isolate over a channel. That means route handlers and React SSR render work are serialized today.
+`beater dev` accepts concurrent HTTP connections through axum. By default, user JS/TS route work is sent to one V8 worker isolate over a channel, so route handlers and React SSR render work serialize. Setting `[app].workers = N` starts N route isolates and round-robins route work across them.
 
 What is concurrent today:
 
 - the Rust HTTP server can accept multiple client connections
 - non-JS control surfaces such as simple error responses do not need the route isolate
+- JS/TS routes can run on separate isolates when `[app].workers` is greater than 1
 - Python tool execution is offloaded away from the async runtime
 - agent run durability lives in Rust and is not reset by JS hot reload
 
 What is not concurrent today:
 
-- multiple JS/TS route handlers do not execute in parallel
-- multiple React SSR renders do not execute in parallel
+- with `workers = 1`, multiple JS/TS route handlers do not execute in parallel
+- with `workers = 1`, multiple React SSR renders do not execute in parallel
 - one `beater dev` process serves one app directory
-- hot reload swaps the single worker isolate, not a pool
+- hot reload swaps the whole worker pool; in-flight streams on the old pool are aborted rather than silently truncated
 
 ## Operational Guidance
 
@@ -31,12 +32,9 @@ For v0.1, treat `beater dev` as a local development server and remote-management
 
 ## Planned Fix
 
-The channel protocol between the host and the JS worker is already shaped for an isolate pool. The production path is:
+The channel protocol between the host and JS workers now supports an isolate pool. `scripts/isolate-pool-scaling-gate.cjs` is the local load gate: on this 10-core machine it measured 103.53 rps with one worker and 792.10 rps with ten workers, a 7.65x improvement against the 6.0x threshold.
 
-- start N V8 worker threads per app
-- dispatch route requests across the pool
-- keep hot reload correct by swapping the whole pool
-- preserve route metadata extraction for crawl surfaces
-- prove scaling with a load test that shows near-linear improvement up to core count
+- tune worker-count guidance for CPU count and memory use
+- preserve route metadata extraction and stream cancellation as the pool grows
 
-The Phase C acceptance criterion remains: `wrk` or an equivalent load test shows near-linear route throughput scaling to core count.
+The Phase C acceptance criterion for route throughput scaling is covered by that equivalent load test.

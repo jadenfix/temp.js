@@ -22,6 +22,7 @@ pub struct RunRow {
     pub input: String,
     #[allow(dead_code)]
     pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,16 @@ pub struct StepRow {
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
     pub attempt: i64,
+}
+
+#[derive(Debug)]
+pub struct StepPartialRow {
+    pub seq: i64,
+    pub ordinal: i64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    #[allow(dead_code)]
+    pub created_at: i64,
 }
 
 fn now() -> i64 {
@@ -68,7 +79,15 @@ impl Journal {
                tool_name TEXT, tool_use_id TEXT,
                attempt INTEGER NOT NULL DEFAULT 1,
                started_at INTEGER NOT NULL, finished_at INTEGER,
-               PRIMARY KEY(run_id, seq));",
+               PRIMARY KEY(run_id, seq));
+             CREATE TABLE IF NOT EXISTS step_partials(
+               run_id TEXT NOT NULL, seq INTEGER NOT NULL,
+               ordinal INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               payload TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               PRIMARY KEY(run_id, seq, ordinal),
+               FOREIGN KEY(run_id, seq) REFERENCES steps(run_id, seq));",
         )?;
         Ok(Self { conn })
     }
@@ -93,7 +112,7 @@ impl Journal {
     pub fn run(&self, id: &str) -> Result<RunRow> {
         self.conn
             .query_row(
-                "SELECT id, agent, status, input, created_at FROM runs WHERE id = ?1",
+                "SELECT id, agent, status, input, created_at, updated_at FROM runs WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(RunRow {
@@ -102,6 +121,7 @@ impl Journal {
                         status: r.get(2)?,
                         input: r.get(3)?,
                         created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
                     })
                 },
             )
@@ -111,7 +131,7 @@ impl Journal {
 
     pub fn list_runs(&self) -> Result<Vec<(RunRow, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.agent, r.status, r.input, r.created_at,
+            "SELECT r.id, r.agent, r.status, r.input, r.created_at, r.updated_at,
                     (SELECT COUNT(*) FROM steps s WHERE s.run_id = r.id)
              FROM runs r ORDER BY r.created_at DESC",
         )?;
@@ -124,8 +144,9 @@ impl Journal {
                         status: r.get(2)?,
                         input: r.get(3)?,
                         created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
                     },
-                    r.get(5)?,
+                    r.get(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -180,6 +201,29 @@ impl Journal {
         Ok(())
     }
 
+    pub fn append_step_partial(
+        &self,
+        run_id: &str,
+        seq: i64,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1
+             FROM step_partials WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, seq],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO step_partials(run_id, seq, ordinal, kind, payload, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run_id, seq, ordinal, kind, payload.to_string(), now()],
+        )?;
+        tx.commit()?;
+        Ok(ordinal)
+    }
+
     pub fn steps(&self, run_id: &str) -> Result<Vec<StepRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, kind, status, request, result, tool_name, tool_use_id, attempt
@@ -214,6 +258,35 @@ impl Journal {
                     })
                 },
             )
+            .collect()
+    }
+
+    pub fn step_partials(&self, run_id: &str, seq: i64) -> Result<Vec<StepPartialRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ordinal, kind, payload, created_at
+             FROM step_partials WHERE run_id = ?1 AND seq = ?2 ORDER BY ordinal",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id, seq], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(seq, ordinal, kind, payload, created_at)| {
+                Ok(StepPartialRow {
+                    seq,
+                    ordinal,
+                    kind,
+                    payload: serde_json::from_str(&payload)?,
+                    created_at,
+                })
+            })
             .collect()
     }
 }
@@ -301,6 +374,62 @@ mod tests {
         assert_eq!(steps[1].tool_use_id.as_deref(), Some("toolu_1"));
         assert_eq!(steps[1].attempt, 2);
         assert_eq!(steps[1].result.as_ref().unwrap()["error"], "boom");
+    }
+
+    #[test]
+    fn records_step_partials_before_final_result() {
+        let app = TempDir::new("partials");
+        let journal = Journal::open(app.path()).unwrap();
+        journal.create_run("run-1", "support", "stream").unwrap();
+        let seq = journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+
+        let first = journal
+            .append_step_partial("run-1", seq, "text_delta", &json!({"text": "hel"}))
+            .unwrap();
+        let second = journal
+            .append_step_partial("run-1", seq, "text_delta", &json!({"text": "lo"}))
+            .unwrap();
+        assert_eq!((first, second), (1, 2));
+
+        let before_complete = Journal::open(app.path())
+            .unwrap()
+            .step_partials("run-1", seq)
+            .unwrap();
+        assert_eq!(before_complete.len(), 2);
+        assert_eq!(before_complete[0].seq, seq);
+        assert_eq!(before_complete[0].ordinal, 1);
+        assert_eq!(before_complete[0].kind, "text_delta");
+        assert_eq!(before_complete[0].payload["text"], "hel");
+        assert_eq!(before_complete[1].ordinal, 2);
+        assert_eq!(before_complete[1].payload["text"], "lo");
+
+        journal
+            .complete_step(
+                "run-1",
+                seq,
+                &json!({
+                    "content": [{"type": "text", "text": "hello"}],
+                    "stop_reason": "end_turn"
+                }),
+            )
+            .unwrap();
+
+        let after_complete = Journal::open(app.path())
+            .unwrap()
+            .step_partials("run-1", seq)
+            .unwrap();
+        assert_eq!(after_complete.len(), 2);
+        assert_eq!(after_complete[0].payload["text"], "hel");
+        assert_eq!(after_complete[1].payload["text"], "lo");
     }
 
     #[test]

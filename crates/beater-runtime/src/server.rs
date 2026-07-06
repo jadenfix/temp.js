@@ -2,25 +2,25 @@
 //! notify-based hot reload, plus the agent surfaces — /mcp and the
 //! generated crawl layer (robots.txt, sitemap.xml, llms.txt, .well-known).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use axum::middleware;
 use axum::routing::{Router, get, post};
-use beater_agent::BeatboxConfig;
-use beater_agent::ToolRegistry;
+use beater_agent::{BeatboxConfig, Journal, ToolCallContext, ToolRegistry};
 use bytes::Bytes;
 use futures_util::{Stream, stream};
 use serde_json::json;
@@ -30,11 +30,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::AppConfig;
 use crate::loader;
 use crate::router::{RouteKind, RouteTable, Segment};
-use crate::worker::{self, RouteBody, RouteMeta, WorkerMsg};
+use crate::worker::{self, RouteActionMeta, RouteBody, RouteMeta, WorkerMsg};
 use crate::{crawl, mcp};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const AGENT_RUN_HISTORY_LIMIT: usize = 50;
 const CLIENT_MODULE_PREFIX: &str = "/_beater/client/";
 const RSC_FLIGHT_PREFIX: &str = "/_beater/rsc/";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -42,12 +43,14 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 struct DevState {
     routes: Arc<RwLock<RouteTable>>,
-    worker_tx: Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    worker_txs: Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+    next_worker: Arc<AtomicUsize>,
     agent_surfaces: Arc<RwLock<AgentSurfaces>>,
     app_name: String,
     base_url: String,
     mcp_access: mcp::AccessConfig,
     app_dir: PathBuf,
+    worker_count: usize,
 }
 
 #[derive(Clone)]
@@ -111,15 +114,17 @@ pub async fn serve(
         );
     }
 
-    let worker = worker::spawn()?;
+    let worker_txs = spawn_worker_pool(config.workers)?;
     let state = DevState {
         routes: Arc::new(RwLock::new(table)),
-        worker_tx: Arc::new(RwLock::new(worker.tx)),
+        worker_txs: Arc::new(RwLock::new(worker_txs)),
+        next_worker: Arc::new(AtomicUsize::new(0)),
         agent_surfaces: Arc::new(RwLock::new(AgentSurfaces::new(registry, agents))),
         app_name: config.name.clone(),
         base_url,
         mcp_access,
         app_dir: config.app_dir.clone(),
+        worker_count: config.workers,
     };
 
     spawn_reloader(
@@ -139,7 +144,14 @@ pub async fn serve(
         .route("/robots.txt", get(handle_robots))
         .route("/sitemap.xml", get(handle_sitemap))
         .route("/llms.txt", get(handle_llms))
+        .route("/openapi.json", get(handle_openapi))
         .route("/.well-known/beater.json", get(handle_well_known))
+        .route("/_beater/agent/runs", get(handle_agent_runs))
+        .route("/_beater/agent/runs/{run_id}", get(handle_agent_run))
+        .route(
+            "/_beater/agent/runs/{run_id}/events",
+            get(handle_agent_run_events),
+        )
         .fallback(handle)
         .layer(middleware::map_response(with_route_security_headers))
         .with_state(state);
@@ -198,7 +210,9 @@ fn spawn_reloader(app_dir: PathBuf, beatbox: BeatboxConfig, state: DevState) {
             tracing::error!("watch {}: {e}", watch_dir.display());
         }
         // keep the watcher alive forever; the dev process owns its lifetime
-        std::thread::park();
+        loop {
+            std::thread::park();
+        }
     });
 
     tokio::spawn(async move {
@@ -207,10 +221,13 @@ fn spawn_reloader(app_dir: PathBuf, beatbox: BeatboxConfig, state: DevState) {
             tokio::time::sleep(Duration::from_millis(120)).await;
             while rx.try_recv().is_ok() {}
             let mut reloaded_worker = false;
-            match (RouteTable::scan(&app_dir), worker::spawn()) {
-                (Ok(table), Ok(worker)) => {
+            match (
+                RouteTable::scan(&app_dir),
+                spawn_worker_pool(state.worker_count),
+            ) {
+                (Ok(table), Ok(worker_txs)) => {
                     *state.routes.write().await = table;
-                    *state.worker_tx.write().await = worker.tx;
+                    *state.worker_txs.write().await = worker_txs;
                     reloaded_worker = true;
                 }
                 (Err(e), _) => tracing::error!("reload: route scan failed: {e:#}"),
@@ -258,12 +275,26 @@ async fn handle_mcp_post(
     body: axum::body::Bytes,
 ) -> Response<Body> {
     let surfaces = agent_surfaces(&state).await;
+    let route_actions =
+        if state.mcp_access.origin_allowed(&headers) && state.mcp_access.authorized(&headers) {
+            route_actions(&state).await
+        } else {
+            Vec::new()
+        };
+    let action_state = state.clone();
     mcp::handle_post(
         &surfaces.registry,
+        &route_actions,
         &state.mcp_access,
         &state.app_dir,
         &headers,
         &body,
+        move |action, arguments, context, payment_headers| {
+            let state = action_state.clone();
+            Box::pin(async move {
+                execute_route_action(&state, action, arguments, context, payment_headers).await
+            }) as Pin<Box<dyn Future<Output = Result<String>> + Send>>
+        },
     )
     .await
 }
@@ -303,6 +334,86 @@ async fn crawlable_routes(state: &DevState) -> Vec<(String, PathBuf, Option<Rout
     routes
 }
 
+async fn route_actions(state: &DevState) -> Vec<mcp::RouteActionTool> {
+    let targets: Vec<(String, String)> = {
+        let table = state.routes.read().await;
+        table
+            .iter()
+            .filter(|route| route.kind == RouteKind::Api)
+            .filter(|route| {
+                !route
+                    .segments
+                    .iter()
+                    .any(|segment| matches!(segment, Segment::Param(_)))
+            })
+            .filter_map(|route| {
+                let spec = deno_core::ModuleSpecifier::from_file_path(&route.file)
+                    .ok()
+                    .map(|specifier| specifier.to_string())?;
+                Some((route.pattern.clone(), spec))
+            })
+            .collect()
+    };
+    let mut actions = Vec::new();
+    for (path, specifier) in targets {
+        let Some(meta) = route_meta(state, specifier).await else {
+            continue;
+        };
+        for action in meta.actions {
+            match route_action_tool(&path, action) {
+                Some(tool)
+                    if actions
+                        .iter()
+                        .all(|existing: &mcp::RouteActionTool| existing.name != tool.name) =>
+                {
+                    actions.push(tool);
+                }
+                Some(tool) => {
+                    tracing::warn!("duplicate route action {} — keeping the first", tool.name);
+                }
+                None => {}
+            }
+        }
+    }
+    actions
+}
+
+fn route_action_tool(path: &str, action: RouteActionMeta) -> Option<mcp::RouteActionTool> {
+    let name = action.name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let method = action
+        .method
+        .unwrap_or_else(|| "POST".to_string())
+        .to_uppercase();
+    let description = action
+        .description
+        .filter(|description| !description.trim().is_empty())
+        .unwrap_or_else(|| format!("Call route action {name}."));
+    let input_schema = if action.input_schema.is_object() {
+        action.input_schema
+    } else {
+        json!({"type": "object", "properties": {}})
+    };
+    Some(mcp::RouteActionTool {
+        name: name.to_string(),
+        description,
+        input_schema,
+        method,
+        path: path.to_string(),
+        side_effect: action.side_effect.unwrap_or_else(|| "write".to_string()),
+        confirm: action.confirm,
+        dry_run: action.dry_run,
+        idempotency_required: action.idempotency_required,
+        auth: if action.auth.is_object() {
+            action.auth
+        } else {
+            json!({"type": "public"})
+        },
+    })
+}
+
 fn crawlable_route_targets(table: &RouteTable) -> Vec<(String, PathBuf, Option<String>)> {
     table
         .iter()
@@ -334,6 +445,7 @@ async fn handle_sitemap(State(state): State<DevState>) -> Response<Body> {
 
 async fn handle_llms(State(state): State<DevState>) -> Response<Body> {
     let surfaces = agent_surfaces(&state).await;
+    let actions = route_actions(&state).await;
     let routes: Vec<(String, Option<RouteMeta>)> = crawlable_routes(&state)
         .await
         .into_iter()
@@ -345,18 +457,31 @@ async fn handle_llms(State(state): State<DevState>) -> Response<Body> {
             &state.app_name,
             &state.base_url,
             &routes,
+            &actions,
             &surfaces.agents,
             &state.mcp_access,
         ),
     )
 }
 
+async fn handle_openapi(State(state): State<DevState>) -> Response<Body> {
+    let actions = route_actions(&state).await;
+    let openapi = crawl::openapi_json(&state.app_name, &state.base_url, &actions);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(openapi.to_string()))
+        .expect("static response")
+}
+
 async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
     let surfaces = agent_surfaces(&state).await;
+    let actions = route_actions(&state).await;
     let manifest = crawl::well_known(
         &state.app_name,
         &state.base_url,
         &surfaces.agents,
+        &actions,
         &state.mcp_access,
     );
     Response::builder()
@@ -366,6 +491,248 @@ async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
         .expect("static response")
 }
 
+async fn handle_agent_runs(State(state): State<DevState>, headers: HeaderMap) -> Response<Body> {
+    if let Some(response) = authorize_agent_run_surface(&state, &headers) {
+        return response;
+    }
+    let journal = match Journal::open(&state.app_dir) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("journal unavailable: {error:#}"),
+            );
+        }
+    };
+    match journal.list_runs() {
+        Ok(runs) => json_response(
+            StatusCode::OK,
+            json!({
+                "limit": AGENT_RUN_HISTORY_LIMIT,
+                "runs": runs.into_iter().take(AGENT_RUN_HISTORY_LIMIT).map(|(run, steps)| {
+                    json!({
+                        "id": run.id,
+                        "agent": run.agent,
+                        "status": run.status,
+                        "input": run.input,
+                        "created_at": run.created_at,
+                        "updated_at": run.updated_at,
+                        "steps": steps,
+                    })
+                }).collect::<Vec<_>>()
+            }),
+        ),
+        Err(error) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("journal unavailable: {error:#}"),
+        ),
+    }
+}
+
+async fn handle_agent_run(
+    State(state): State<DevState>,
+    AxumPath(run_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Some(response) = authorize_agent_run_surface(&state, &headers) {
+        return response;
+    }
+    let journal = match Journal::open(&state.app_dir) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("journal unavailable: {error:#}"),
+            );
+        }
+    };
+    let run = match journal.run(&run_id) {
+        Ok(run) => run,
+        Err(_) => return text_response(StatusCode::NOT_FOUND, "run not found".to_string()),
+    };
+    let steps = match journal.steps(&run_id) {
+        Ok(steps) => steps,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("journal unavailable: {error:#}"),
+            );
+        }
+    };
+    let mut step_values = Vec::with_capacity(steps.len());
+    for step in steps {
+        let partials = match journal.step_partials(&run_id, step.seq) {
+            Ok(partials) => partials,
+            Err(error) => {
+                return text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("journal unavailable: {error:#}"),
+                );
+            }
+        };
+        step_values.push(json!({
+            "seq": step.seq,
+            "kind": step.kind,
+            "status": step.status,
+            "request": step.request,
+            "result": step.result,
+            "tool_name": step.tool_name,
+            "tool_use_id": step.tool_use_id,
+            "attempt": step.attempt,
+            "partials": partials.len(),
+        }));
+    }
+    json_response(
+        StatusCode::OK,
+        json!({
+            "run": {
+                "id": run.id,
+                "agent": run.agent,
+                "status": run.status,
+                "input": run.input,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+            },
+            "steps": step_values,
+        }),
+    )
+}
+
+async fn handle_agent_run_events(
+    State(state): State<DevState>,
+    AxumPath(run_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Some(response) = authorize_agent_run_surface(&state, &headers) {
+        return response;
+    }
+    match Journal::open(&state.app_dir).and_then(|journal| journal.run(&run_id).map(|_| ())) {
+        Ok(()) => {}
+        Err(_) => return text_response(StatusCode::NOT_FOUND, "run not found".to_string()),
+    }
+
+    let stream = stream::unfold(
+        RunEventStreamState::new(state.app_dir.clone(), run_id),
+        next_run_event,
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream; charset=utf-8")
+        .header("cache-control", "no-store")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream))
+        .expect("stream response")
+}
+
+fn authorize_agent_run_surface(state: &DevState, headers: &HeaderMap) -> Option<Response<Body>> {
+    if !state.mcp_access.origin_allowed(headers) {
+        return Some(text_response(
+            StatusCode::FORBIDDEN,
+            "origin not allowed".to_string(),
+        ));
+    }
+    if !state.mcp_access.authorized(headers) {
+        return Some(
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer")
+                .body(Body::from("missing or invalid bearer token"))
+                .expect("static response"),
+        );
+    }
+    None
+}
+
+struct RunEventStreamState {
+    app_dir: PathBuf,
+    run_id: String,
+    seen_ordinals: HashMap<i64, i64>,
+    pending: VecDeque<String>,
+    done: bool,
+}
+
+impl RunEventStreamState {
+    fn new(app_dir: PathBuf, run_id: String) -> Self {
+        Self {
+            app_dir,
+            run_id,
+            seen_ordinals: HashMap::new(),
+            pending: VecDeque::new(),
+            done: false,
+        }
+    }
+}
+
+async fn next_run_event(
+    mut state: RunEventStreamState,
+) -> Option<(std::result::Result<Bytes, Infallible>, RunEventStreamState)> {
+    loop {
+        if let Some(event) = state.pending.pop_front() {
+            return Some((Ok(Bytes::from(event)), state));
+        }
+        if state.done {
+            return None;
+        }
+
+        match collect_run_events(&mut state) {
+            Ok(terminal) => {
+                if terminal && state.pending.is_empty() {
+                    state.pending.push_back(sse_event(
+                        "done",
+                        &json!({"run_id": state.run_id.clone(), "status": "terminal"}),
+                    ));
+                    state.done = true;
+                }
+            }
+            Err(error) => {
+                state.pending.push_back(sse_event(
+                    "error",
+                    &json!({"run_id": state.run_id.clone(), "error": format!("{error:#}")}),
+                ));
+                state.done = true;
+            }
+        }
+        if state.pending.is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+fn collect_run_events(state: &mut RunEventStreamState) -> Result<bool> {
+    let journal = Journal::open(&state.app_dir)?;
+    let run = journal.run(&state.run_id)?;
+    for step in journal.steps(&state.run_id)? {
+        if step.kind != "llm_call" {
+            continue;
+        }
+        let last_seen = state.seen_ordinals.entry(step.seq).or_insert(0);
+        for partial in journal.step_partials(&state.run_id, step.seq)? {
+            if partial.ordinal <= *last_seen {
+                continue;
+            }
+            *last_seen = partial.ordinal;
+            state.pending.push_back(sse_event(
+                "llm_partial",
+                &json!({
+                    "run_id": state.run_id.clone(),
+                    "seq": partial.seq,
+                    "ordinal": partial.ordinal,
+                    "kind": partial.kind,
+                    "payload": partial.payload,
+                }),
+            ));
+        }
+    }
+    Ok(matches!(
+        run.status.as_str(),
+        "completed" | "failed" | "needs_review"
+    ))
+}
+
+fn sse_event(event: &str, data: &serde_json::Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
 async fn agent_surfaces(state: &DevState) -> AgentSurfaces {
     state.agent_surfaces.read().await.clone()
 }
@@ -373,13 +740,11 @@ async fn agent_surfaces(state: &DevState) -> AgentSurfaces {
 async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
     let (reply_tx, reply_rx) = oneshot::channel();
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        send_worker_msg(
-            &state.worker_tx,
-            WorkerMsg::RouteMeta {
-                specifier,
-                reply: reply_tx,
-            },
-        )
+        let tx = first_worker_tx(&state.worker_txs).await;
+        tx.send(WorkerMsg::RouteMeta {
+            specifier,
+            reply: reply_tx,
+        })
         .await
         .ok()?;
         reply_rx.await.ok()
@@ -396,18 +761,144 @@ async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
     }
 }
 
+async fn execute_route_action(
+    state: &DevState,
+    action: mcp::RouteActionTool,
+    arguments: serde_json::Value,
+    context: ToolCallContext,
+    payment_headers: mcp::PaymentHeaders,
+) -> Result<String> {
+    if action.confirm && arguments.get("confirm").and_then(|value| value.as_bool()) != Some(true) {
+        anyhow::bail!("route action {} requires confirm: true", action.name);
+    }
+    if action.idempotency_required && context.idempotency_key.is_none() {
+        anyhow::bail!("route action {} requires an idempotency key", action.name);
+    }
+    let (specifier, kind) = {
+        let table = state.routes.read().await;
+        match table.match_path(&action.path) {
+            Some((route, _)) => {
+                let spec = deno_core::ModuleSpecifier::from_file_path(&route.file)
+                    .map_err(|_| anyhow::anyhow!("bad route path {}", route.file.display()))?;
+                (spec.to_string(), route.kind)
+            }
+            None => anyhow::bail!(
+                "route action {} path {} is not routed",
+                action.name,
+                action.path
+            ),
+        }
+    };
+    if kind != RouteKind::Api {
+        anyhow::bail!("route action {} must target an API route", action.name);
+    }
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept".to_string(), "application/json".to_string());
+    headers.insert("x-beater-action".to_string(), action.name.clone());
+    if let Some(tool_use_id) = &context.tool_use_id {
+        headers.insert("x-beater-tool-use-id".to_string(), tool_use_id.clone());
+    }
+    if let Some(idempotency_key) = &context.idempotency_key {
+        headers.insert("idempotency-key".to_string(), idempotency_key.clone());
+    }
+    payment_headers.insert_into(&mut headers);
+    let request_json = json!({
+        "id": NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string(),
+        "method": action.method.clone(),
+        "path": action.path,
+        "params": {},
+        "query": {},
+        "headers": headers,
+        "body": serde_json::to_string(&arguments)?,
+    })
+    .to_string();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let msg = WorkerMsg::Route {
+        specifier,
+        method: action.method.clone(),
+        request_json,
+        page: false,
+        reply: reply_tx,
+    };
+    let tx = clone_worker_tx(&state.worker_txs, &state.next_worker).await;
+    let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        tx.send(msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("js worker is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("js worker dropped the route action request"))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("route action timed out after {REQUEST_TIMEOUT:?}"))??;
+    let response = result.map_err(|stack| anyhow::anyhow!(stack))?;
+    if !(200..300).contains(&response.status) {
+        anyhow::bail!(
+            "route action returned HTTP {}: {}",
+            response.status,
+            route_body_preview(&response.body)
+        );
+    }
+    route_body_string(response.body)
+}
+
+fn route_body_preview(body: &RouteBody) -> String {
+    match body {
+        RouteBody::Full(body) => body.clone(),
+        RouteBody::Chunks(chunks) => chunks.join(""),
+        RouteBody::Stream { .. } => "<stream body>".to_string(),
+    }
+}
+
+fn route_body_string(body: RouteBody) -> Result<String> {
+    match body {
+        RouteBody::Full(body) => Ok(body),
+        RouteBody::Chunks(chunks) => Ok(chunks.join("")),
+        RouteBody::Stream { .. } => {
+            anyhow::bail!("route actions must return a finite body, not a stream")
+        }
+    }
+}
+
+#[cfg(test)]
 async fn send_worker_msg(
-    worker_tx: &Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    worker_txs: &Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+    next_worker: &AtomicUsize,
     msg: WorkerMsg,
 ) -> std::result::Result<(), mpsc::error::SendError<WorkerMsg>> {
-    let tx = clone_worker_tx(worker_tx).await;
+    let tx = clone_worker_tx(worker_txs, next_worker).await;
     tx.send(msg).await
 }
 
 async fn clone_worker_tx(
-    worker_tx: &Arc<RwLock<mpsc::Sender<WorkerMsg>>>,
+    worker_txs: &Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+    next_worker: &AtomicUsize,
 ) -> mpsc::Sender<WorkerMsg> {
-    worker_tx.read().await.clone()
+    let worker_txs = worker_txs.read().await;
+    assert!(!worker_txs.is_empty(), "worker pool should never be empty");
+    let index = next_worker.fetch_add(1, Ordering::Relaxed) % worker_txs.len();
+    worker_txs[index].clone()
+}
+
+async fn first_worker_tx(
+    worker_txs: &Arc<RwLock<Vec<mpsc::Sender<WorkerMsg>>>>,
+) -> mpsc::Sender<WorkerMsg> {
+    let worker_txs = worker_txs.read().await;
+    assert!(!worker_txs.is_empty(), "worker pool should never be empty");
+    worker_txs[0].clone()
+}
+
+fn spawn_worker_pool(count: usize) -> Result<Vec<mpsc::Sender<WorkerMsg>>> {
+    let count = count.max(1);
+    let mut workers = Vec::with_capacity(count);
+    for index in 0..count {
+        let worker = worker::spawn().with_context(|| format!("spawn js worker {index}"))?;
+        workers.push(worker.tx);
+    }
+    tracing::info!("started {count} js worker isolate(s)");
+    Ok(workers)
 }
 
 // ---- route dispatch ---------------------------------------------------------
@@ -461,9 +952,9 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
 
     let page = kind == RouteKind::Page;
     if page && method != "GET" && method != "HEAD" {
-        return Ok(text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "page routes are GET-only".to_string(),
+        return Ok(method_not_allowed_response(
+            "GET, HEAD",
+            "page routes are GET-only",
         ));
     }
     let headers: HashMap<String, String> = req
@@ -476,11 +967,28 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
             )
         })
         .collect();
-    let body_bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await?;
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!("request body rejected: {e}");
+            return Ok(text_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeded the 8 MiB limit".to_string(),
+            ));
+        }
+    };
     let body = if body_bytes.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::Value::String(String::from_utf8_lossy(&body_bytes).into_owned())
+        match String::from_utf8(body_bytes.to_vec()) {
+            Ok(body) => serde_json::Value::String(body),
+            Err(_) => {
+                return Ok(text_response(
+                    StatusCode::BAD_REQUEST,
+                    "request body must be valid UTF-8".to_string(),
+                ));
+            }
+        }
     };
 
     let request_json = json!({
@@ -503,7 +1011,7 @@ async fn handle_inner(state: DevState, req: Request<Body>) -> Result<Response<Bo
         reply: reply_tx,
     };
 
-    let worker_tx = clone_worker_tx(&state.worker_tx).await;
+    let worker_tx = clone_worker_tx(&state.worker_txs, &state.next_worker).await;
     let send_tx = worker_tx.clone();
     let cancel_tx = worker_tx.downgrade();
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -588,9 +1096,9 @@ async fn rsc_flight_response(
     head: bool,
 ) -> Result<Response<Body>> {
     if method != "GET" && method != "HEAD" {
-        return Ok(text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "RSC flight streams are GET-only".to_string(),
+        return Ok(method_not_allowed_response(
+            "GET, HEAD",
+            "RSC flight streams are GET-only",
         ));
     }
 
@@ -625,7 +1133,7 @@ async fn rsc_flight_response(
     .to_string();
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let worker_tx = clone_worker_tx(&state.worker_tx).await;
+    let worker_tx = clone_worker_tx(&state.worker_txs, &state.next_worker).await;
     let send_tx = worker_tx.clone();
     let cancel_tx = worker_tx.downgrade();
     let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -652,9 +1160,9 @@ async fn rsc_flight_response(
 
 fn client_module_response(app_dir: &Path, method: &str, path: &str) -> Result<Response<Body>> {
     if method != "GET" && method != "HEAD" {
-        return Ok(text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "client modules are GET-only".to_string(),
+        return Ok(method_not_allowed_response(
+            "GET, HEAD",
+            "client modules are GET-only",
         ));
     }
 
@@ -693,11 +1201,7 @@ fn find_client_module(app_dir: &Path, route_path: &Path) -> Option<PathBuf> {
     let routes_dir = app_dir.join("app").join("routes");
     ["ts", "tsx", "js", "jsx", "mjs"]
         .into_iter()
-        .map(|ext| {
-            routes_dir
-                .join(route_path)
-                .with_extension(format!("client.{ext}"))
-        })
+        .map(|ext| route_companion_module_path(&routes_dir, route_path, "client", ext))
         .find(|path| path.is_file())
 }
 
@@ -716,20 +1220,39 @@ fn find_rsc_server_module(
     let routes_dir = app_dir.join("app").join("routes");
     ["tsx", "ts", "jsx", "js", "mjs"]
         .into_iter()
-        .map(|ext| {
-            routes_dir
-                .join(route_path)
-                .with_extension(format!("server.{ext}"))
-        })
+        .map(|ext| route_companion_module_path(&routes_dir, route_path, "server", ext))
         .find(|path| path.is_file())
 }
 
 fn has_matching_page_route(app_dir: &Path, routes: &RouteTable, route_path: &Path) -> bool {
     let routes_dir = app_dir.join("app").join("routes");
-    let candidates = ["tsx", "jsx"].map(|ext| routes_dir.join(route_path).with_extension(ext));
+    let candidates = ["tsx", "jsx"].map(|ext| route_module_path(&routes_dir, route_path, ext));
     routes
         .iter()
         .any(|route| route.kind == RouteKind::Page && candidates.contains(&route.file))
+}
+
+fn route_module_path(routes_dir: &Path, route_path: &Path, ext: &str) -> PathBuf {
+    let mut path = routes_dir.join(route_path);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension(ext);
+    };
+    path.set_file_name(format!("{name}.{ext}"));
+    path
+}
+
+fn route_companion_module_path(
+    routes_dir: &Path,
+    route_path: &Path,
+    companion: &str,
+    ext: &str,
+) -> PathBuf {
+    let mut path = routes_dir.join(route_path);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension(format!("{companion}.{ext}"));
+    };
+    path.set_file_name(format!("{name}.{companion}.{ext}"));
+    path
 }
 
 fn route_scoped_internal_path(path: &str, prefix: &str, suffix: &str) -> Option<PathBuf> {
@@ -895,28 +1418,52 @@ fn text_response(status: StatusCode, body: String) -> Response<Body> {
         .expect("static response")
 }
 
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static response")
+}
+
+fn method_not_allowed_response(allow: &'static str, body: &'static str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header("allow", allow)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(body.to_string()))
+        .expect("static response")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use axum::body::Body;
-    use axum::http::{HeaderValue, Request, Response, StatusCode};
+    use axum::extract::{Path as AxumPath, State};
+    use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
     use axum::routing::get;
     use axum::{Router, middleware};
+    use beater_agent::{Journal, ToolRegistry};
     use futures_util::StreamExt;
+    use serde_json::json;
     use tokio::sync::{RwLock, mpsc};
     use tower::ServiceExt;
 
     use super::{
-        apply_route_security_headers, cancel_on_drop_body_stream, client_module_response,
-        client_module_route_path, crawlable_route_targets, find_client_module,
-        find_rsc_server_module, route_response, route_response_body, rsc_flight_route_path,
-        secure_route_response, send_worker_msg, text_response, with_route_security_headers,
+        AgentSurfaces, DevState, apply_route_security_headers, cancel_on_drop_body_stream,
+        client_module_response, client_module_route_path, crawlable_route_targets,
+        find_client_module, find_rsc_server_module, handle_agent_run, handle_agent_run_events,
+        handle_agent_runs, method_not_allowed_response, route_response, route_response_body,
+        rsc_flight_route_path, secure_route_response, send_worker_msg, text_response,
+        with_route_security_headers,
     };
+    use crate::mcp;
     use crate::router::RouteTable;
     use crate::worker;
 
@@ -998,21 +1545,28 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(worker::WorkerMsg::CancelStream { stream_id: 1 })
             .unwrap();
-        let worker_tx = Arc::new(RwLock::new(tx));
+        let worker_txs = Arc::new(RwLock::new(vec![tx]));
+        let next_worker = Arc::new(AtomicUsize::new(0));
 
         let blocked_send = tokio::spawn({
-            let worker_tx = Arc::clone(&worker_tx);
+            let worker_txs = Arc::clone(&worker_txs);
+            let next_worker = Arc::clone(&next_worker);
             async move {
-                send_worker_msg(&worker_tx, worker::WorkerMsg::CancelStream { stream_id: 2 }).await
+                send_worker_msg(
+                    &worker_txs,
+                    &next_worker,
+                    worker::WorkerMsg::CancelStream { stream_id: 2 },
+                )
+                .await
             }
         });
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         let (replacement_tx, _replacement_rx) = mpsc::channel(1);
-        let mut guard = tokio::time::timeout(Duration::from_millis(100), worker_tx.write())
+        let mut guard = tokio::time::timeout(Duration::from_millis(100), worker_txs.write())
             .await
             .expect("blocked worker sends should not hold the reload write lock");
-        *guard = replacement_tx;
+        *guard = vec![replacement_tx];
         drop(guard);
 
         match rx
@@ -1208,6 +1762,230 @@ mod tests {
         }
     }
 
+    fn test_state(app: &TempDir, mcp_access: mcp::AccessConfig) -> DevState {
+        let (worker_tx, _worker_rx) = mpsc::channel(1);
+        DevState {
+            routes: Arc::new(RwLock::new(RouteTable::default())),
+            worker_txs: Arc::new(RwLock::new(vec![worker_tx])),
+            next_worker: Arc::new(AtomicUsize::new(0)),
+            agent_surfaces: Arc::new(RwLock::new(AgentSurfaces::new(
+                ToolRegistry::empty(),
+                Vec::new(),
+            ))),
+            app_name: "test".to_string(),
+            base_url: "http://127.0.0.1:3000".to_string(),
+            mcp_access,
+            app_dir: app.path().to_path_buf(),
+            worker_count: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_run_events_replays_journaled_llm_partials_and_closes_terminal_run() {
+        let app = TempDir::new("agent-run-events");
+        let journal = Journal::open(app.path()).unwrap();
+        journal.create_run("run-1", "support", "hello").unwrap();
+        let seq = journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({"messages": [{"role": "user", "content": "hello"}]}),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        journal
+            .append_step_partial(
+                "run-1",
+                seq,
+                "content_block_delta",
+                &json!({
+                    "event": "content_block_delta",
+                    "data": {"delta": {"type": "text_delta", "text": "hel"}}
+                }),
+            )
+            .unwrap();
+        journal
+            .append_step_partial(
+                "run-1",
+                seq,
+                "content_block_delta",
+                &json!({
+                    "event": "content_block_delta",
+                    "data": {"delta": {"type": "text_delta", "text": "lo"}}
+                }),
+            )
+            .unwrap();
+        journal
+            .complete_step(
+                "run-1",
+                seq,
+                &json!({"content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn"}),
+            )
+            .unwrap();
+        journal.set_run_status("run-1", "completed").unwrap();
+
+        let response = handle_agent_run_events(
+            State(test_state(&app, mcp::AccessConfig::default())),
+            AxumPath("run-1".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/event-stream; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(body.matches("event: llm_partial").count(), 2, "{body}");
+        assert!(body.contains("\"text\":\"hel\""), "{body}");
+        assert!(body.contains("\"text\":\"lo\""), "{body}");
+        assert!(body.contains("event: done"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn agent_runs_lists_recent_journal_rows() {
+        let app = TempDir::new("agent-runs-list");
+        let journal = Journal::open(app.path()).unwrap();
+        journal.create_run("run-1", "support", "hello").unwrap();
+        let seq = journal
+            .start_step(
+                "run-1",
+                "tool_call",
+                &json!({"name": "get_time"}),
+                Some("get_time"),
+                None,
+                1,
+            )
+            .unwrap();
+        journal
+            .complete_step("run-1", seq, &json!({"ok": true}))
+            .unwrap();
+        journal.set_run_status("run-1", "completed").unwrap();
+
+        let response = handle_agent_runs(
+            State(test_state(&app, mcp::AccessConfig::default())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["limit"], super::AGENT_RUN_HISTORY_LIMIT);
+        assert_eq!(body["runs"][0]["id"], "run-1");
+        assert_eq!(body["runs"][0]["agent"], "support");
+        assert_eq!(body["runs"][0]["status"], "completed");
+        assert_eq!(body["runs"][0]["steps"], 1);
+    }
+
+    #[tokio::test]
+    async fn agent_runs_caps_history_response() {
+        let app = TempDir::new("agent-runs-cap");
+        let journal = Journal::open(app.path()).unwrap();
+        for index in 0..(super::AGENT_RUN_HISTORY_LIMIT + 5) {
+            journal
+                .create_run(&format!("run-{index}"), "support", "hello")
+                .unwrap();
+        }
+
+        let response = handle_agent_runs(
+            State(test_state(&app, mcp::AccessConfig::default())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["runs"].as_array().unwrap().len(),
+            super::AGENT_RUN_HISTORY_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_run_detail_includes_steps_and_partial_counts() {
+        let app = TempDir::new("agent-run-detail");
+        let journal = Journal::open(app.path()).unwrap();
+        journal.create_run("run-1", "support", "hello").unwrap();
+        let seq = journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({"messages": [{"role": "user", "content": "hello"}]}),
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+        journal
+            .append_step_partial(
+                "run-1",
+                seq,
+                "content_block_delta",
+                &json!({"data": {"delta": {"text": "hi"}}}),
+            )
+            .unwrap();
+        journal
+            .complete_step("run-1", seq, &json!({"stop_reason": "end_turn"}))
+            .unwrap();
+
+        let response = handle_agent_run(
+            State(test_state(&app, mcp::AccessConfig::default())),
+            AxumPath("run-1".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["run"]["id"], "run-1");
+        assert_eq!(body["steps"][0]["seq"], seq);
+        assert_eq!(body["steps"][0]["kind"], "llm_call");
+        assert_eq!(body["steps"][0]["attempt"], 2);
+        assert_eq!(body["steps"][0]["partials"], 1);
+    }
+
+    #[tokio::test]
+    async fn agent_run_events_requires_bearer_when_mcp_auth_is_enabled() {
+        let app = TempDir::new("agent-run-events-auth");
+        let journal = Journal::open(app.path()).unwrap();
+        journal.create_run("run-1", "support", "hello").unwrap();
+
+        let response = handle_agent_run_events(
+            State(test_state(
+                &app,
+                mcp::AccessConfig::new(Some("secret".to_string()), Vec::new()),
+            )),
+            AxumPath("run-1".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get("www-authenticate").unwrap(),
+            "Bearer"
+        );
+    }
+
     #[test]
     fn client_module_route_paths_are_normalized() {
         assert_eq!(
@@ -1250,6 +2028,23 @@ mod tests {
     }
 
     #[test]
+    fn finds_dotted_route_client_module_without_stripping_suffix() {
+        let app = TempDir::new("find-dotted");
+        app.write(
+            "app/routes/report.v2.client.ts",
+            "document.body.dataset.ready = 'true';",
+        );
+        app.write(
+            "app/routes/report.client.ts",
+            "throw new Error('wrong file');",
+        );
+
+        let found = find_client_module(app.path(), Path::new("report.v2")).unwrap();
+
+        assert_eq!(found, app.path().join("app/routes/report.v2.client.ts"));
+    }
+
+    #[test]
     fn finds_adjacent_route_server_component_module() {
         let app = TempDir::new("find-rsc");
         app.write(
@@ -1269,6 +2064,28 @@ mod tests {
             found,
             app.path().join("app/routes/dashboard/settings.server.tsx")
         );
+    }
+
+    #[test]
+    fn finds_dotted_route_server_component_module() {
+        let app = TempDir::new("find-rsc-dotted");
+        app.write(
+            "app/routes/report.v2.tsx",
+            "export default function ReportPage() {}",
+        );
+        app.write(
+            "app/routes/report.v2.server.tsx",
+            "export default function ReportFlight() {}",
+        );
+        app.write(
+            "app/routes/report.server.tsx",
+            "export default function WrongFlight() {}",
+        );
+        let table = RouteTable::scan(app.path()).unwrap();
+
+        let found = find_rsc_server_module(app.path(), &table, Path::new("report.v2")).unwrap();
+
+        assert_eq!(found, app.path().join("app/routes/report.v2.server.tsx"));
     }
 
     #[test]
@@ -1329,6 +2146,24 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("document.body.dataset.count"));
         assert!(!body.contains(": number"));
+    }
+
+    #[tokio::test]
+    async fn client_module_response_sets_allow_header_on_405() {
+        let response =
+            client_module_response(Path::new("/missing"), "POST", "/_beater/client/index.js")
+                .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get("allow").unwrap(), "GET, HEAD");
+    }
+
+    #[test]
+    fn method_not_allowed_response_sets_allow_header() {
+        let response = method_not_allowed_response("GET, HEAD", "GET-only");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get("allow").unwrap(), "GET, HEAD");
     }
 
     #[tokio::test]

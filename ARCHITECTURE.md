@@ -26,7 +26,7 @@ One Rust host process owns the event loop, the HTTP server, the agent scheduler,
 | 1 | **V8** (deno_core) | routes (TS/TSX), agent definitions, React SSR | the web's language, JIT-fast, isolate-scoped |
 | 2 | **CPython** (PyO3, embedded) | ML tools — numpy, torch, pandas work as-is | full-fat Python; wasm cannot run the ML ecosystem |
 | 3 | **Native Rust** | the agent loop itself, built-in tools, all framework machinery | performance, correctness, survives isolate reloads |
-| 4 | **Wasmtime** *(future)* | untrusted / agent-generated code | capability-scoped sandbox |
+| 4 | **Wasmtime** | untrusted / agent-generated scalar wasm code | hermetic W0 sandbox: empty imports, no filesystem, no network, no env/secrets, fuel + memory + wall limits |
 
 The agent loop deliberately lives in tier 3, not tier 1: it survives hot reloads of user code, it is journaled by construction, and it cannot be starved by user JS.
 
@@ -45,11 +45,11 @@ The agent loop deliberately lives in tier 3, not tier 1: it survives hot reloads
 | Web APIs in isolate | minimal shims: console, timers, TextEncoder, ReadableStream | route contract is plain objects, not WHATWG fetch classes (that fidelity comes with the npm-compat era). The stream shim is scoped to React SSR |
 | TS/TSX | `deno_ast` (SWC) transpile in the module loader, source maps wired into error stacks | useful errors are an acceptance criterion, not polish |
 | HTTP | axum 0.8; response bodies stream from the isolate over an mpsc channel | |
-| Threading | `JsRuntime` is `!Send` → one dedicated OS thread (current-thread tokio rt); host↔worker via mpsc | single isolate for now, so JS route work serializes; the channel protocol is already pool-shaped. See `docs/runtime-limits.md` |
+| Threading | `JsRuntime` is `!Send` → one dedicated OS thread per worker (current-thread tokio rt); host↔workers via mpsc | single worker by default; `[app].workers = N` starts a small isolate pool. See `docs/runtime-limits.md` |
 | Hot reload | `notify` watcher → drop worker thread → fresh isolate (~50–200ms) | trivially correct; agent runs are unaffected (loop lives in Rust) |
 | Python | pyo3 0.29 `auto-initialize` (Py_InitializeEx(0) — no Python signal handlers); one interpreter; every call via `spawn_blocking` + semaphore | GIL never touches the async runtime. Venv: **build-time** linking is `PYO3_PYTHON`; **runtime** packages come from `site.addsitedir(<venv>/site-packages)` with a version-match check (`beater doctor`) |
-| LLM | reqwest → Anthropic Messages API (`claude-opus-4-8`, adaptive thinking); non-streaming per step; loop on `stop_reason == "tool_use"` | each request is one journaled step |
-| Durability | rusqlite (bundled), step-lifecycle journal (§5); append committed **before** every side effect | crash-kill-9 between any two steps loses nothing |
+| LLM | reqwest → Anthropic Messages API (`claude-opus-4-8`, adaptive thinking); SSE streaming per step; loop on `stop_reason == "tool_use"` | each request is one journaled step, with stream events appended as partial-step records before final completion |
+| Durability | rusqlite (bundled), step-lifecycle journal (§5); append committed **before** every side effect; LLM stream partials committed before the final response | crash-kill-9 between any two steps loses nothing |
 | MCP | serve (not consume) the tool registry per spec **2025-11-25**, stateless | §6 |
 | Free-threaded Python | punted until ML wheels are reliable | flip pyo3 to 3.14t, replace spawn_blocking with parallel attach |
 
@@ -84,7 +84,7 @@ The tool registry is served at `POST /mcp` per spec 2025-11-25 (Streamable HTTP)
 - `GET /mcp` → 405 (we offer no server-initiated SSE stream — explicitly allowed by spec)
 - stateless: no `MCP-Session-Id` issued
 
-Consuming remote MCP servers as tool sources is a planned follow-up (the registry is impl-agnostic).
+Consuming remote MCP servers as declared tool sources is implemented through direct `tools/call`, with optional bearer auth, egress policy, retries, idempotency keys, and provider session initialization. Provider `tools/list` discovery and future MCP transport upgrades remain follow-ups.
 
 ## 6b. The Agent Access Layer (agent-ready sites by default)
 
@@ -99,8 +99,9 @@ Every other framework treats the crawl layer as hand-maintained files or plugins
 |---|---|---|
 | `/robots.txt` | crawl policy + sitemap pointer | M3 |
 | `/sitemap.xml` | route table (lastmod = file mtime) | M3 |
-| `/llms.txt` | route table + per-route `agent` metadata | M3 |
-| `/.well-known/beater.json` | manifest: MCP endpoint, sitemap, llms.txt, auth requirements | M3 |
+| `/llms.txt` | route table + per-route `agent` metadata + route actions | M3 |
+| `/.well-known/beater.json` | manifest: MCP endpoint, OpenAPI, sitemap, llms.txt, auth requirements, route actions | M3 |
+| `/openapi.json` | route action definitions | M3 |
 | markdown views (`Accept: text/markdown` / `.md`) | rendered routes | post-SSR |
 | MCP `resources/list` / `resources/read` | route table → clean markdown | post-SSR |
 | JSON-LD (schema.org) in pages | per-route `agent.schema` | later |
@@ -115,7 +116,7 @@ export const agent = {
 };
 ```
 
-The end state (post-MVP): a single `defineAction({name, input, auth, confirm, handler})` on a route exposes the same action to humans (HTML form), agents (MCP tool), APIs (OpenAPI), and crawlers (metadata) — with dry-run previews, idempotency keys, and human confirmation for destructive scopes. The journal (§5) already gives every agent-initiated action an audit trail.
+The implemented route-action slice lets a route export `agent.actions: [defineAction(...)]`; the same route can receive a human HTML form post, appear in live `/mcp tools/list`, dispatch through `/mcp tools/call` with journaled execution, confirmation checks, and idempotency keys, and publish the same action metadata through runtime `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`.
 
 ## 7. Developer experience
 
@@ -138,14 +139,15 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **Full npm ecosystem / node-compat** — server routes can import local ESM packages from `node_modules` with bare specifiers; CommonJS `require`, Node built-ins, package install/build hooks, import maps, and client-side dependency bundling remain.
 - **WHATWG fetch classes in routes** — comes with broader npm-compat.
 - **Full RSC** — the chunked isolate→host streaming plumbing, route-scoped client modules, and initial `text/x-component` flight transport are the substrate; add official React Flight client references/manifests after broader npm-compat.
-- **Wasmtime sandbox** — fourth `impl` kind in the tool registry, for untrusted/agent-generated code.
-- **C++ tools** — via `cxx` on the Rust built-in path when a real use case appears.
-- **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
-- **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. Full image building, target-OS binary selection, venv baking guarantees, and the `docker run` cold-start gate remain.
-- **Isolate pool / per-request isolation** — channel protocol already supports N workers; current serialization is documented in `docs/runtime-limits.md`.
-- **LLM streaming (SSE to browser)** — journal needs partial-step records first.
-- **MCP sessions/SSE + the 2026-07-28 spec** — adopt when released.
-- **Observability/evals** — integrate beater-agents (OTLP out of the agent loop) rather than rebuilding.
+- **Wasmtime sandbox expansion** — local `wasmtime` tools now run hermetic scalar wasm with empty imports; broader WASI/capability handles for files, sockets, and richer value passing remain future work.
+- **C++ tools** — `cpp_double` proves the `cxx` bridge on the Rust built-in path; richer C++ tool packaging remains future work.
+- **Production agentic browsing** — the registry has a mock CDP provider for contract tests and a native `playwright` provider backed by the upstream Beater browser crates; `scripts/playwright-browser-gate.cjs` proves authenticated real Chromium calls through the agent loop reuse one run-scoped session, scoped env secrets are redacted from results, and resume cleans stale browser runner markers before review/replay.
+- **defineAction runtime binding** — route modules can now export `agent.actions: [defineAction(...)]`; the hello form posts to the route handler and the same action is exposed through live MCP `tools/list` + journaled `tools/call`, runtime `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`. `beater-connect` still covers static action-doc generation; richer production API docs remain future work.
+- **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.
+- **Isolate pool production hardening / per-request isolation** — `[app].workers = N` starts N route isolates; smoke tests prove round-robin dispatch, and `scripts/isolate-pool-scaling-gate.cjs` proved 7.65x route throughput on ten local workers. Per-request isolation hardening and worker-count tuning remain production work.
+- **LLM streaming to browser** — Anthropic SSE ingestion, partial-step journal records, protected run list/detail/events endpoints under `/_beater/agent/runs`, and the hello example's recent-run EventSource panel are in place; richer production run-management UI remains.
+- **MCP discovery/SSE + the 2026-07-28 spec** — remote MCP `tools/call`, provider session initialization, and startup `tools/list` schema import via `remoteMcpProvider` are in place; adopt the next transport spec when released.
+- **Observability/evals** — an opt-in native Beater trace exporter posts finished journal runs and steps to `/v1/traces/native`; full OTLP export and dashboard proof remain future work.
 
 ## 9. Milestones
 
@@ -159,4 +161,4 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 | M5 | route-scoped client module (`/_beater/client/<route>.js`) + hydrated counter | interactivity | **done** |
 | M6 | route-scoped RSC transport (`/_beater/rsc/<route>.flight`) + browser-rendered server island | RSC substrate | transport done; official React Flight manifests pending |
 | M7 | bare ESM package imports from local `node_modules` in server routes | adoption wedge | **done** |
-| M8 | `beater build` host bundle + Docker context | deploy substrate | host bundle done; Docker cold-start gate pending |
+| M8 | `beater build` host bundle + Docker context | deploy substrate | host bundle done; Docker cold-start gate scripted but pending a passing Linux image run |

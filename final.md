@@ -69,7 +69,7 @@ The work below is not just about matching Node/Next request handling. The end st
 - [x] Add client hydration with a per-route client bundle.
 - [x] Add RSC flight protocol over the same chunk channel.
 - [x] Add npm/node-compat adoption wedge.
-- [ ] Add isolate pool behind the existing worker protocol.
+- [x] Add isolate pool behind the existing worker protocol.
 - [x] Add `beater build` runnable host-bundle foundation.
 - [ ] Prove the deploy story with a Linux container image and `docker run` cold-start gate.
 
@@ -115,6 +115,7 @@ The work below is not just about matching Node/Next request handling. The end st
 | npm/node-compat wedge | `scripts/npm-compat-gate.sh` scaffolds a temp app, installs `zod@4.4.3`, adds a route importing `import { z } from "zod"`, and verifies `/api/zod` returns the parsed payload |
 | OpenAPI path grouping | `beater-connect` tests parse generated OpenAPI and prove resources plus multiple actions sharing one path emit a single `paths` key with all methods preserved |
 | npm/node-compat wedge | `scripts/npm-compat-gate.sh` scaffolds a temp app, installs `zod@4.4.3`, adds a route importing `import { z } from "zod"`, and verifies `/api/zod` returns the parsed payload; loader unit tests cover server-side export conditions and wildcard subpath exports |
+| Playwright browser provider | `scripts/playwright-browser-gate.cjs` installs the upstream runner dependencies in a temp dir, runs a local authenticated browser fixture plus Anthropic-compatible SSE mock, drives `beater agent run` through `provider: "playwright"`, and verifies three completed Chromium tool results reused one run-scoped session in SQLite without leaking the password |
 
 ---
 
@@ -195,7 +196,7 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 
 ### Portability (currently: works on this Mac)
 - [x] **Python discovery**: `.cargo/config.toml` no longer hardcodes `PYO3_PYTHON`; README documents macOS/Linux setup; `beater doctor` reports embedded Python + venv mismatches; remote macOS/Linux CI is green.
-- [x] **Concurrency**: one isolate = JS route requests serialize; one dev server = one app. The limitation is documented prominently in README and `docs/runtime-limits.md`; the isolate pool remains Phase C work.
+- [x] **Concurrency**: one isolate by default serializes JS route requests, and `[app].workers = N` can round-robin route work across a pool; one dev server still serves one app. The default and the scaling gate are documented prominently in README and `docs/runtime-limits.md`.
 - [x] **Port/host binding**: `beater dev --host <ip>` and `[app] host = "..."`; the no-key integration test binds `0.0.0.0` and curls through localhost.
 - [x] `beater new <app>` scaffolding command (embedded hello template) — the first-five-minutes experience is tested by scaffolding and serving a generated app.
 
@@ -203,20 +204,20 @@ The MVP proves the thesis on this machine. A release requires removing the machi
 - [x] Mockable outbound LLM networking: `ANTHROPIC_BASE_URL` lets resume and integration tests run against local servers instead of live vendor APIs.
 - [x] Network bind control: `--host` / `[app] host` makes container, VM, and remote-management smoke tests possible.
 - [x] Remote-management mode: documented bearer-token auth for `/mcp`, explicit trusted-host/origin rules, browser preflight/CORS support, public base URL metadata, and a safe way to expose a dev/prod agent endpoint beyond localhost.
-- [x] Networked integration contract (v0.1 direct `tools/call`): `remote_mcp` tool sources, request timeouts/retries, bearer-secret handling, `tool_use_id` idempotency keys, review parking, and egress policy are tested against mock servers. Provider discovery and MCP sessions remain Phase C item 8.
+- [x] Networked integration contract (v0.1 direct `tools/call`): `remote_mcp` tool sources, request timeouts/retries, bearer-secret handling, `tool_use_id` idempotency keys, in-memory provider session initialization, review parking, and egress policy are tested against mock servers. Provider `tools/list` discovery remains Phase C item 8.
 - [x] Agentic browsing foundation (v0.1 mock CDP): `browserTool` provider contract, allowed-origin policy, per-tool-call mock session cleanup on success/failure/timeout, and mocked agent-loop e2e prove an agent can complete a browser task through a tool declaration. Real run-attached Playwright/CDP providers remain Phase C item 9.
 - [x] Integration registry docs: `docs/integrations.md` shows how first-party Python/Rust tools, remote MCP servers, and browser providers coexist in one agent config without queues or sidecar services.
 
 ### Security floor (currently: dev-mode assumptions everywhere)
 - [x] /mcp local-dev mode can remain unauthenticated; `BEATER_MCP_TOKEN` enables bearer auth, `BEATER_MCP_TRUSTED_ORIGINS` pins browser operators, and smoke tests prove unauthorized remote calls fail closed.
-- [x] Python tools run with full process privileges — trust model documented in `docs/security.md` (tools are first-party code until the wasm sandbox tier lands)
+- [x] Python tools run with full process privileges — trust model documented in `docs/security.md`; untrusted scalar wasm now uses the hermetic local `wasmtime` tier
 - [x] Journal stores full prompts/results in plaintext SQLite — documented in `docs/security.md`; redaction hooks remain later work
 
 ### Docs
 - [x] README quickstart actually runnable start-to-finish by a stranger (install Rust, install Python 3.11+, cargo build, `beater new`, `beater dev`)
 - [x] `docs/tools.md`: the pyTool/rustTool contract (TOOL dict, run(), idempotency rules)
 - [x] `docs/integrations.md`: one-registry contract for first-party tools, remote MCP sources, mock browser providers, production browser-provider acceptance criteria, secrets, retries, idempotency, egress, and journal audit rules
-- [x] `docs/runtime-limits.md`: current single-isolate route serialization, one-app-per-dev-server limit, operational guidance, and isolate-pool acceptance path
+- [x] `docs/runtime-limits.md`: default single-isolate route serialization, `[app].workers` pool support, one-app-per-dev-server limit, operational guidance, and the remaining scaling-proof acceptance path
 - [x] CHANGELOG + versioning policy (deno_core pin-bump cadence)
 
 ---
@@ -233,15 +234,27 @@ Phase C progress so far:
 - Route-scoped client modules can now live beside page routes as `*.client.ts` files and are served from `/_beater/client/<route>.js`; the hello page uses this to prove same-origin browser code can hydrate a counter without Node/npm. Full React hydration and bundling are still open.
 - Route-scoped server components can now live beside page routes as `*.server.tsx` files and stream `text/x-component` flight frames from `/_beater/rsc/<route>.flight`; this proves the transport and browser island path, not full official React Flight manifests.
 - Server routes can now import local ESM packages from `node_modules` with bare specifiers. This is the adoption wedge for real integrations and shared validation libraries without adding a Node sidecar; CommonJS, Node built-ins, install hooks, and client dependency bundling remain broader compatibility work.
+- `beater dev` can now start `[app].workers = N` JS isolates and round-robin route work across them; `dev_server_round_robins_js_routes_across_worker_pool` proves two workers keep separate module state. `scripts/isolate-pool-scaling-gate.cjs` proved the load path on this 10-core machine: 103.53 rps with one worker, 792.10 rps with ten workers, 7.65x against a 6.0x threshold.
 - Hot reload now aborts still-active SSR/RSC stream bodies if the old worker channel closes, so clients see a stream error instead of a cleanly truncated 200 response.
 - Worker sends now clone the current isolate channel before awaiting bounded-queue capacity, so a wedged worker cannot hold the hot-reload sender lock while the reloader tries to swap in a fresh isolate.
-- `beater build --out <dir>` now emits a runnable host-platform bundle with `bin/beater`, copied app assets, `run.sh`, `beater-build.json`, `.dockerignore`, and a non-root Dockerfile. Runtime state and common local credential files are excluded; symlinked app files and symlinked outputs are refused. `build_creates_runnable_bundle_and_refuses_unsafe_output` starts the generated launcher and hits `/api/health`; the Docker cold-start gate remains open.
+- `beater build --out <dir>` now emits a runnable host-platform bundle with `bin/beater`, copied app assets, `run.sh`, `beater-build.json`, `.dockerignore`, and a non-root Dockerfile. Runtime state and common local credential files are excluded; symlinked app files and symlinked outputs are refused. `build_creates_runnable_bundle_and_refuses_unsafe_output` starts the generated launcher and hits `/api/health`; `scripts/docker-cold-start-gate.sh` now codifies the Linux-builder plus `docker run` cold-start proof, but the gate remains open until it passes.
 - Dropping an SSR/RSC response body before it reaches EOF now sends `CancelStream` to the owning worker, so disconnected clients do not leave stalled stream state registered indefinitely.
 - SSR/RSC stream chunks now cross from the isolate to the HTTP body through a bounded async channel, the local `ReadableStream` shim exposes queue pressure through `desiredSize`, and stale timer clears no longer accumulate cancellation ids in long-lived workers.
 - Remote MCP tools now treat malformed JSON-RPC bodies after HTTP 2xx as ambiguous for non-idempotent calls, and send the journaled `ToolCallContext.idempotency_key` as the provider-facing idempotency header.
+- Remote MCP tools can now opt into provider sessions with `session: {scope: "run", cleanup: "always"}`; beater sends `initialize`, stores the returned `Mcp-Session-Id` in memory for that tool, and reuses it on later `tools/call` requests.
 - Agent resume now converts failed idempotent tool re-runs and removed-tool lookups into `is_error` tool results, while still parking genuinely non-idempotent interrupted tools for review.
 - Direct `/mcp tools/call` requests now create synthetic MCP journal runs, commit a `tool_call` started row before executing side-effecting tools, and finish the row/run as completed, failed, or `needs_review` before returning the MCP tool result.
 - Dev hot reload now refreshes the agent/tool registry and agent metadata alongside routes and the worker, preserving the last good agent snapshot if a reload-time config rebuild fails.
+- Local `wasmtime` tools now provide the fourth registry implementation kind for hermetic untrusted scalar wasm: `wasmtime_tool_runs_hermetic_wasm_function` proves execution with fuel/memory/wall limits, and `wasmtime_tool_rejects_filesystem_imports_before_execution` plus `wasmtime_policy_rejects_filesystem_mounts` prove filesystem capability denial.
+- `rustTool("cpp_double")` now calls a C++ function through `cxx` on the Rust built-in path; `cpp_builtin_executes_through_rust_tool_registry` proves schema exposure and execution through the same registry path as other host tools.
+- `remoteMcpProvider(prefix, ...)` now sends startup `initialize` + `tools/list`, imports each provider tool schema as `<prefix>.<provider tool name>`, and still executes calls through the existing remote MCP journal/retry/session path; tests cover JS serialization, schema import, and execution against the original provider tool name.
+- `beater-connect` now emits `forms.html` from the same `Action` definitions that generate OpenAPI, MCP catalog metadata, llms.txt, robots.txt, and sitemap.xml; `generated_forms_post_actions_with_mcp_semantics` proves auth, scopes, confirm, dry-run, side-effect, and idempotency semantics line up with the MCP catalog.
+- Route modules can now export `agent.actions: [defineAction(...)]`; the hello contact action proves one route handler accepts a human form POST, appears in live `/mcp tools/list` with confirm/idempotency metadata, executes through `/mcp tools/call` via the same journaled route handler path, and publishes runtime `/openapi.json`, `/llms.txt`, and well-known action metadata.
+- Agent LLM calls now use Anthropic SSE, rebuild text and tool-use responses from stream events, and append each stream event as a durable `step_partials` row before the final `llm_call` completion. Tests cover text deltas, tool-use `input_json_delta`, journal partial durability, and agent-loop partial recording.
+- `GET /_beater/agent/runs`, `GET /_beater/agent/runs/<run_id>`, and `GET /_beater/agent/runs/<run_id>/events` now expose protected run history, step summaries, and journaled LLM partials for browser run UIs, reusing the MCP origin/bearer policy and closing streams with a terminal event once the run reaches `completed`, `failed`, or `needs_review`.
+- The hello example now includes a route-scoped recent-runs EventSource panel that lists journaled runs, opens a selected run, and renders `llm_partial` events in the browser; dev smoke tests prove the panel and transpiled client code ship in both the checked-in fixture and scaffolded app.
+- Agent runs can now opt into Beater native trace export with `BEATER_TRACE_EXPORT_URL`: after run/resume, beater.js projects journal runs and steps into `agent.run`, `llm.call`, and `tool.call` spans for `/v1/traces/native`. Unit and runner integration tests cover the projection, auth header, scope fields, and tool metadata; full OTLP/dashboard proof remains.
+- `browserTool(..., {provider: "playwright"})` now reuses the pinned upstream Beater browser crates to launch Chromium through the Playwright runner, navigate to `input.url`, execute one optional browser action, reuse the browser session across calls in one run, and close sessions when the agent run or synthetic MCP run reaches a terminal state. App runs also write Playwright runner markers under `.beater/browser-sessions`, and `beater agent resume` removes stale markers and terminates marked runners for that run before replay/review. Unit tests cover provider configuration, scoped env secrets with redaction, run-scoped session reuse, stale runner cleanup, resume cleanup, action input shapes, and pre-driver origin rejection; `scripts/playwright-browser-gate.cjs` passed with an authenticated real Chromium flow through `beater agent run`, verified session reuse in SQLite, and asserted the password did not leak into journal rows.
 
 | # | Item | Done when |
 |---|---|---|
@@ -249,16 +262,16 @@ Phase C progress so far:
 | 2 | **Client hydration** — route-scoped client bundles (`/_beater/client/<route>.js`) | **done:** `/_beater/client/index.js` serves the route companion client module; the hello counter increments in the browser gate |
 | 3 | **RSC** — flight protocol over the same chunked channel | **partial:** `/_beater/rsc/index.flight` streams the hello server island and the browser gate renders it; official React Flight client references/manifests remain after npm-compat |
 | 4 | **npm/node-compat** — the adoption wedge (Deno-style compat layer, not a reimplementation) | **done for the wedge:** `import { z } from "zod"` works in a route; full CommonJS, Node built-ins, install hooks, and client bundling remain later work |
-| 5 | **Isolate pool** — N workers behind the existing channel protocol | wrk shows near-linear scaling to core count |
-| 6 | **Wasm sandbox tier** — Wasmtime as the 4th tool impl kind | an untrusted tool runs capability-scoped and cannot read the filesystem |
-| 7 | **LLM streaming** — SSE to browser + partial-step journal records | tokens stream to a page while every step stays crash-resumable |
-| 8 | **MCP consume + sessions** — use remote MCP servers as tool sources; add session/auth plumbing for remote management; adopt the next MCP spec when released | an agent uses a third-party MCP server's tool via config only, with scoped credentials and resumable error handling |
-| 9 | **Agentic browsing** — reuse beater-agents' CDP/Playwright crates as a tool provider | an agent completes a real browsing task from a pyTool-style declaration, with browser sessions cleaned up after crashes |
-| 10 | **defineAction** — one definition → HTML form + MCP tool + OpenAPI + crawler metadata (§6b end state) | a form posts for humans AND appears in tools/list with auth + confirm semantics |
-| 11 | **Deploy story** — `beater build` → single container (binary + assets + venv) | **partial:** host-platform bundle exists and is locally boot-tested through `run.sh`; done requires `docker run` of a target-OS image serving the app cold in <1s |
-| 12 | **Observability** — OTLP out of the agent loop into beater-agents | a run's trace appears in the beater-agents dashboard |
+| 5 | **Isolate pool** — N workers behind the existing channel protocol | **done:** `scripts/isolate-pool-scaling-gate.cjs` showed 7.65x route throughput on ten local workers versus one worker |
+| 6 | **Wasm sandbox tier** — Wasmtime as the 4th tool impl kind | **done for W0:** local `wasmtime` tools run hermetic scalar wasm with empty imports, no filesystem mounts, no network/env/secrets, and fuel/memory/wall limits; tests prove filesystem imports and mounts are denied |
+| 7 | **LLM streaming** — SSE to browser + partial-step journal records | **done for the first browser history surface:** Anthropic SSE ingestion, partial-step journal records, protected run list/detail/events endpoints, and the hello recent-runs EventSource panel are implemented; richer production run-management UI can build on these surfaces |
+| 8 | **MCP consume + sessions** — use remote MCP servers as tool sources; add session/auth plumbing for remote management; adopt the next MCP spec when released | **partial:** declared remote MCP tools support scoped credentials, egress, retries, idempotency keys, review parking, provider session initialization, and startup `tools/list` schema import via `remoteMcpProvider`; done requires next-spec transport adoption |
+| 9 | **Agentic browsing** — reuse beater-agents' CDP/Playwright crates as a tool provider | **done for the Playwright provider:** `provider: "playwright"` reuses the upstream Beater browser crates, `scripts/playwright-browser-gate.cjs` proves authenticated real Chromium tool calls through the agent loop with journal verification and run-scoped session reuse, scoped env secrets are redacted from result payloads, and resume cleans stale browser runner markers before replay/review |
+| 10 | **defineAction** — one definition → HTML form + MCP tool + OpenAPI + crawler metadata (§6b end state) | **done for the first route-action path:** route-bound `defineAction` now powers a human form POST, live MCP `tools/list` + journaled `tools/call`, runtime `/openapi.json`, `/llms.txt`, and well-known action metadata; `beater-connect` static `Action` definitions still emit `forms.html`, OpenAPI, MCP catalog, and crawler metadata with matching semantics |
+| 11 | **Deploy story** — `beater build` → single container (binary + assets + venv) | **partial:** host-platform bundle exists and is locally boot-tested through `run.sh`; `scripts/docker-cold-start-gate.sh` defines the target-OS image proof; done requires the gate to pass with `docker run` serving the app cold in <1s |
+| 12 | **Observability** — OTLP out of the agent loop into beater-agents | **partial:** an opt-in native Beater exporter posts finished journal runs and steps to `/v1/traces/native`; done still requires OTLP export and dashboard proof that a run trace appears in beater-agents |
 | 13 | **Free-threaded Python** — pyo3 on 3.14t once ML wheels are reliable | two Python tools execute truly in parallel under load |
-| 14 | **C++ tools** — via cxx on the Rust builtin path | a C++ function is callable as a tool with schema |
+| 14 | **C++ tools** — via cxx on the Rust builtin path | **done for the first builtin:** `rustTool("cpp_double")` exposes a schema and calls a C++ function through `cxx`; broader C++ packaging remains future work |
 
 **Definition of thesis-done:** a team can build and deploy a production app where the web UI, the agents, the browser automation, the remote integrations, and the ML tools live in one repo, run in one process, survive crashes mid-agent-loop, and are discoverable/callable by third-party AI agents — without Node, without a queue between the web and ML halves, and without a cloud lock-in. Items 1–5 + 11 are the minimum for the web-runtime replacement to be true; 6–10 + 12–14 make it an agent-native platform for remote management, networking, integrations, and browsing.
 
@@ -267,5 +280,5 @@ Phase C progress so far:
 ## TL;DR
 
 - **To be e2e done (MVP):** install `ANTHROPIC_API_KEY`, run `scripts/m2-live-gate.sh`, preserve the emitted `evidence.md` + raw logs, then flip README.md/ARCHITECTURE.md/final.md from pending to done. Everything else is already built and verified.
-- **To ship v0.1:** tests + CI, portable Python config, isolate-pool-or-documented-limits, `beater new`.
-- **To kill Node/Next:** pay off punts 1–5 and finish the remaining Docker proof for 11, while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.
+- **To ship v0.1:** tests + CI, portable Python config, isolate-pool support plus scaling gate, `beater new`.
+- **To kill Node/Next:** finish the #11 Docker proof, then pay off #7–#10 and #12–#14 while keeping remote management, networking, integrations, and agentic browsing as first-class platform requirements rather than later add-ons.

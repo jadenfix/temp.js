@@ -7,6 +7,8 @@
 //! No sessions (`MCP-Session-Id` is a MAY), no SSE — every request gets a
 //! single JSON object back.
 
+use std::fmt;
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
@@ -26,17 +28,69 @@ use beater_agent::{
     start_journaled_tool_call,
 };
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteActionTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub method: String,
+    pub path: String,
+    pub side_effect: String,
+    pub confirm: bool,
+    pub dry_run: bool,
+    pub idempotency_required: bool,
+    pub auth: Value,
+}
+
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 pub const DEFAULT_TOKEN_ENV: &str = "BEATER_MCP_TOKEN";
 pub const DEFAULT_TRUSTED_ORIGINS_ENV: &str = "BEATER_MCP_TRUSTED_ORIGINS";
+pub const AETHER_PAYMENT_HEADER: &str = "x-payment";
+pub const AETHER_PAYMENT_HASH_HEADER: &str = "x-aether-payment-hash";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaymentHeaders {
+    pub payment: Option<String>,
+    pub payment_hash: Option<String>,
+}
+
+impl PaymentHeaders {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            payment: header_to_string(headers, AETHER_PAYMENT_HEADER),
+            payment_hash: header_to_string(headers, AETHER_PAYMENT_HASH_HEADER),
+        }
+    }
+
+    pub fn insert_into(&self, headers: &mut std::collections::HashMap<String, String>) {
+        if let Some(payment) = &self.payment {
+            headers.insert(AETHER_PAYMENT_HEADER.to_string(), payment.clone());
+        }
+        if let Some(payment_hash) = &self.payment_hash {
+            headers.insert(AETHER_PAYMENT_HASH_HEADER.to_string(), payment_hash.clone());
+        }
+    }
+}
 
 /// MCP access policy. By default the endpoint remains local-dev friendly:
 /// non-browser clients may omit Origin and no token is required. Set
 /// BEATER_MCP_TOKEN before binding beyond loopback.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct AccessConfig {
     bearer_token: Option<String>,
     trusted_origins: Vec<String>,
+}
+
+impl fmt::Debug for AccessConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessConfig")
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trusted_origins", &self.trusted_origins)
+            .finish()
+    }
 }
 
 impl AccessConfig {
@@ -94,7 +148,7 @@ impl AccessConfig {
                 .any(|allowed| allowed == &origin)
     }
 
-    fn authorized(&self, headers: &HeaderMap) -> bool {
+    pub fn authorized(&self, headers: &HeaderMap) -> bool {
         let Some(expected) = self.bearer_token.as_deref() else {
             return true;
         };
@@ -168,9 +222,12 @@ fn is_loopback_origin(origin: &str) -> bool {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
+    const MAX_TOKEN_BYTES: usize = 4096;
+    if left.len() > MAX_TOKEN_BYTES || right.len() > MAX_TOKEN_BYTES {
+        return false;
+    }
     let mut diff = left.len() ^ right.len();
-    for index in 0..max_len {
+    for index in 0..MAX_TOKEN_BYTES {
         let left_byte = left.get(index).copied().unwrap_or(0);
         let right_byte = right.get(index).copied().unwrap_or(0);
         diff |= usize::from(left_byte ^ right_byte);
@@ -178,12 +235,29 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+fn header_to_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub async fn handle_post(
     registry: &ToolRegistry,
+    route_actions: &[RouteActionTool],
     access: &AccessConfig,
     app_dir: &Path,
     headers: &HeaderMap,
     body: &[u8],
+    route_executor: impl Fn(
+        RouteActionTool,
+        Value,
+        beater_agent::ToolCallContext,
+        PaymentHeaders,
+    )
+        -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>,
 ) -> Response<Body> {
     if !access.origin_allowed(headers) {
         return http_response(
@@ -208,7 +282,29 @@ pub async fn handle_post(
         }
     };
 
-    // Notifications and client responses carry no `id` → 202 Accepted, no body.
+    if !message.is_object() {
+        return with_cors(
+            http_response(
+                StatusCode::BAD_REQUEST,
+                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "invalid request: JSON-RPC message must be an object"}}),
+            ),
+            access,
+            headers,
+        );
+    }
+
+    if !message.get("method").is_some_and(Value::is_string) {
+        return with_cors(
+            http_response(
+                StatusCode::BAD_REQUEST,
+                json!({"jsonrpc": "2.0", "id": message.get("id").cloned().unwrap_or(Value::Null), "error": {"code": -32600, "message": "invalid request: method must be a string"}}),
+            ),
+            access,
+            headers,
+        );
+    }
+
+    // Notifications and client responses carry no `id` -> 202 Accepted, no body.
     let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
         return with_cors(
             Response::builder()
@@ -222,6 +318,7 @@ pub async fn handle_post(
 
     let method = message["method"].as_str().unwrap_or_default();
     let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let payment_headers = PaymentHeaders::from_headers(headers);
     let reply = match method {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -229,8 +326,18 @@ pub async fn handle_post(
             "serverInfo": {"name": "beater.js", "version": env!("CARGO_PKG_VERSION")},
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools_json(registry)})),
-        "tools/call" => tools_call(registry, app_dir, &params).await,
+        "tools/list" => Ok(json!({"tools": tools_json(registry, route_actions)})),
+        "tools/call" => {
+            tools_call(
+                registry,
+                route_actions,
+                app_dir,
+                &params,
+                payment_headers,
+                route_executor,
+            )
+            .await
+        }
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
@@ -282,7 +389,7 @@ pub fn handle_options(access: &AccessConfig, headers: &HeaderMap) -> Response<Bo
             .header(ACCESS_CONTROL_ALLOW_METHODS, "POST, GET, OPTIONS")
             .header(
                 ACCESS_CONTROL_ALLOW_HEADERS,
-                "authorization, content-type, accept, mcp-protocol-version, mcp-session-id",
+                "authorization, content-type, accept, mcp-protocol-version, mcp-session-id, x-payment, x-aether-payment-hash",
             )
             .header(ACCESS_CONTROL_MAX_AGE, "600")
             .body(Body::empty())
@@ -292,32 +399,64 @@ pub fn handle_options(access: &AccessConfig, headers: &HeaderMap) -> Response<Bo
     )
 }
 
-fn tools_json(registry: &ToolRegistry) -> Value {
-    Value::Array(
-        registry
-            .entries()
-            .iter()
-            .map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                })
+fn tools_json(registry: &ToolRegistry, route_actions: &[RouteActionTool]) -> Value {
+    let mut tools: Vec<Value> = registry
+        .entries()
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
             })
-            .collect(),
-    )
+        })
+        .collect();
+    tools.extend(route_actions.iter().map(|action| {
+        json!({
+            "name": action.name,
+            "description": action.description,
+            "inputSchema": action.input_schema,
+            "x-beater-action": {
+                "method": action.method,
+                "path": action.path,
+                "sideEffect": action.side_effect,
+                "confirm": action.confirm,
+                "dryRun": action.dry_run,
+                "idempotencyRequired": action.idempotency_required,
+                "auth": action.auth,
+            }
+        })
+    }));
+    Value::Array(tools)
 }
 
 async fn tools_call(
     registry: &ToolRegistry,
+    route_actions: &[RouteActionTool],
     app_dir: &Path,
     params: &Value,
+    payment_headers: PaymentHeaders,
+    route_executor: impl Fn(
+        RouteActionTool,
+        Value,
+        beater_agent::ToolCallContext,
+        PaymentHeaders,
+    )
+        -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>,
 ) -> Result<Value, (i64, String)> {
     let name = params["name"]
         .as_str()
         .ok_or((-32602, "tools/call requires params.name".to_string()))?;
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-    if registry.get(name).is_none() {
+    let route_action = if registry.get(name).is_none() {
+        route_actions
+            .iter()
+            .find(|action| action.name == name)
+            .cloned()
+    } else {
+        None
+    };
+    if registry.get(name).is_none() && route_action.is_none() {
         return Err((-32602, format!("unknown tool: {name}")));
     }
     // Tool failures are results with isError, not protocol errors.
@@ -350,14 +489,28 @@ async fn tools_call(
         )
         .map_err(journal_error)?
     };
-    match registry
-        .execute_with_context(name, &arguments, &call.context)
+    let seq = call.seq;
+    let context = call.context;
+    let result = if let Some(action) = route_action {
+        route_executor(
+            action,
+            arguments.clone(),
+            context.clone(),
+            payment_headers.clone(),
+        )
         .await
-    {
+    } else {
+        registry
+            .execute_with_context(name, &arguments, &context)
+            .await
+    };
+    if let Err(error) = registry.close_browser_sessions(&run_id).await {
+        tracing::warn!("browser session cleanup for MCP run {run_id} failed: {error:#}");
+    }
+    match result {
         Ok(result) => {
             let journal = open_journal(app_dir)?;
-            complete_journaled_tool_call(&journal, &run_id, call.seq, &result)
-                .map_err(journal_error)?;
+            complete_journaled_tool_call(&journal, &run_id, seq, &result).map_err(journal_error)?;
             journal
                 .set_run_status(&run_id, "completed")
                 .map_err(journal_error)?;
@@ -373,7 +526,7 @@ async fn tools_call(
                 "failed"
             };
             let journal = open_journal(app_dir)?;
-            fail_journaled_tool_call(&journal, &run_id, call.seq, &format!("{e:#}"))
+            fail_journaled_tool_call(&journal, &run_id, seq, &format!("{e:#}"))
                 .map_err(journal_error)?;
             journal
                 .set_run_status(&run_id, status)
@@ -439,7 +592,7 @@ fn with_cors(
     headers.insert(VARY, HeaderValue::from_static("origin"));
     headers.insert(
         ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("www-authenticate"),
+        HeaderValue::from_static("www-authenticate, x-payment, x-aether-payment-hash"),
     );
     response
 }
@@ -447,20 +600,26 @@ fn with_cors(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use axum::body::Body;
     use axum::http::header::{AUTHORIZATION, ORIGIN};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use beater_agent::{Journal, ToolDecl, ToolRegistry};
     use serde_json::{Value, json};
 
-    use super::{AccessConfig, handle_get, handle_options, handle_post, mcp_tool_use_id};
+    use super::{
+        AETHER_PAYMENT_HASH_HEADER, AETHER_PAYMENT_HEADER, AccessConfig, PaymentHeaders,
+        RouteActionTool, handle_get, handle_options, handle_post, mcp_tool_use_id,
+    };
 
     struct TempApp {
         path: PathBuf,
@@ -486,6 +645,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    async fn test_handle_post(
+        registry: &ToolRegistry,
+        access: &AccessConfig,
+        app_dir: &Path,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> axum::http::Response<Body> {
+        handle_post(
+            registry,
+            &[],
+            access,
+            app_dir,
+            headers,
+            body,
+            |_action, _arguments, _context, _payment_headers| {
+                Pin::from(Box::new(async {
+                    anyhow::bail!("test did not configure route action execution")
+                })
+                    as Box<dyn Future<Output = anyhow::Result<String>> + Send>)
+            },
+        )
+        .await
     }
 
     #[test]
@@ -543,7 +726,7 @@ mod tests {
         let access = AccessConfig::new(Some("secret".to_string()), Vec::new());
         let headers = HeaderMap::new();
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &access,
             app.path(),
@@ -567,7 +750,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &access,
             app.path(),
@@ -587,7 +770,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer secret ".parse().unwrap());
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &access,
             app.path(),
@@ -597,6 +780,71 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn debug_redacts_bearer_token() {
+        let access = AccessConfig::new(
+            Some("super-secret-token".to_string()),
+            vec!["https://ops.example.test".to_string()],
+        );
+
+        let rendered = format!("{access:?}");
+
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("super-secret-token"), "{rendered}");
+        assert!(rendered.contains("https://ops.example.test"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn non_object_json_rpc_is_invalid_request() {
+        let app = TempApp::new("invalid-non-object");
+        let registry = ToolRegistry::empty();
+
+        for body in [
+            br#"[]"#.as_slice(),
+            br#""hello""#.as_slice(),
+            br#"5"#.as_slice(),
+        ] {
+            let response = test_handle_post(
+                &registry,
+                &AccessConfig::default(),
+                app.path(),
+                &HeaderMap::new(),
+                body,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["id"], Value::Null);
+            assert_eq!(body["error"]["code"], -32600);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_non_string_method_is_invalid_request() {
+        let app = TempApp::new("invalid-method");
+        let registry = ToolRegistry::empty();
+
+        for body in [
+            br#"{"jsonrpc":"2.0","id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"method":7}"#.as_slice(),
+        ] {
+            let response = test_handle_post(
+                &registry,
+                &AccessConfig::default(),
+                app.path(),
+                &HeaderMap::new(),
+                body,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["id"], 1);
+            assert_eq!(body["error"]["code"], -32600);
+        }
     }
 
     #[test]
@@ -638,7 +886,7 @@ mod tests {
         )
         .expect("remote MCP registry should build");
 
-        let first_response = handle_post(
+        let first_response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -646,7 +894,7 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"crm.lookup","arguments":{"email":"a@example.com"}}}"#,
         )
         .await;
-        let second_response = handle_post(
+        let second_response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -689,12 +937,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_call_forwards_aether_payment_headers_to_route_actions() {
+        let app = TempApp::new("route-action-payment-headers");
+        let registry = ToolRegistry::empty();
+        let route_actions = vec![RouteActionTool {
+            name: "billing.checkout".to_string(),
+            description: "Checkout".to_string(),
+            input_schema: json!({"type": "object"}),
+            method: "POST".to_string(),
+            path: "/api/checkout".to_string(),
+            side_effect: "purchase".to_string(),
+            confirm: false,
+            dry_run: false,
+            idempotency_required: false,
+            auth: Value::Null,
+        }];
+        let seen = Arc::new(Mutex::new(PaymentHeaders::default()));
+        let seen_for_executor = Arc::clone(&seen);
+        let mut headers = HeaderMap::new();
+        headers.insert(AETHER_PAYMENT_HEADER, "payment-payload".parse().unwrap());
+        headers.insert(AETHER_PAYMENT_HASH_HEADER, "0x1234".parse().unwrap());
+
+        let response = handle_post(
+            &registry,
+            &route_actions,
+            &AccessConfig::default(),
+            app.path(),
+            &headers,
+            br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"billing.checkout","arguments":{"confirm":true}}}"#,
+            move |_action, _arguments, _context, payment_headers| {
+                let seen = Arc::clone(&seen_for_executor);
+                Pin::from(Box::new(async move {
+                    *seen.lock().unwrap() = payment_headers;
+                    Ok("{\"ok\":true}".to_string())
+                }) as Box<dyn Future<Output = anyhow::Result<String>> + Send>)
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["result"]["isError"], false);
+        let payment_headers = seen.lock().unwrap().clone();
+        assert_eq!(payment_headers.payment.as_deref(), Some("payment-payload"));
+        assert_eq!(payment_headers.payment_hash.as_deref(), Some("0x1234"));
+    }
+
+    #[tokio::test]
     async fn tools_call_journals_successful_tool_execution() {
         let app = TempApp::new("journal-success");
         let registry = ToolRegistry::build(Path::new(""), &[rust_decl("get_time")])
             .expect("rust builtin registry should build");
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -755,7 +1049,7 @@ mod tests {
         )
         .expect("remote MCP registry should build");
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -799,6 +1093,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tools_call_journals_needs_review_tool_execution() {
+        let app = TempApp::new("journal-needs-review");
+        let remote = MockRemoteMcp::new_text("{not json");
+        let registry = ToolRegistry::build(
+            Path::new(""),
+            &[remote_decl_with_idempotent(
+                "crm.lookup",
+                &remote.endpoint,
+                false,
+            )],
+        )
+        .expect("remote MCP registry should build");
+
+        let response = test_handle_post(
+            &registry,
+            &AccessConfig::default(),
+            app.path(),
+            &HeaderMap::new(),
+            br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"crm.lookup","arguments":{"email":"ambiguous@example.com"}}}"#,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["id"], "1");
+        assert_eq!(body["result"]["isError"], true);
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("needs review")
+                || body["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("review the remote system"),
+            "{body}"
+        );
+
+        let journal = Journal::open(app.path()).unwrap();
+        let runs = journal.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let (run, step_count) = &runs[0];
+        assert_eq!(run.agent, "mcp");
+        assert_eq!(run.status, "needs_review");
+        assert_eq!(*step_count, 1);
+
+        let steps = journal.steps(&run.id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, "tool_call");
+        assert_eq!(steps[0].status, "failed");
+        assert_eq!(steps[0].tool_name.as_deref(), Some("crm.lookup"));
+    }
+
     #[test]
     fn get_requires_auth_before_reporting_no_stream() {
         let access = AccessConfig::new(Some("secret".to_string()), Vec::new());
@@ -835,15 +1183,23 @@ mod tests {
                 .unwrap(),
             "https://ops.example.com"
         );
-        assert!(
-            response
-                .headers()
-                .get("access-control-allow-headers")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("authorization")
-        );
+        let allow_headers = response
+            .headers()
+            .get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(allow_headers.contains("authorization"));
+        assert!(allow_headers.contains(AETHER_PAYMENT_HEADER));
+        assert!(allow_headers.contains(AETHER_PAYMENT_HASH_HEADER));
+        let expose_headers = response
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(expose_headers.contains(AETHER_PAYMENT_HEADER));
+        assert!(expose_headers.contains(AETHER_PAYMENT_HASH_HEADER));
     }
 
     #[test]
@@ -938,6 +1294,28 @@ mod tests {
                     thread_requests.lock().unwrap().push(request);
                     let _ = write_response(&mut stream, &body);
                 }
+            });
+            Self {
+                endpoint,
+                requests,
+                handle: Some(handle),
+            }
+        }
+
+        fn new_text(response: &'static str) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!(
+                "http://127.0.0.1:{}/mcp",
+                listener.local_addr().unwrap().port()
+            );
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = requests.clone();
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = accept_with_deadline(&listener);
+                let request = read_request(&mut stream);
+                thread_requests.lock().unwrap().push(request);
+                let _ = write_response(&mut stream, response);
             });
             Self {
                 endpoint,

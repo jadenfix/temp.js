@@ -396,10 +396,29 @@
     const mod = await import(specifier);
     const meta = mod.agent;
     if (!meta || typeof meta !== "object") return null;
+    const actions = Array.isArray(meta.actions)
+      ? meta.actions
+          .filter((action) => action && typeof action === "object" && typeof action.name === "string")
+          .map((action) => ({
+            name: action.name,
+            description: typeof action.description === "string" ? action.description : null,
+            method: typeof action.method === "string" ? action.method.toUpperCase() : "POST",
+            inputSchema:
+              action.inputSchema && typeof action.inputSchema === "object"
+                ? action.inputSchema
+                : { type: "object", properties: {} },
+            sideEffect: typeof action.sideEffect === "string" ? action.sideEffect : "write",
+            confirm: action.confirm === true,
+            dryRun: action.dryRun === true,
+            idempotencyRequired: action.idempotencyRequired === true,
+            auth: action.auth && typeof action.auth === "object" ? action.auth : { type: "public" },
+          }))
+      : [];
     return {
       title: typeof meta.title === "string" ? meta.title : null,
       description: typeof meta.description === "string" ? meta.description : null,
       crawl: meta.crawl !== false,
+      actions,
     };
   };
 

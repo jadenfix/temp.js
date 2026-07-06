@@ -46,6 +46,7 @@ fn run() -> Result<(), String> {
                 "agent-card" => print!("{}", bundle.agent_card),
                 "openapi" => print!("{}", bundle.openapi),
                 "mcp" => print!("{}", bundle.mcp_catalog),
+                "forms" => print!("{}", bundle.forms),
                 "llms" => print!("{}", bundle.llms),
                 "robots" => print!("{}", bundle.robots),
                 "sitemap" => print!("{}", bundle.sitemap),
@@ -75,6 +76,7 @@ fn write_bundle(out: &Path, bundle: &ConnectBundle) -> Result<(), String> {
     )?;
     write_file(&out.join("openapi.json"), &bundle.openapi)?;
     write_file(&out.join("mcp").join("catalog.json"), &bundle.mcp_catalog)?;
+    write_file(&out.join("forms.html"), &bundle.forms)?;
     write_file(&out.join("llms.txt"), &bundle.llms)?;
     write_file(&out.join("robots.txt"), &bundle.robots)?;
     write_file(&out.join("sitemap.xml"), &bundle.sitemap)?;
@@ -88,6 +90,6 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "beater-connect\n\nUSAGE:\n  beater-connect demo [--out DIR]\n  beater-connect print <beater|agent-card|openapi|mcp|llms|robots|sitemap>\n"
+        "beater-connect\n\nUSAGE:\n  beater-connect demo [--out DIR]\n  beater-connect print <beater|agent-card|openapi|mcp|forms|llms|robots|sitemap>\n"
     );
 }

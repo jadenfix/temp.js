@@ -28,6 +28,8 @@ axum = "0.8"
 bytes = "1"
 futures-util = "0.3"
 base64 = "0.22"
+cxx = "1"
+cxx-build = "1"
 
 # embedded CPython
 pyo3 = { version = "0.29", features = ["auto-initialize"] }
@@ -36,7 +38,7 @@ pyo3 = { version = "0.29", features = ["auto-initialize"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # LLM API client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
 
 # cli + config + fs
 clap = { version = "4", features = ["derive"] }
@@ -59,7 +61,10 @@ beater-runtime = { path = "crates/beater-runtime" }
 beater-agent = { path = "crates/beater-agent" }
 beater-py = { path = "crates/beater-py" }
 beater-connect = { path = "crates/beater-connect" }
+beater-browser = { git = "https://github.com/jadenfix/beater", rev = "d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e" }
+beater-browser-playwright = { git = "https://github.com/jadenfix/beater", rev = "d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e" }
 beatbox-client = { git = "https://github.com/jadenfix/beatbox", rev = "dc2ddd9d93542737627210a05eeae96e008a1aad" }
+wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
 
 # V8 and swc are unusable at opt-level 0; keep our own crates fast to compile
 [profile.dev.package."*"]

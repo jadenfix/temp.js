@@ -9,7 +9,7 @@ agents/support/agent.ts       → durable agent loop (runs in Rust, survives cra
 agents/support/tools/*.py     → full-fat Python tools (numpy/torch work) in embedded CPython
 ```
 
-Why: the Node/Next stack was designed for documents and forms. Agent apps are long-running polyglot loops — the unit of work is a journaled, resumable run, not a request; the ML half lives in Python and native code, not JS. beater.js is one Rust host process with four execution tiers: **V8** (routes, SSR), **CPython** (ML tools), **native Rust** (the agent loop itself), and **Wasmtime** (sandboxed untrusted code, planned). Tools speak [MCP](https://modelcontextprotocol.io) natively.
+Why: the Node/Next stack was designed for documents and forms. Agent apps are long-running polyglot loops — the unit of work is a journaled, resumable run, not a request; the ML half lives in Python and native code, not JS. beater.js is one Rust host process with four execution tiers: **V8** (routes, SSR), **CPython** (ML tools), **native Rust** (the agent loop itself), and **Wasmtime** (hermetic W0 sandboxed untrusted code). Tools speak [MCP](https://modelcontextprotocol.io) natively.
 
 Read the full design: [ARCHITECTURE.md](./ARCHITECTURE.md)
 
@@ -47,6 +47,8 @@ docker build -t my-app-beater /tmp/my-app-bundle
 docker run --rm -e BEATER_MCP_TOKEN=dev-token -p 127.0.0.1:3000:3000 my-app-beater
 ```
 
+Set `BEATER_TRACE_EXPORT_URL` to export finished agent runs to Beater's native `/v1/traces/native` ingest endpoint. See [Observability](docs/observability.md) for the full environment contract.
+
 When exposing `/mcp` beyond localhost, require a bearer token and add browser origins explicitly:
 
 ```sh
@@ -57,7 +59,7 @@ export BEATER_MCP_TRUSTED_ORIGINS="https://ops.example.com" # browser-based oper
 
 ## Current limits
 
-`beater dev` currently uses one JS route isolate, so TS routes and React SSR serialize through that worker. One dev server serves one app directory. See [Runtime limits](docs/runtime-limits.md) for the exact concurrency model and isolate-pool path.
+`beater dev` defaults to one JS route isolate, so TS routes and React SSR serialize unless you set `[app].workers = N` in `beater.toml`. One dev server serves one app directory. See [Runtime limits](docs/runtime-limits.md) for the exact concurrency model and scaling gate.
 
 Server-side routes can import local ESM packages from `node_modules` with bare package specifiers. The resolver handles basic/exact package `exports` entries with `node`, `import`, `module`, and `default` conditions, plus `module`/`main` fallbacks; CommonJS `require`, Node built-ins, and client-side dependency bundling are still outside this wedge.
 
@@ -69,15 +71,16 @@ RSC transport is starting as route companions such as `app/routes/index.server.t
 
 ## Docker deploy gate
 
-The end-to-end deploy proof lives in `scripts/docker-cold-start-gate.sh`. It scaffolds a hello app, runs `beater build`, builds the generated Dockerfile, starts the image on a loopback-only published port, waits for `/api/health`, and checks authenticated MCP tool discovery.
+The end-to-end deploy proof lives in `scripts/docker-cold-start-gate.sh`. It builds the release CLI inside a Linux Docker builder, runs `beater build` against `examples/hello`, builds the generated Dockerfile, starts the image on a loopback-only published port, waits for `/api/health`, and checks authenticated MCP tool discovery.
 
 Useful knobs:
 
-- `BEATER_DOCKER_GATE_MODE=auto|local|builder` chooses whether to use the host Linux binary or build inside a Docker `rust:bookworm` builder.
+- `BEATER_DOCKER_RUST_IMAGE=rust:1-bookworm` chooses the Linux builder image.
 - `BEATER_DOCKER_COLD_START_MS=1000` sets the health deadline measured from `docker run`; CI uses `3000` to avoid runner-scheduling flakes while still proving a cold container boot.
-- `BEATER_DOCKER_GATE_KEEP=1` keeps the generated app and bundle for inspection.
-- `BEATER_DOCKER_GATE_TMP=/path/to/workspace` uses an existing workspace and leaves it in place.
+- `BEATER_DOCKER_GATE_WORKDIR=/path/to/workspace` uses an existing workspace for build artifacts, logs, and `evidence.md`.
+- `BEATER_DOCKER_KEEP=1` keeps the target cache and generated image after a successful run.
 - `BEATER_DOCKER_IMAGE=name:tag` uses an explicit image tag and leaves that tag in place.
+- `BEATER_DOCKER_MIN_FREE_KIB=12582912` sets the free-space preflight for the Linux release build.
 
 ## Build from source
 
@@ -102,6 +105,7 @@ More docs:
 
 - [Tool contract](docs/tools.md)
 - [Integration registry](docs/integrations.md)
+- [Observability](docs/observability.md)
 - [Runtime limits](docs/runtime-limits.md)
 - [Security and trust model](docs/security.md)
 - [Changelog and versioning policy](CHANGELOG.md)
@@ -109,3 +113,11 @@ More docs:
 ## License
 
 Apache-2.0
+
+## Ecosystem
+
+beater.js is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: one Rust binary that serves your app and runs durable polyglot agents, with no sibling project required. Within the family it can connect for:
+
+- feeding its journaled runs to [beater-memory](https://github.com/jadenfix/beater-memory) (journal import exists today) and its traces to [beater](https://github.com/jadenfix/beater) for evals and CI gates
+- using the local Wasmtime tier for hermetic untrusted scalar wasm tools, with [beatbox](https://github.com/jadenfix/beatbox) still available as the remote sandbox lane
+- giving its agents web hands via [tempo](https://github.com/jadenfix/tempo) and running under [beaterOS](https://github.com/jadenfix/beaterOS) authority and policy
