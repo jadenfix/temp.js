@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Prove the Phase C npm/node-compat wedge: a route can import a real ESM
-# package plus a leaf CommonJS default export from node_modules with bare
-# specifiers, while unsupported CommonJS require() fails closed.
+# package, a leaf CommonJS default export, and a first Node built-in shim from
+# node_modules with bare specifiers, while unsupported CommonJS require() fails
+# closed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+if [[ "$(uname -s)" == "Darwin" && -d /Library/Developer/CommandLineTools/Library/Frameworks ]]; then
+  export DYLD_FRAMEWORK_PATH="${DYLD_FRAMEWORK_PATH:+$DYLD_FRAMEWORK_PATH:}/Library/Developer/CommandLineTools/Library/Frameworks"
+fi
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${BEATER_BIN:-$TARGET_DIR/debug/beater}"
@@ -57,6 +62,32 @@ cat >"$APP/node_modules/require-cjs/index.cjs" <<'JS'
 module.exports = require("fs");
 JS
 
+mkdir -p "$APP/node_modules/buffered"
+cat >"$APP/node_modules/buffered/package.json" <<'JSON'
+{
+  "name": "buffered",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+JSON
+
+cat >"$APP/node_modules/buffered/index.js" <<'JS'
+import { Buffer } from "node:buffer";
+
+export function encode(value) {
+  const buffer = Buffer.from(value, "utf8");
+  return {
+    text: buffer.toString("utf8"),
+    hex: buffer.toString("hex"),
+    base64: buffer.toString("base64"),
+    bytes: Buffer.byteLength(value, "utf8"),
+    isBuffer: Buffer.isBuffer(buffer),
+  };
+}
+JS
+
 cat >"$APP/app/routes/api/zod.ts" <<'TS'
 import { z } from "zod";
 
@@ -99,13 +130,26 @@ export function GET() {
 }
 TS
 
+cat >"$APP/app/routes/api/buffered.ts" <<'TS'
+import { encode } from "buffered";
+
+export function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(encode("beater")),
+  };
+}
+TS
+
 mkdir -p "$(dirname "$LOG")"
-env \
-  -u ANTHROPIC_API_KEY \
-  -u BEATER_BASE_URL \
-  -u BEATER_MCP_TOKEN \
-  -u BEATER_MCP_TRUSTED_ORIGINS \
-  "$BIN" dev "$APP" --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
+(
+  unset ANTHROPIC_API_KEY
+  unset BEATER_BASE_URL
+  unset BEATER_MCP_TOKEN
+  unset BEATER_MCP_TRUSTED_ORIGINS
+  "$BIN" dev "$APP" --host 127.0.0.1 --port "$PORT"
+) >"$LOG" 2>&1 &
 pid=$!
 
 python3 - "$PORT" "$LOG" <<'PY'
@@ -145,9 +189,9 @@ body = response.read().decode("utf-8")
 conn.close()
 if response.status != 200:
     sys.exit(f"expected 200 from /api/zod, got {response.status}: {body}")
-payload = json.loads(body)
-if payload != {"ok": True, "value": "beater"}:
-    sys.exit(f"unexpected /api/zod payload: {payload!r}")
+zod_payload = json.loads(body)
+if zod_payload != {"ok": True, "value": "beater"}:
+    sys.exit(f"unexpected /api/zod payload: {zod_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/cjs")
@@ -161,6 +205,24 @@ if cjs_payload != {"label": "legacy-cjs", "doubled": 42}:
     sys.exit(f"unexpected /api/cjs payload: {cjs_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("GET", "/api/buffered")
+response = conn.getresponse()
+body = response.read().decode("utf-8")
+conn.close()
+if response.status != 200:
+    sys.exit(f"expected 200 from /api/buffered, got {response.status}: {body}")
+buffer_payload = json.loads(body)
+expected_buffer = {
+    "text": "beater",
+    "hex": "626561746572",
+    "base64": "YmVhdGVy",
+    "bytes": 6,
+    "isBuffer": True,
+}
+if buffer_payload != expected_buffer:
+    sys.exit(f"unexpected /api/buffered payload: {buffer_payload!r}")
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/cjs-require")
 response = conn.getresponse()
 body = response.read().decode("utf-8")
@@ -171,8 +233,9 @@ if "CommonJS require" not in body:
     sys.exit(f"expected /api/cjs-require failure to mention CommonJS require, got: {body}")
 print(
     "npm compat passed: "
-    f"zod import returned {payload['value']}; "
+    f"zod import returned {zod_payload['value']}; "
     f"cjs doubled {cjs_payload['doubled']}; "
+    f"buffer base64 {buffer_payload['base64']}; "
     "require failed closed"
 )
 PY

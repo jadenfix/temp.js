@@ -52,6 +52,7 @@ fn vendor_specifier(specifier: &str) -> Option<&'static str> {
         "react" => Some("beater:vendor/react"),
         "react/jsx-runtime" | "react/jsx-dev-runtime" => Some("beater:vendor/react-jsx-runtime"),
         "react-dom/server" => Some("beater:vendor/react-dom-server"),
+        "node:buffer" | "buffer" => Some("beater:vendor/node-buffer"),
         _ => None,
     }
 }
@@ -66,6 +67,7 @@ fn vendor_source(specifier: &str) -> Option<&'static str> {
         "beater:vendor/react-dom-server" => {
             Some(include_str!("../assets/vendor/react-dom-server.mjs"))
         }
+        "beater:vendor/node-buffer" => Some(include_str!("../assets/vendor/node-buffer.mjs")),
         _ => None,
     }
 }
@@ -1358,6 +1360,31 @@ mod tests {
             ModuleSourceCode::String(text) => text.to_string(),
             ModuleSourceCode::Bytes(bytes) => String::from_utf8(bytes.to_vec()).unwrap(),
         }
+    }
+
+    #[test]
+    fn node_buffer_vendor_specifiers_resolve_to_checked_in_shim() {
+        assert_eq!(
+            super::vendor_specifier("node:buffer"),
+            Some("beater:vendor/node-buffer")
+        );
+        assert_eq!(
+            super::vendor_specifier("buffer"),
+            Some("beater:vendor/node-buffer")
+        );
+
+        let source = super::vendor_source("beater:vendor/node-buffer").unwrap();
+        assert!(source.contains("export class Buffer extends Uint8Array"));
+        assert!(source.contains("globalThis.Buffer ??= Buffer"));
+    }
+
+    #[test]
+    fn node_buffer_vendor_module_loads_from_beater_scheme() {
+        let specifier = ModuleSpecifier::parse("beater:vendor/node-buffer").unwrap();
+        let source = source_text(load_sync(&specifier).unwrap());
+
+        assert!(source.contains("Buffer.from"));
+        assert!(source.contains("Buffer.concat"));
     }
 
     #[test]

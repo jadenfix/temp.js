@@ -646,6 +646,36 @@ fn new_scaffolds_runnable_app_and_refuses_overwrite() {
         "export const z = { string: () => ({ parse: (value) => String(value).trim() }) };\n",
     )
     .expect("write fixture zod index");
+    std::fs::create_dir_all(app.join("node_modules/buffered"))
+        .expect("create fixture buffered package");
+    std::fs::write(
+        app.join("node_modules/buffered/package.json"),
+        r#"{
+  "name": "buffered",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}"#,
+    )
+    .expect("write fixture buffered package.json");
+    std::fs::write(
+        app.join("node_modules/buffered/index.js"),
+        r#"import { Buffer } from "node:buffer";
+
+export function encode(value) {
+  const buffer = Buffer.from(value, "utf8");
+  return {
+    text: buffer.toString("utf8"),
+    hex: buffer.toString("hex"),
+    base64: buffer.toString("base64"),
+    bytes: Buffer.byteLength(value, "utf8"),
+    isBuffer: Buffer.isBuffer(buffer),
+  };
+}
+"#,
+    )
+    .expect("write fixture buffered index");
     std::fs::write(
         app.join("app/routes/api/zod.ts"),
         r#"import { z } from "zod";
@@ -662,6 +692,20 @@ export function GET() {
 "#,
     )
     .expect("write zod route");
+    std::fs::write(
+        app.join("app/routes/api/buffered.ts"),
+        r#"import { encode } from "buffered";
+
+export function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(encode("beater")),
+  };
+}
+"#,
+    )
+    .expect("write buffered route");
 
     let child = Command::new(&beater)
         .arg("dev")
@@ -687,6 +731,14 @@ export function GET() {
     let zod = http_request(port, "GET", "/api/zod", None).expect("GET /api/zod");
     assert!(zod.starts_with("HTTP/1.1 200"), "{zod}");
     assert!(zod.contains(r#""value":"beater""#), "{zod}");
+
+    let buffered = http_request(port, "GET", "/api/buffered", None).expect("GET /api/buffered");
+    assert!(buffered.starts_with("HTTP/1.1 200"), "{buffered}");
+    assert!(buffered.contains(r#""text":"beater""#), "{buffered}");
+    assert!(buffered.contains(r#""hex":"626561746572""#), "{buffered}");
+    assert!(buffered.contains(r#""base64":"YmVhdGVy""#), "{buffered}");
+    assert!(buffered.contains(r#""bytes":6"#), "{buffered}");
+    assert!(buffered.contains(r#""isBuffer":true"#), "{buffered}");
 
     let home = http_request(port, "GET", "/", None).expect("GET scaffolded /");
     assert!(home.starts_with("HTTP/1.1 200"), "{home}");
