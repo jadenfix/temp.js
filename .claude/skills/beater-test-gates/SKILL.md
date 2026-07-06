@@ -75,6 +75,31 @@ scripts/playwright-browser-gate.cjs
 
 If the gate fails and you need to inspect its temp app/journal, rerun with `BEATER_KEEP_GATE_WORKDIR=1`.
 
+## OTLP trace gate
+
+`scripts/otlp-trace-gate.cjs` is the local OTLP proof. It starts a mock Anthropic SSE server and mock OTLP collector, runs the real `beater agent run` CLI against a temp app with the built-in `get_time` tool, then verifies one `/v1/traces` request contains `agent.run`, two `llm.call`, and one `tool.call` span with auth/header propagation.
+
+Build the local binary with the same PyO3 settings first, then run the gate:
+
+```sh
+tmp_config=$(mktemp /tmp/beater-pyo3-config.XXXXXX)
+printf '%s\n' \
+  'implementation=CPython' \
+  'version=3.9' \
+  'shared=true' \
+  'abi3=false' \
+  'lib_name=python3.9' \
+  'lib_dir=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib' \
+  'executable=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' > "$tmp_config"
+PYO3_CONFIG_FILE="$tmp_config" \
+  DYLD_FRAMEWORK_PATH=/Library/Developer/CommandLineTools/Library/Frameworks \
+  cargo build --bin beater
+rm -f "$tmp_config"
+scripts/otlp-trace-gate.cjs
+```
+
+If the gate fails and you need to inspect its temp app/journal, rerun with `BEATER_KEEP_GATE_WORKDIR=1`.
+
 ## Deploy gate probe
 
 The deploy proof is `scripts/docker-cold-start-gate.sh`. Before running it, check both free space and Docker availability:
