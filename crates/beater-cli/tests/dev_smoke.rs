@@ -80,6 +80,7 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
     );
     assert!(home.contains("data-beater-counter"), "{home}");
     assert!(home.contains("data-beater-run-events"), "{home}");
+    assert!(home.contains("data-beater-action-form"), "{home}");
 
     let client =
         http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
@@ -131,6 +132,61 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
     assert!(tools_call.starts_with("HTTP/1.1 200"), "{tools_call}");
     assert!(tools_call.contains("\"isError\":false"), "{tools_call}");
     assert!(tools_call.contains("\\\"unix\\\""), "{tools_call}");
+
+    let route_action_form = http_request_with_headers(
+        port,
+        "POST",
+        "/api/actions/contact",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        Some("email=agent%40example.test&message=hello&confirm=true&idempotency_key=form-1"),
+    )
+    .expect("POST route action form");
+    assert!(
+        route_action_form.starts_with("HTTP/1.1 200"),
+        "{route_action_form}"
+    );
+    assert!(route_action_form.contains("\"action\":\"hello.contact\""));
+    assert!(route_action_form.contains("\"email\":\"agent@example.test\""));
+    assert!(route_action_form.contains("\"idempotency_key\":\"form-1\""));
+
+    let tools_list = http_request(
+        port,
+        "POST",
+        "/mcp",
+        Some(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#),
+    )
+    .expect("POST /mcp tools/list");
+    assert!(tools_list.starts_with("HTTP/1.1 200"), "{tools_list}");
+    assert!(
+        tools_list.contains("\"name\":\"hello.contact\""),
+        "{tools_list}"
+    );
+    assert!(
+        tools_list.contains("\"idempotencyRequired\":true"),
+        "{tools_list}"
+    );
+
+    let route_action_tool = http_request(
+        port,
+        "POST",
+        "/mcp",
+        Some(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"hello.contact","arguments":{"email":"agent@example.test","message":"hello from mcp","confirm":true}}}"#,
+        ),
+    )
+    .expect("POST /mcp route action tools/call");
+    assert!(
+        route_action_tool.starts_with("HTTP/1.1 200"),
+        "{route_action_tool}"
+    );
+    assert!(
+        route_action_tool.contains("\"isError\":false"),
+        "{route_action_tool}"
+    );
+    assert!(
+        route_action_tool.contains("\\\"action\\\":\\\"hello.contact\\\""),
+        "{route_action_tool}"
+    );
 
     let mcp_get = http_request(port, "GET", "/mcp", None).expect("GET /mcp");
     assert!(mcp_get.starts_with("HTTP/1.1 405"), "{mcp_get}");
@@ -391,6 +447,7 @@ fn new_scaffolds_runnable_app_and_refuses_overwrite() {
         "app/routes/index.server.tsx",
         "app/routes/api/health.ts",
         "app/routes/api/boom.ts",
+        "app/routes/api/actions/contact.ts",
         "agents/support/agent.ts",
         "agents/support/tools/summarize_numbers.py",
         "agents/support/tools/slow_summarize.py",
@@ -475,6 +532,7 @@ export function GET() {
         "{home}"
     );
     assert!(home.contains("data-beater-run-events"), "{home}");
+    assert!(home.contains("data-beater-action-form"), "{home}");
 
     let client =
         http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
@@ -1147,8 +1205,16 @@ fn http_request_with_headers(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let body = body.unwrap_or("");
+    let has_content_type = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    let content_type = if has_content_type {
+        String::new()
+    } else {
+        "\r\ncontent-type: application/json".to_string()
+    };
     let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}{content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     for (name, value) in headers {

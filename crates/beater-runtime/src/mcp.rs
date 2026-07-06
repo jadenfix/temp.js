@@ -8,6 +8,7 @@
 //! single JSON object back.
 
 use std::fmt;
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
@@ -26,6 +27,20 @@ use beater_agent::{
     Journal, ToolNeedsReview, ToolRegistry, complete_journaled_tool_call, fail_journaled_tool_call,
     start_journaled_tool_call,
 };
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteActionTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub method: String,
+    pub path: String,
+    pub side_effect: String,
+    pub confirm: bool,
+    pub dry_run: bool,
+    pub idempotency_required: bool,
+    pub auth: Value,
+}
 
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 pub const DEFAULT_TOKEN_ENV: &str = "BEATER_MCP_TOKEN";
@@ -196,10 +211,17 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 pub async fn handle_post(
     registry: &ToolRegistry,
+    route_actions: &[RouteActionTool],
     access: &AccessConfig,
     app_dir: &Path,
     headers: &HeaderMap,
     body: &[u8],
+    route_executor: impl Fn(
+        RouteActionTool,
+        Value,
+        beater_agent::ToolCallContext,
+    )
+        -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>,
 ) -> Response<Body> {
     if !access.origin_allowed(headers) {
         return http_response(
@@ -267,8 +289,8 @@ pub async fn handle_post(
             "serverInfo": {"name": "beater.js", "version": env!("CARGO_PKG_VERSION")},
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools_json(registry)})),
-        "tools/call" => tools_call(registry, app_dir, &params).await,
+        "tools/list" => Ok(json!({"tools": tools_json(registry, route_actions)})),
+        "tools/call" => tools_call(registry, route_actions, app_dir, &params, route_executor).await,
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
@@ -330,32 +352,62 @@ pub fn handle_options(access: &AccessConfig, headers: &HeaderMap) -> Response<Bo
     )
 }
 
-fn tools_json(registry: &ToolRegistry) -> Value {
-    Value::Array(
-        registry
-            .entries()
-            .iter()
-            .map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                })
+fn tools_json(registry: &ToolRegistry, route_actions: &[RouteActionTool]) -> Value {
+    let mut tools: Vec<Value> = registry
+        .entries()
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
             })
-            .collect(),
-    )
+        })
+        .collect();
+    tools.extend(route_actions.iter().map(|action| {
+        json!({
+            "name": action.name,
+            "description": action.description,
+            "inputSchema": action.input_schema,
+            "x-beater-action": {
+                "method": action.method,
+                "path": action.path,
+                "sideEffect": action.side_effect,
+                "confirm": action.confirm,
+                "dryRun": action.dry_run,
+                "idempotencyRequired": action.idempotency_required,
+                "auth": action.auth,
+            }
+        })
+    }));
+    Value::Array(tools)
 }
 
 async fn tools_call(
     registry: &ToolRegistry,
+    route_actions: &[RouteActionTool],
     app_dir: &Path,
     params: &Value,
+    route_executor: impl Fn(
+        RouteActionTool,
+        Value,
+        beater_agent::ToolCallContext,
+    )
+        -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>,
 ) -> Result<Value, (i64, String)> {
     let name = params["name"]
         .as_str()
         .ok_or((-32602, "tools/call requires params.name".to_string()))?;
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-    if registry.get(name).is_none() {
+    let route_action = if registry.get(name).is_none() {
+        route_actions
+            .iter()
+            .find(|action| action.name == name)
+            .cloned()
+    } else {
+        None
+    };
+    if registry.get(name).is_none() && route_action.is_none() {
         return Err((-32602, format!("unknown tool: {name}")));
     }
     // Tool failures are results with isError, not protocol errors.
@@ -388,14 +440,19 @@ async fn tools_call(
         )
         .map_err(journal_error)?
     };
-    match registry
-        .execute_with_context(name, &arguments, &call.context)
-        .await
-    {
+    let seq = call.seq;
+    let context = call.context;
+    let result = if let Some(action) = route_action {
+        route_executor(action, arguments.clone(), context.clone()).await
+    } else {
+        registry
+            .execute_with_context(name, &arguments, &context)
+            .await
+    };
+    match result {
         Ok(result) => {
             let journal = open_journal(app_dir)?;
-            complete_journaled_tool_call(&journal, &run_id, call.seq, &result)
-                .map_err(journal_error)?;
+            complete_journaled_tool_call(&journal, &run_id, seq, &result).map_err(journal_error)?;
             journal
                 .set_run_status(&run_id, "completed")
                 .map_err(journal_error)?;
@@ -411,7 +468,7 @@ async fn tools_call(
                 "failed"
             };
             let journal = open_journal(app_dir)?;
-            fail_journaled_tool_call(&journal, &run_id, call.seq, &format!("{e:#}"))
+            fail_journaled_tool_call(&journal, &run_id, seq, &format!("{e:#}"))
                 .map_err(journal_error)?;
             journal
                 .set_run_status(&run_id, status)
@@ -485,13 +542,16 @@ fn with_cors(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use axum::body::Body;
     use axum::http::header::{AUTHORIZATION, ORIGIN};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
@@ -524,6 +584,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    async fn test_handle_post(
+        registry: &ToolRegistry,
+        access: &AccessConfig,
+        app_dir: &Path,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> axum::http::Response<Body> {
+        handle_post(
+            registry,
+            &[],
+            access,
+            app_dir,
+            headers,
+            body,
+            |_action, _arguments, _context| {
+                Pin::from(Box::new(async {
+                    anyhow::bail!("test did not configure route action execution")
+                })
+                    as Box<dyn Future<Output = anyhow::Result<String>> + Send>)
+            },
+        )
+        .await
     }
 
     #[test]
@@ -581,7 +665,7 @@ mod tests {
         let access = AccessConfig::new(Some("secret".to_string()), Vec::new());
         let headers = HeaderMap::new();
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &access,
             app.path(),
@@ -605,7 +689,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &access,
             app.path(),
@@ -625,7 +709,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer secret ".parse().unwrap());
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &access,
             app.path(),
@@ -661,7 +745,7 @@ mod tests {
             br#""hello""#.as_slice(),
             br#"5"#.as_slice(),
         ] {
-            let response = handle_post(
+            let response = test_handle_post(
                 &registry,
                 &AccessConfig::default(),
                 app.path(),
@@ -686,7 +770,7 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":1}"#.as_slice(),
             br#"{"jsonrpc":"2.0","id":1,"method":7}"#.as_slice(),
         ] {
-            let response = handle_post(
+            let response = test_handle_post(
                 &registry,
                 &AccessConfig::default(),
                 app.path(),
@@ -741,7 +825,7 @@ mod tests {
         )
         .expect("remote MCP registry should build");
 
-        let first_response = handle_post(
+        let first_response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -749,7 +833,7 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"crm.lookup","arguments":{"email":"a@example.com"}}}"#,
         )
         .await;
-        let second_response = handle_post(
+        let second_response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -797,7 +881,7 @@ mod tests {
         let registry = ToolRegistry::build(Path::new(""), &[rust_decl("get_time")])
             .expect("rust builtin registry should build");
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -858,7 +942,7 @@ mod tests {
         )
         .expect("remote MCP registry should build");
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),
@@ -916,7 +1000,7 @@ mod tests {
         )
         .expect("remote MCP registry should build");
 
-        let response = handle_post(
+        let response = test_handle_post(
             &registry,
             &AccessConfig::default(),
             app.path(),

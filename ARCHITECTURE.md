@@ -115,7 +115,7 @@ export const agent = {
 };
 ```
 
-The end state (post-MVP): a single `defineAction({name, input, auth, confirm, handler})` on a route exposes the same action to humans (HTML form), agents (MCP tool), APIs (OpenAPI), and crawlers (metadata) — with dry-run previews, idempotency keys, and human confirmation for destructive scopes. The journal (§5) already gives every agent-initiated action an audit trail.
+The implemented route-action slice lets a route export `agent.actions: [defineAction(...)]`; the same route can receive a human HTML form post and appear in live `/mcp tools/list`, and `/mcp tools/call` dispatches back through the route handler with journaled execution, confirmation checks, and idempotency keys. The remaining end state is to fold this live route binding into runtime OpenAPI and crawler metadata generation.
 
 ## 7. Developer experience
 
@@ -141,7 +141,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **Wasmtime sandbox expansion** — local `wasmtime` tools now run hermetic scalar wasm with empty imports; broader WASI/capability handles for files, sockets, and richer value passing remain future work.
 - **C++ tools** — `cpp_double` proves the `cxx` bridge on the Rust built-in path; richer C++ tool packaging remains future work.
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
-- **defineAction runtime binding** — `beater-connect` now emits `forms.html`, OpenAPI, MCP catalog metadata, and crawl docs from one `Action` definition; route-bound handlers that execute through both HTML form posts and live `/mcp tools/call` remain future work.
+- **defineAction runtime binding** — route modules can now export `agent.actions: [defineAction(...)]`; the hello form posts to the route handler and the same action is exposed through live MCP `tools/list` + journaled `tools/call`. `beater-connect` still emits static forms/OpenAPI/MCP/crawl docs; runtime OpenAPI/crawler unification remains future work.
 - **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.
 - **Isolate pool production hardening / per-request isolation** — `[app].workers = N` starts N route isolates; smoke tests prove round-robin dispatch, and `scripts/isolate-pool-scaling-gate.cjs` proved 7.65x route throughput on ten local workers. Per-request isolation hardening and worker-count tuning remain production work.
 - **LLM streaming to browser** — Anthropic SSE ingestion, partial-step journal records, `GET /_beater/agent/runs/<run_id>/events`, and the hello example's EventSource run stream panel are in place; production run history/navigation polish remains.

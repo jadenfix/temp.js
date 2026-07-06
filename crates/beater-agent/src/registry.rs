@@ -213,7 +213,7 @@ impl ToolNeedsReview {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolCallContext {
     pub tool_use_id: Option<String>,
     pub idempotency_key: Option<String>,

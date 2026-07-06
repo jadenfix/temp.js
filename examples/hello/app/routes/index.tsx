@@ -563,6 +563,51 @@ a {
   line-height: 1.45;
 }
 
+.action-form {
+  display: grid;
+  gap: 10px;
+}
+
+.action-form label {
+  display: grid;
+  gap: 5px;
+  color: #4d5549;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.action-form input,
+.action-form textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #d4dace;
+  border-radius: 8px;
+  background: #fbfcf6;
+  color: #20332e;
+  font: inherit;
+  font-size: 13px;
+  padding: 9px 10px;
+}
+
+.action-form textarea {
+  min-height: 74px;
+  resize: vertical;
+}
+
+.action-confirm {
+  display: flex !important;
+  grid-template-columns: none !important;
+  flex-direction: row;
+  gap: 8px !important;
+  align-items: center;
+}
+
+.action-confirm input {
+  width: 16px;
+  min-width: 16px;
+  aspect-ratio: 1;
+}
+
 @media (max-width: 980px) {
   .topbar,
   .grid,
@@ -852,6 +897,34 @@ export default function Home({ request }: { request: PageRequest }) {
                 </form>
                 <p className="stream-status" data-run-events-status>idle</p>
                 <div className="stream-log" data-run-events-log />
+              </section>
+
+              <section className="panel mini">
+                <h3 className="section-title">Route action</h3>
+                <form
+                  className="action-form"
+                  method="post"
+                  action="/api/actions/contact"
+                  data-beater-action-form
+                >
+                  <label>
+                    Email
+                    <input name="email" type="email" required defaultValue="agent@example.test" />
+                  </label>
+                  <label>
+                    Message
+                    <textarea name="message" required defaultValue="Hello from a route action." />
+                  </label>
+                  <label>
+                    Idempotency key
+                    <input name="idempotency_key" required defaultValue="hello-contact-demo" />
+                  </label>
+                  <label className="action-confirm">
+                    <input name="confirm" type="checkbox" value="true" required />
+                    Confirm write
+                  </label>
+                  <button className="stream-button" type="submit">Send</button>
+                </form>
               </section>
             </aside>
           </section>

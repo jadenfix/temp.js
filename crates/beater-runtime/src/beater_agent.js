@@ -13,6 +13,26 @@ export function defineAgent(cfg) {
   };
 }
 
+export function defineAction(cfg) {
+  if (!cfg || typeof cfg !== "object") {
+    throw new Error("defineAction(config) requires a config object");
+  }
+  if (typeof cfg.name !== "string" || cfg.name.trim() === "") {
+    throw new Error("defineAction requires config.name");
+  }
+  return {
+    name: cfg.name,
+    description: cfg.description ?? `Call ${cfg.name}.`,
+    method: cfg.method ?? "POST",
+    inputSchema: cfg.inputSchema ?? { type: "object", properties: {} },
+    sideEffect: cfg.sideEffect ?? "write",
+    confirm: cfg.confirm === true,
+    dryRun: cfg.dryRun === true,
+    idempotencyRequired: cfg.idempotencyRequired === true,
+    auth: cfg.auth ?? { type: "public" },
+  };
+}
+
 // Python tool: full-fat CPython embedded in the host (numpy/torch work).
 // Not idempotent unless declared — the resume-safety contract.
 export function pyTool(name, path, opts = {}) {

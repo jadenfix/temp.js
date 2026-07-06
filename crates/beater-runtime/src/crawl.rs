@@ -190,6 +190,7 @@ mod tests {
             title: None,
             description: None,
             crawl,
+            actions: Vec::new(),
         })
     }
 
@@ -223,6 +224,7 @@ mod tests {
                     title: Some("Docs [draft]".to_string()),
                     description: None,
                     crawl: true,
+                    actions: Vec::new(),
                 }),
             )],
             &[],

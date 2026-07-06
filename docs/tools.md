@@ -7,7 +7,15 @@ beater.js tools are first-party code declared by an agent and exposed through th
 `agents/<name>/agent.ts` imports helpers from `beater:agent`:
 
 ```ts
-import { browserTool, defineAgent, pyTool, remoteMcpTool, rustTool, wasmtimeTool } from "beater:agent";
+import {
+  browserTool,
+  defineAction,
+  defineAgent,
+  pyTool,
+  remoteMcpTool,
+  rustTool,
+  wasmtimeTool,
+} from "beater:agent";
 
 export default defineAgent({
   name: "support",
@@ -23,6 +31,46 @@ export default defineAgent({
 ```
 
 Tool names are global within the served app registry. If two agents declare the same tool name, the first loaded tool wins and the duplicate is logged.
+
+## Route Actions
+
+API routes can expose the same handler to humans and agents with `defineAction` metadata:
+
+```ts
+import { defineAction } from "beater:agent";
+
+export const agent = {
+  actions: [
+    defineAction({
+      name: "hello.contact",
+      description: "Send a contact request.",
+      method: "POST",
+      confirm: true,
+      idempotencyRequired: true,
+      auth: {type: "public"},
+      inputSchema: {
+        type: "object",
+        properties: {
+          email: {type: "string"},
+          message: {type: "string"},
+          confirm: {type: "boolean"},
+        },
+        required: ["email", "message", "confirm"],
+      },
+    }),
+  ],
+};
+
+export function POST(request) {
+  return {
+    status: 200,
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({ok: true}),
+  };
+}
+```
+
+The route remains a normal HTML form target. The dev server also imports `agent.actions` into `/mcp tools/list`; `/mcp tools/call` journals a synthetic MCP run, enforces confirmation and idempotency metadata, then dispatches the call through the route handler with JSON arguments.
 
 ## Python tools
 

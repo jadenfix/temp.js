@@ -164,6 +164,10 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
         include_str!("../../../examples/hello/app/routes/api/boom.ts"),
     ),
     (
+        "app/routes/api/actions/contact.ts",
+        include_str!("../../../examples/hello/app/routes/api/actions/contact.ts"),
+    ),
+    (
         "agents/support/agent.ts",
         include_str!("../../../examples/hello/agents/support/agent.ts"),
     ),

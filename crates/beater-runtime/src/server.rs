@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use axum::middleware;
 use axum::routing::{Router, get, post};
-use beater_agent::{BeatboxConfig, Journal, ToolRegistry};
+use beater_agent::{BeatboxConfig, Journal, ToolCallContext, ToolRegistry};
 use bytes::Bytes;
 use futures_util::{Stream, stream};
 use serde_json::json;
@@ -29,7 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::AppConfig;
 use crate::loader;
 use crate::router::{RouteKind, RouteTable, Segment};
-use crate::worker::{self, RouteBody, RouteMeta, WorkerMsg};
+use crate::worker::{self, RouteActionMeta, RouteBody, RouteMeta, WorkerMsg};
 use crate::{crawl, mcp};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -270,12 +271,26 @@ async fn handle_mcp_post(
     body: axum::body::Bytes,
 ) -> Response<Body> {
     let surfaces = agent_surfaces(&state).await;
+    let route_actions = if state.mcp_access.origin_allowed(&headers)
+        && state.mcp_access.authorized(&headers)
+    {
+        route_actions(&state).await
+    } else {
+        Vec::new()
+    };
+    let action_state = state.clone();
     mcp::handle_post(
         &surfaces.registry,
+        &route_actions,
         &state.mcp_access,
         &state.app_dir,
         &headers,
         &body,
+        move |action, arguments, context| {
+            let state = action_state.clone();
+            Box::pin(async move { execute_route_action(&state, action, arguments, context).await })
+                as Pin<Box<dyn Future<Output = Result<String>> + Send>>
+        },
     )
     .await
 }
@@ -313,6 +328,86 @@ async fn crawlable_routes(state: &DevState) -> Vec<(String, PathBuf, Option<Rout
         routes.push((pattern, file, meta));
     }
     routes
+}
+
+async fn route_actions(state: &DevState) -> Vec<mcp::RouteActionTool> {
+    let targets: Vec<(String, String)> = {
+        let table = state.routes.read().await;
+        table
+            .iter()
+            .filter(|route| route.kind == RouteKind::Api)
+            .filter(|route| {
+                !route
+                    .segments
+                    .iter()
+                    .any(|segment| matches!(segment, Segment::Param(_)))
+            })
+            .filter_map(|route| {
+                let spec = deno_core::ModuleSpecifier::from_file_path(&route.file)
+                    .ok()
+                    .map(|specifier| specifier.to_string())?;
+                Some((route.pattern.clone(), spec))
+            })
+            .collect()
+    };
+    let mut actions = Vec::new();
+    for (path, specifier) in targets {
+        let Some(meta) = route_meta(state, specifier).await else {
+            continue;
+        };
+        for action in meta.actions {
+            match route_action_tool(&path, action) {
+                Some(tool)
+                    if actions
+                        .iter()
+                        .all(|existing: &mcp::RouteActionTool| existing.name != tool.name) =>
+                {
+                    actions.push(tool);
+                }
+                Some(tool) => {
+                    tracing::warn!("duplicate route action {} — keeping the first", tool.name);
+                }
+                None => {}
+            }
+        }
+    }
+    actions
+}
+
+fn route_action_tool(path: &str, action: RouteActionMeta) -> Option<mcp::RouteActionTool> {
+    let name = action.name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let method = action
+        .method
+        .unwrap_or_else(|| "POST".to_string())
+        .to_uppercase();
+    let description = action
+        .description
+        .filter(|description| !description.trim().is_empty())
+        .unwrap_or_else(|| format!("Call route action {name}."));
+    let input_schema = if action.input_schema.is_object() {
+        action.input_schema
+    } else {
+        json!({"type": "object", "properties": {}})
+    };
+    Some(mcp::RouteActionTool {
+        name: name.to_string(),
+        description,
+        input_schema,
+        method,
+        path: path.to_string(),
+        side_effect: action.side_effect.unwrap_or_else(|| "write".to_string()),
+        confirm: action.confirm,
+        dry_run: action.dry_run,
+        idempotency_required: action.idempotency_required,
+        auth: if action.auth.is_object() {
+            action.auth
+        } else {
+            json!({"type": "public"})
+        },
+    })
 }
 
 fn crawlable_route_targets(table: &RouteTable) -> Vec<(String, PathBuf, Option<String>)> {
@@ -525,6 +620,105 @@ async fn route_meta(state: &DevState, specifier: String) -> Option<RouteMeta> {
         Err(e) => {
             tracing::warn!("route meta failed: {e}");
             None
+        }
+    }
+}
+
+async fn execute_route_action(
+    state: &DevState,
+    action: mcp::RouteActionTool,
+    arguments: serde_json::Value,
+    context: ToolCallContext,
+) -> Result<String> {
+    if action.confirm && arguments.get("confirm").and_then(|value| value.as_bool()) != Some(true) {
+        anyhow::bail!("route action {} requires confirm: true", action.name);
+    }
+    if action.idempotency_required && context.idempotency_key.is_none() {
+        anyhow::bail!("route action {} requires an idempotency key", action.name);
+    }
+    let (specifier, kind) = {
+        let table = state.routes.read().await;
+        match table.match_path(&action.path) {
+            Some((route, _)) => {
+                let spec = deno_core::ModuleSpecifier::from_file_path(&route.file)
+                    .map_err(|_| anyhow::anyhow!("bad route path {}", route.file.display()))?;
+                (spec.to_string(), route.kind)
+            }
+            None => anyhow::bail!(
+                "route action {} path {} is not routed",
+                action.name,
+                action.path
+            ),
+        }
+    };
+    if kind != RouteKind::Api {
+        anyhow::bail!("route action {} must target an API route", action.name);
+    }
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept".to_string(), "application/json".to_string());
+    headers.insert("x-beater-action".to_string(), action.name.clone());
+    if let Some(tool_use_id) = &context.tool_use_id {
+        headers.insert("x-beater-tool-use-id".to_string(), tool_use_id.clone());
+    }
+    if let Some(idempotency_key) = &context.idempotency_key {
+        headers.insert("idempotency-key".to_string(), idempotency_key.clone());
+    }
+    let request_json = json!({
+        "id": NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string(),
+        "method": action.method.clone(),
+        "path": action.path,
+        "params": {},
+        "query": {},
+        "headers": headers,
+        "body": serde_json::to_string(&arguments)?,
+    })
+    .to_string();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let msg = WorkerMsg::Route {
+        specifier,
+        method: action.method.clone(),
+        request_json,
+        page: false,
+        reply: reply_tx,
+    };
+    let tx = clone_worker_tx(&state.worker_txs, &state.next_worker).await;
+    let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        tx.send(msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("js worker is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("js worker dropped the route action request"))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("route action timed out after {REQUEST_TIMEOUT:?}"))??;
+    let response = result.map_err(|stack| anyhow::anyhow!(stack))?;
+    if !(200..300).contains(&response.status) {
+        anyhow::bail!(
+            "route action returned HTTP {}: {}",
+            response.status,
+            route_body_preview(&response.body)
+        );
+    }
+    route_body_string(response.body)
+}
+
+fn route_body_preview(body: &RouteBody) -> String {
+    match body {
+        RouteBody::Full(body) => body.clone(),
+        RouteBody::Chunks(chunks) => chunks.join(""),
+        RouteBody::Stream { .. } => "<stream body>".to_string(),
+    }
+}
+
+fn route_body_string(body: RouteBody) -> Result<String> {
+    match body {
+        RouteBody::Full(body) => Ok(body),
+        RouteBody::Chunks(chunks) => Ok(chunks.join("")),
+        RouteBody::Stream { .. } => {
+            anyhow::bail!("route actions must return a finite body, not a stream")
         }
     }
 }

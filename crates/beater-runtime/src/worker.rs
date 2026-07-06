@@ -80,6 +80,32 @@ pub struct RouteMeta {
     pub title: Option<String>,
     pub description: Option<String>,
     pub crawl: bool,
+    #[serde(default)]
+    pub actions: Vec<RouteActionMeta>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteActionMeta {
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default, rename = "inputSchema", alias = "input_schema")]
+    pub input_schema: serde_json::Value,
+    #[serde(default, rename = "sideEffect", alias = "side_effect")]
+    pub side_effect: Option<String>,
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
+    #[serde(
+        default,
+        rename = "idempotencyRequired",
+        alias = "idempotency_required"
+    )]
+    pub idempotency_required: bool,
+    #[serde(default)]
+    pub auth: serde_json::Value,
 }
 
 #[derive(Debug)]
