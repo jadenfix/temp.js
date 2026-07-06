@@ -50,3 +50,33 @@ scripts/otlp-trace-gate.cjs
 ```
 
 The gate starts a mock Anthropic SSE server, runs the real `beater agent run` CLI against a temp app, captures the OTLP `/v1/traces` request, and verifies the run, LLM, and tool spans. Dashboard proof against a running beater-agents deployment remains the external observability milestone.
+
+Run the local Beater read/dashboard proof with:
+
+```sh
+cargo build --bin beater
+scripts/beater-dashboard-trace-gate.cjs
+```
+
+That gate starts a local `beaterd` from `BEATERD_BIN` or a sibling `../beater` checkout, runs the real `beater agent run` CLI against a temp app, exports native spans to `/v1/traces/native`, and verifies the same Beater read endpoints used by the dashboard:
+
+- `GET /v1/traces/demo?project_id=demo&environment_id=local&trace_id=...`
+- `GET /v1/traces/demo/<trace_id>`
+- `GET /v1/spans/demo/<trace_id>/<span_id>`
+- `GET /v1/spans/demo/<trace_id>/<span_id>/io`
+
+The script prints a dashboard URL for the exported run. To also require a rendered dashboard page, run the gate on a fixed API port and start the dashboard against that same port:
+
+```sh
+# terminal 1
+cd ../beater/web/dashboard
+NEXT_PUBLIC_BEATER_API_BASE_URL=http://127.0.0.1:18080 npm run dev
+
+# terminal 2
+BEATERD_HTTP_PORT=18080 \
+  BEATER_DASHBOARD_PROBE=1 \
+  BEATER_DASHBOARD_URL=http://127.0.0.1:3000 \
+  scripts/beater-dashboard-trace-gate.cjs
+```
+
+Use `BEATERD_OTLP_GRPC_PORT` if the default random OTLP gRPC port is not acceptable in your environment.

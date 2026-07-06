@@ -114,6 +114,31 @@ scripts/otlp-trace-gate.cjs
 
 If the gate fails and you need to inspect its temp app/journal, rerun with `BEATER_KEEP_GATE_WORKDIR=1`.
 
+## Beater dashboard trace gate
+
+`scripts/beater-dashboard-trace-gate.cjs` is the local Beater native ingest/read proof for the dashboard-backed path. It starts a mock Anthropic SSE server and a local `beaterd` from `BEATERD_BIN` or a sibling `../beater` checkout, runs the real `beater agent run` CLI against a temp app with `rustTool("get_time")`, exports native spans to `/v1/traces/native`, then verifies the Beater read endpoints the dashboard uses: trace list, trace detail, span detail, and span I/O. The script prints the dashboard URL for the exported trace. If a dashboard is already running against a fixed Beater API port, set `BEATERD_HTTP_PORT`, `BEATER_DASHBOARD_PROBE=1`, and `BEATER_DASHBOARD_URL` to require the rendered page check too.
+
+Build the local binary with the same PyO3 settings first, then run the gate:
+
+```sh
+tmp_config=$(mktemp /tmp/beater-pyo3-config.XXXXXX)
+printf '%s\n' \
+  'implementation=CPython' \
+  'version=3.9' \
+  'shared=true' \
+  'abi3=false' \
+  'lib_name=python3.9' \
+  'lib_dir=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib' \
+  'executable=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' > "$tmp_config"
+PYO3_CONFIG_FILE="$tmp_config" \
+  DYLD_FRAMEWORK_PATH=/Library/Developer/CommandLineTools/Library/Frameworks \
+  cargo build --bin beater
+rm -f "$tmp_config"
+scripts/beater-dashboard-trace-gate.cjs
+```
+
+If no sibling Beater checkout exists, set `BEATERD_BIN=/path/to/beaterd`. If the gate fails and you need to inspect its temp app or Beater data directory, rerun with `BEATER_KEEP_GATE_WORKDIR=1`.
+
 ## Deploy gate probe
 
 The deploy proof is `scripts/docker-cold-start-gate.sh`. It builds the release CLI in a Linux Docker builder, runs `beater build` for `examples/hello`, builds the generated Dockerfile, starts the image on a loopback-only published port, checks `/api/health`, and proves `/mcp` rejects unauthenticated calls while accepting bearer-token `tools/list`.
