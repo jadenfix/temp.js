@@ -853,11 +853,9 @@ mod tests {
         let referrer =
             ModuleSpecifier::from_file_path(app.path().join("app/routes/index.ts")).unwrap();
 
-        assert!(
-            resolve_import_map("zod", referrer.as_str())
-                .unwrap()
-                .is_none()
-        );
+        assert!(resolve_import_map("zod", referrer.as_str())
+            .unwrap()
+            .is_none());
         let package = resolve_package_import("zod", referrer.as_str())
             .unwrap()
             .unwrap();
@@ -880,11 +878,9 @@ mod tests {
         let referrer =
             ModuleSpecifier::from_file_path(app.path().join("app/routes/index.ts")).unwrap();
 
-        assert!(
-            resolve_import_map("#local", referrer.as_str())
-                .unwrap()
-                .is_none()
-        );
+        assert!(resolve_import_map("#local", referrer.as_str())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
