@@ -158,7 +158,7 @@ docker build -t "$IMAGE" "$WORKDIR/out/bundle" 2>&1 | tee "$WORKDIR/logs/docker-
 
 PORT=$(free_port)
 start=$(now_ms)
-CID=$(docker run -d --rm \
+CID=$(docker run -d \
   -e "BEATER_MCP_TOKEN=$MCP_TOKEN" \
   -p "127.0.0.1:$PORT:3000" \
   "$IMAGE")
@@ -184,6 +184,10 @@ PY
   if [ "$(now_ms)" -ge "$deadline" ]; then
     docker logs "$CID" >"$WORKDIR/logs/container.log" 2>&1 || true
     echo "container did not serve /api/health within 10s" >&2
+    echo "last health probe error:" >&2
+    cat "$WORKDIR/logs/health.err" >&2 || true
+    echo "container logs:" >&2
+    cat "$WORKDIR/logs/container.log" >&2 || true
     echo "logs: $WORKDIR/logs" >&2
     exit 1
   fi
@@ -194,6 +198,8 @@ docker logs "$CID" >"$WORKDIR/logs/container.log" 2>&1 || true
 
 if [ "$elapsed" -gt "$COLD_START_MS" ]; then
   echo "docker cold start exceeded ${COLD_START_MS}ms: ${elapsed}ms" >&2
+  echo "container logs:" >&2
+  cat "$WORKDIR/logs/container.log" >&2 || true
   echo "logs: $WORKDIR/logs" >&2
   exit 1
 fi
