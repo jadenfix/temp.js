@@ -25,7 +25,7 @@ Pre-alpha, built in the open. Current milestone progress:
 - [x] **M5** — route-scoped client module (`/_beater/client/index.js`) hydrates a counter on the hello route
 - [x] **M6** — route-scoped RSC transport (`/_beater/rsc/index.flight`) streams server islands to the browser
 - [x] **M7** — server routes can import local ESM packages from `node_modules` with bare specifiers
-- [ ] **M8** — `beater build` deploy story (runnable host bundle exists; Docker cold-start gate is scripted but still needs a passing Linux image run)
+- [x] **M8** — `beater build` deploy story (runnable host bundle + Docker cold-start gate)
 
 ## Quickstart (target DX)
 
@@ -43,6 +43,8 @@ export ANTHROPIC_API_KEY=sk-ant-...                     # required for live agen
 ./target/debug/beater doctor my-app                      # verify Python/venv/V8 wiring
 ./target/debug/beater build my-app --out /tmp/my-app-bundle
 BEATER_HOST=127.0.0.1 BEATER_PORT=3000 /tmp/my-app-bundle/run.sh
+docker build -t my-app-beater /tmp/my-app-bundle
+docker run --rm -e BEATER_MCP_TOKEN=dev-token -p 127.0.0.1:3000:3000 my-app-beater
 ```
 
 Set `BEATER_TRACE_EXPORT_URL` to export finished agent runs to Beater's native `/v1/traces/native` ingest endpoint. See [Observability](docs/observability.md) for the full environment contract.
@@ -65,7 +67,20 @@ Client modules are route companions such as `app/routes/index.client.ts`. They a
 
 RSC transport is starting as route companions such as `app/routes/index.server.tsx`, streamed from `/_beater/rsc/index.flight` with `text/x-component` frames over the same isolate-to-host stream channel. This is the transport wedge; full React Flight client runtime and client-reference manifests are still Phase C work.
 
-`beater build` currently emits a host-platform bundle: copied app assets, the current `beater` binary, `run.sh`, `beater-build.json`, `.dockerignore`, and a Dockerfile that runs as a non-root `beater` user. Runtime state and common local credential files are excluded. The bundle launcher is tested by starting it and hitting `/api/health`; `scripts/docker-cold-start-gate.sh` codifies the remaining Linux-target image build plus `docker run` cold-start proof.
+`beater build` currently emits a host-platform bundle: copied app assets, the current `beater` binary, `run.sh`, `beater-build.json`, `.dockerignore`, and a Dockerfile that runs as a non-root `beater` user. Runtime state and common local credential files are excluded. The bundle launcher is tested by starting it and hitting `/api/health`, and CI runs a Linux Docker cold-start gate that builds an image, starts the container, verifies `/api/health`, and proves `/mcp` rejects unauthenticated requests while accepting a bearer token.
+
+## Docker deploy gate
+
+The end-to-end deploy proof lives in `scripts/docker-cold-start-gate.sh`. It builds the release CLI inside a Linux Docker builder, runs `beater build` against `examples/hello`, builds the generated Dockerfile, starts the image on a loopback-only published port, waits for `/api/health`, and checks authenticated MCP tool discovery.
+
+Useful knobs:
+
+- `BEATER_DOCKER_RUST_IMAGE=rust:1-bookworm` chooses the Linux builder image.
+- `BEATER_DOCKER_COLD_START_MS=1000` sets the health deadline measured from `docker run`; CI uses `3000` to avoid runner-scheduling flakes while still proving a cold container boot.
+- `BEATER_DOCKER_GATE_WORKDIR=/path/to/workspace` uses an existing workspace for build artifacts, logs, and `evidence.md`.
+- `BEATER_DOCKER_KEEP=1` keeps the target cache and generated image after a successful run.
+- `BEATER_DOCKER_IMAGE=name:tag` uses an explicit image tag and leaves that tag in place.
+- `BEATER_DOCKER_MIN_FREE_KIB=12582912` sets the free-space preflight for the Linux release build.
 
 ## Build from source
 

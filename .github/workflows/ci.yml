@@ -5,7 +5,10 @@ on:
   push:
     branches:
       - main
-      - "codex/**"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   rust:
@@ -49,3 +52,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Docker cold-start gate
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          BEATER_DOCKER_COLD_START_MS: "3000"
+        run: scripts/docker-cold-start-gate.sh
