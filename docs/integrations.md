@@ -34,6 +34,18 @@ Nothing agent-visible should bypass this path. If a tool can mutate external sta
 
 ## Current Kinds
 
+### Beater Connect Actions
+
+`beater-connect` is the static bridge for action definitions today. A single `Action` definition emits OpenAPI, MCP catalog metadata, crawl documents, and `forms.html`. The generated form posts to the action path and preserves the same action semantics as the MCP catalog with `data-auth`, `data-scopes`, `data-confirm`, `data-dry-run`, `data-side-effect`, and `data-idempotency-required` attributes.
+
+```sh
+beater-connect demo --out .agent
+beater-connect print forms
+beater-connect print mcp
+```
+
+Runtime `defineAction` route binding is still future work: the next step is to let route code provide the handler once and have the dev server expose that handler to both HTML form posts and live `/mcp tools/list` + `tools/call`.
+
 ### First-Party Python
 
 Use `pyTool` for app-owned Python code:

@@ -355,6 +355,7 @@ impl ConnectApp {
             agent_card: self.agent_card_json(),
             openapi: self.openapi_json(),
             mcp_catalog: self.mcp_catalog_json(),
+            forms: self.forms_html(),
             llms: self.llms_txt(),
             robots: self.robots_txt(),
             sitemap: self.sitemap_xml(),
@@ -521,6 +522,32 @@ impl ConnectApp {
         .ok();
         writeln!(out, "  ]").ok();
         writeln!(out, "}}").ok();
+        out
+    }
+
+    pub fn forms_html(&self) -> String {
+        let mut out = String::new();
+        writeln!(out, "<!doctype html>").ok();
+        writeln!(out, "<html lang=\"en\">").ok();
+        writeln!(out, "<head>").ok();
+        writeln!(out, "  <meta charset=\"utf-8\">").ok();
+        writeln!(
+            out,
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        )
+        .ok();
+        writeln!(out, "  <title>{} actions</title>", html_escape(&self.name)).ok();
+        writeln!(out, "</head>").ok();
+        writeln!(out, "<body>").ok();
+        writeln!(out, "  <main>").ok();
+        writeln!(out, "    <h1>{} actions</h1>", html_escape(&self.name)).ok();
+        writeln!(out, "    <p>{}</p>", html_escape(&self.description)).ok();
+        for action in &self.actions {
+            self.write_action_form(&mut out, action);
+        }
+        writeln!(out, "  </main>").ok();
+        writeln!(out, "</body>").ok();
+        writeln!(out, "</html>").ok();
         out
     }
 
@@ -786,6 +813,73 @@ impl ConnectApp {
             action.input.json_schema(14)
         )
     }
+
+    fn write_action_form(&self, out: &mut String, action: &Action) {
+        let html_method = if action.method.eq_ignore_ascii_case("GET") {
+            "get"
+        } else {
+            "post"
+        };
+        let scopes = action.auth.scopes().join(" ");
+        writeln!(
+            out,
+            "    <section id=\"action-{}\">",
+            html_escape(&action.id)
+        )
+        .ok();
+        writeln!(out, "      <h2>{}</h2>", html_escape(&action.title)).ok();
+        writeln!(out, "      <p>{}</p>", html_escape(&action.description)).ok();
+        writeln!(
+            out,
+            "      <form method=\"{}\" action=\"{}\" data-action-id=\"{}\" data-method=\"{}\" data-side-effect=\"{}\" data-auth=\"{}\" data-scopes=\"{}\" data-confirm=\"{}\" data-dry-run=\"{}\" data-idempotency-required=\"{}\">",
+            html_method,
+            html_escape(&action.path),
+            html_escape(&action.id),
+            html_escape(&action.method),
+            action.side_effect.as_str(),
+            action.auth.kind(),
+            html_escape(&scopes),
+            action.confirm,
+            action.dry_run,
+            action.idempotency_required
+        )
+        .ok();
+        if !action.method.eq_ignore_ascii_case("GET") && !action.method.eq_ignore_ascii_case("POST")
+        {
+            writeln!(
+                out,
+                "        <input type=\"hidden\" name=\"_method\" value=\"{}\">",
+                html_escape(&action.method)
+            )
+            .ok();
+        }
+        if action.confirm {
+            writeln!(
+                out,
+                "        <label><input type=\"checkbox\" name=\"confirm\" value=\"true\" required> Confirm {}</label>",
+                html_escape(action.side_effect.as_str())
+            )
+            .ok();
+        }
+        if action.idempotency_required {
+            writeln!(
+                out,
+                "        <label>Idempotency key <input name=\"idempotency_key\" autocomplete=\"off\" required></label>"
+            )
+            .ok();
+        }
+        for field in &action.input.fields {
+            write_form_field(out, field);
+        }
+        writeln!(
+            out,
+            "        <button type=\"submit\">{}</button>",
+            html_escape(&action.title)
+        )
+        .ok();
+        writeln!(out, "      </form>").ok();
+        writeln!(out, "    </section>").ok();
+    }
 }
 
 struct OpenApiPathItem {
@@ -847,6 +941,7 @@ pub struct ConnectBundle {
     pub agent_card: String,
     pub openapi: String,
     pub mcp_catalog: String,
+    pub forms: String,
     pub llms: String,
     pub robots: String,
     pub sitemap: String,
@@ -946,6 +1041,56 @@ fn string_array_json(values: &[String]) -> String {
     format!("[{body}]")
 }
 
+fn write_form_field(out: &mut String, field: &Field) {
+    let required = if field.required { " required" } else { "" };
+    let input_type = match field.kind {
+        FieldKind::String => "text",
+        FieldKind::Number | FieldKind::Integer => "number",
+        FieldKind::Boolean => "checkbox",
+        FieldKind::Object | FieldKind::Array => "textarea",
+    };
+    let description = field.description.as_deref().unwrap_or("");
+    if matches!(field.kind, FieldKind::Object | FieldKind::Array) {
+        writeln!(
+            out,
+            "        <label>{} <textarea name=\"{}\"{} aria-description=\"{}\"></textarea></label>",
+            html_escape(&field.name),
+            html_escape(&field.name),
+            required,
+            html_escape(description)
+        )
+        .ok();
+    } else if matches!(field.kind, FieldKind::Boolean) {
+        writeln!(
+            out,
+            "        <label><input type=\"{}\" name=\"{}\" value=\"true\"{} aria-description=\"{}\"> {}</label>",
+            input_type,
+            html_escape(&field.name),
+            required,
+            html_escape(description),
+            html_escape(&field.name)
+        )
+        .ok();
+    } else {
+        let step = if matches!(field.kind, FieldKind::Number) {
+            " step=\"any\""
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "        <label>{} <input type=\"{}\" name=\"{}\"{}{} aria-description=\"{}\"></label>",
+            html_escape(&field.name),
+            input_type,
+            html_escape(&field.name),
+            step,
+            required,
+            html_escape(description)
+        )
+        .ok();
+    }
+}
+
 fn json_escape(value: &str) -> String {
     let mut out = String::new();
     for character in value.chars() {
@@ -958,6 +1103,21 @@ fn json_escape(value: &str) -> String {
             character if character.is_control() => {
                 write!(out, "\\u{:04x}", character as u32).ok();
             }
+            character => out.push(character),
+        }
+    }
+    out
+}
+
+fn html_escape(value: &str) -> String {
+    let mut out = String::new();
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
             character => out.push(character),
         }
     }
@@ -1012,8 +1172,44 @@ mod tests {
             assert!(bundle.agent_card.contains(action));
             assert!(bundle.openapi.contains(action));
             assert!(bundle.mcp_catalog.contains(action));
+            assert!(bundle.forms.contains(action));
             assert!(bundle.llms.contains(action));
         }
+    }
+
+    #[test]
+    fn generated_forms_post_actions_with_mcp_semantics() {
+        let app = demo_app();
+        let forms = app.forms_html();
+        let mcp: serde_json::Value =
+            serde_json::from_str(&app.mcp_catalog_json()).expect("mcp catalog should be JSON");
+        let book_demo = mcp["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "book_demo")
+            .expect("book_demo should be in MCP catalog");
+
+        assert!(
+            forms.contains("action=\"/agent/actions/book-demo\""),
+            "{forms}"
+        );
+        assert!(forms.contains("method=\"post\""), "{forms}");
+        assert!(forms.contains("data-action-id=\"book_demo\""), "{forms}");
+        assert!(forms.contains("data-auth=\"user\""), "{forms}");
+        assert!(forms.contains("data-scopes=\"demo:book\""), "{forms}");
+        assert!(forms.contains("data-confirm=\"true\""), "{forms}");
+        assert!(forms.contains("data-dry-run=\"true\""), "{forms}");
+        assert!(
+            forms.contains("data-idempotency-required=\"true\""),
+            "{forms}"
+        );
+        assert!(forms.contains("name=\"idempotency_key\""), "{forms}");
+        assert!(forms.contains("name=\"confirm\""), "{forms}");
+        assert_eq!(book_demo["auth"]["type"], "user");
+        assert_eq!(book_demo["confirm"], true);
+        assert_eq!(book_demo["dryRun"], true);
+        assert_eq!(book_demo["idempotencyRequired"], true);
     }
 
     #[test]
