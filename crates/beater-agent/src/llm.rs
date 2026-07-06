@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -18,6 +19,7 @@ use crate::registry::AgentConfig;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+static OPENAI_FALLBACK_TOOL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct LlmSelection {
     pub provider: String,
@@ -114,7 +116,7 @@ impl OpenAiCompatible {
         body: &Value,
         mut on_partial: impl FnMut(&Value) -> Result<()>,
     ) -> Result<Value> {
-        let names = ToolNameMap::from_body(body);
+        let names = ToolNameMap::from_body(body)?;
         let request = openai_request_body(body, &names)?;
         let resp = self
             .http
@@ -134,29 +136,18 @@ impl OpenAiCompatible {
 
         let mut decoder = SseDecoder::default();
         let mut assembler = OpenAiStreamAssembler::new(names.provider_to_original);
+        let mut saw_done = false;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading openai-compatible streaming response body")?;
             for event in decoder.push(&chunk)? {
-                if event.data.trim() == "[DONE]" {
-                    continue;
-                }
-                let chunk = event.json_data("openai-compatible")?;
-                let partial = json!({"event": "openai_chunk", "data": chunk});
-                on_partial(&partial)?;
-                assembler.apply(&partial["data"])?;
+                handle_openai_event(event, &mut assembler, &mut saw_done, &mut on_partial)?;
             }
         }
         for event in decoder.finish()? {
-            if event.data.trim() == "[DONE]" {
-                continue;
-            }
-            let chunk = event.json_data("openai-compatible")?;
-            let partial = json!({"event": "openai_chunk", "data": chunk});
-            on_partial(&partial)?;
-            assembler.apply(&partial["data"])?;
+            handle_openai_event(event, &mut assembler, &mut saw_done, &mut on_partial)?;
         }
-        assembler.finish(body["model"].clone())
+        assembler.finish(body["model"].clone(), saw_done)
     }
 }
 
@@ -400,6 +391,30 @@ impl SseEvent {
     }
 }
 
+fn handle_openai_event(
+    event: SseEvent,
+    assembler: &mut OpenAiStreamAssembler,
+    saw_done: &mut bool,
+    on_partial: &mut impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    if event.data.trim() == "[DONE]" {
+        *saw_done = true;
+        return Ok(());
+    }
+    if *saw_done {
+        bail!("openai-compatible stream sent data after [DONE]");
+    }
+    let chunk = event.json_data("openai-compatible")?;
+    if event.event == "error" || chunk.get("error").is_some() {
+        bail!(
+            "openai-compatible stream error event; payload omitted from journal to avoid leaking provider-returned secrets"
+        );
+    }
+    let partial = json!({"event": "openai_chunk", "data": chunk});
+    on_partial(&partial)?;
+    assembler.apply(&partial["data"])
+}
+
 struct OpenAiStreamAssembler {
     id: Option<String>,
     model: Option<String>,
@@ -407,6 +422,7 @@ struct OpenAiStreamAssembler {
     tool_calls: Vec<Option<ToolCallState>>,
     finish_reason: Option<String>,
     provider_to_original: HashMap<String, String>,
+    fallback_tool_id_prefix: String,
 }
 
 #[derive(Default)]
@@ -418,6 +434,7 @@ struct ToolCallState {
 
 impl OpenAiStreamAssembler {
     fn new(provider_to_original: HashMap<String, String>) -> Self {
+        let fallback_id = OPENAI_FALLBACK_TOOL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         Self {
             id: None,
             model: None,
@@ -425,6 +442,7 @@ impl OpenAiStreamAssembler {
             tool_calls: Vec::new(),
             finish_reason: None,
             provider_to_original,
+            fallback_tool_id_prefix: format!("toolu_openai_{fallback_id}"),
         }
     }
 
@@ -479,11 +497,15 @@ impl OpenAiStreamAssembler {
         Ok(())
     }
 
-    fn finish(self, request_model: Value) -> Result<Value> {
+    fn finish(self, request_model: Value, saw_done: bool) -> Result<Value> {
+        if !saw_done {
+            bail!("openai-compatible stream ended before [DONE]");
+        }
         let mut content = Vec::new();
         if !self.text.is_empty() {
             content.push(json!({"type": "text", "text": self.text}));
         }
+        let fallback_tool_id_prefix = &self.fallback_tool_id_prefix;
         for (index, call) in self.tool_calls.into_iter().enumerate() {
             let Some(call) = call else {
                 continue;
@@ -504,7 +526,7 @@ impl OpenAiStreamAssembler {
             };
             content.push(json!({
                 "type": "tool_use",
-                "id": call.id.unwrap_or_else(|| format!("toolu_openai_{index}")),
+                "id": call.id.unwrap_or_else(|| format!("{fallback_tool_id_prefix}_{index}")),
                 "name": name,
                 "input": input,
             }));
@@ -537,13 +559,14 @@ impl OpenAiStreamAssembler {
     }
 }
 
+#[derive(Debug)]
 struct ToolNameMap {
     original_to_provider: HashMap<String, String>,
     provider_to_original: HashMap<String, String>,
 }
 
 impl ToolNameMap {
-    fn from_body(body: &Value) -> Self {
+    fn from_body(body: &Value) -> Result<Self> {
         let mut original_to_provider = HashMap::new();
         let mut provider_to_original = HashMap::new();
         for tool in body["tools"].as_array().into_iter().flatten() {
@@ -551,13 +574,20 @@ impl ToolNameMap {
                 continue;
             };
             let provider = openai_tool_name(original);
+            if let Some(existing) = provider_to_original.get(&provider)
+                && existing != original
+            {
+                bail!(
+                    "OpenAI-compatible tool name collision after sanitization: {existing:?} and {original:?} both map to {provider:?}"
+                );
+            }
             original_to_provider.insert(original.to_string(), provider.clone());
             provider_to_original.insert(provider, original.to_string());
         }
-        Self {
+        Ok(Self {
             original_to_provider,
             provider_to_original,
-        }
+        })
     }
 
     fn provider_name(&self, original: &str) -> String {
@@ -605,8 +635,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        openai_request_body, openai_tool_name, validate_openai_base_url, OpenAiStreamAssembler,
-        ToolNameMap,
+        handle_openai_event, openai_request_body, openai_tool_name, validate_openai_base_url,
+        OpenAiStreamAssembler, SseEvent, ToolNameMap,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -648,7 +678,7 @@ mod tests {
                 }]}
             ]
         });
-        let names = ToolNameMap::from_body(&body);
+        let names = ToolNameMap::from_body(&body).unwrap();
         let request = openai_request_body(&body, &names).unwrap();
         assert_eq!(request["messages"][0]["role"], "system");
         assert_eq!(request["messages"][2]["tool_calls"][0]["id"], "call_1");
@@ -656,6 +686,22 @@ mod tests {
         assert_eq!(
             request["tools"][0]["function"]["name"],
             names.provider_name("crm.lookup")
+        );
+    }
+
+    #[test]
+    fn openai_tool_name_collisions_are_rejected() {
+        let generated = openai_tool_name("crm.lookup/customer");
+        let body = json!({
+            "tools": [
+                {"name": "crm.lookup/customer"},
+                {"name": generated.clone()}
+            ]
+        });
+        let error = ToolNameMap::from_body(&body).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("tool name collision"),
+            "{error:#}"
         );
     }
 
@@ -669,11 +715,92 @@ mod tests {
                 "choices": [{"delta": {"content": "partial"}, "finish_reason": null}]
             }))
             .unwrap();
-        let error = assembler.finish(json!("mock")).unwrap_err();
+        let error = assembler.finish(json!("mock"), true).unwrap_err();
         assert!(
             format!("{error:#}").contains("without terminal finish_reason"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn openai_stream_requires_done_frame() {
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        assembler
+            .apply(&json!({
+                "id": "chatcmpl_1",
+                "model": "mock",
+                "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]
+            }))
+            .unwrap();
+        let error = assembler.finish(json!("mock"), false).unwrap_err();
+        assert!(format!("{error:#}").contains("before [DONE]"), "{error:#}");
+    }
+
+    #[test]
+    fn openai_stream_rejects_data_after_done() {
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        let mut saw_done = false;
+        let mut partials = Vec::new();
+        let error = {
+            let mut on_partial = |partial: &serde_json::Value| {
+                partials.push(partial.clone());
+                Ok(())
+            };
+            handle_openai_event(
+                SseEvent {
+                    event: "message".to_string(),
+                    data: "[DONE]".to_string(),
+                },
+                &mut assembler,
+                &mut saw_done,
+                &mut on_partial,
+            )
+            .unwrap();
+            handle_openai_event(
+                SseEvent {
+                    event: "message".to_string(),
+                    data: json!({
+                        "choices": [{"delta": {"content": "late"}, "finish_reason": "stop"}]
+                    })
+                    .to_string(),
+                },
+                &mut assembler,
+                &mut saw_done,
+                &mut on_partial,
+            )
+            .unwrap_err()
+        };
+        assert!(format!("{error:#}").contains("after [DONE]"), "{error:#}");
+        assert!(partials.is_empty(), "{partials:?}");
+    }
+
+    #[test]
+    fn openai_stream_error_events_are_not_journaled() {
+        let provider_secret = format!("{}{}", "nv", "api-test-fixture");
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        let mut saw_done = false;
+        let mut partials = Vec::new();
+        let error = {
+            let mut on_partial = |partial: &serde_json::Value| {
+                partials.push(partial.clone());
+                Ok(())
+            };
+            handle_openai_event(
+                SseEvent {
+                    event: "error".to_string(),
+                    data: json!({"error": {"message": format!("echoed {provider_secret}")}})
+                        .to_string(),
+                },
+                &mut assembler,
+                &mut saw_done,
+                &mut on_partial,
+            )
+            .unwrap_err()
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("payload omitted"), "{message}");
+        assert!(!message.contains(&provider_secret), "{message}");
+        assert!(partials.is_empty(), "{partials:?}");
     }
 
     #[test]
@@ -711,10 +838,42 @@ mod tests {
                 }]
             }))
             .unwrap();
-        let message = assembler.finish(json!("mock")).unwrap();
+        let message = assembler.finish(json!("mock"), true).unwrap();
         assert_eq!(message["stop_reason"], "tool_use");
         assert_eq!(message["content"][0]["type"], "tool_use");
         assert_eq!(message["content"][0]["name"], "summarize_numbers");
         assert_eq!(message["content"][0]["input"]["numbers"][1], 2);
+    }
+
+    #[test]
+    fn openai_fallback_tool_ids_are_unique_across_responses() {
+        let first_id = fallback_tool_id_for_omitted_provider_id();
+        let second_id = fallback_tool_id_for_omitted_provider_id();
+        assert_ne!(first_id, second_id);
+    }
+
+    fn fallback_tool_id_for_omitted_provider_id() -> String {
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        assembler
+            .apply(&json!({
+                "model": "mock",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "name": "summarize_numbers",
+                                "arguments": "{\"numbers\":[1]}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .unwrap();
+        assembler.finish(json!("mock"), true).unwrap()["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 }

@@ -77,21 +77,11 @@ impl Anthropic {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading anthropic streaming response body")?;
             for event in decoder.push(&chunk)? {
-                if event.data.trim() == "[DONE]" {
-                    continue;
-                }
-                let partial = event.as_partial()?;
-                on_partial(&partial)?;
-                assembler.apply(&partial["data"])?;
+                handle_anthropic_event(event, &mut assembler, &mut on_partial)?;
             }
         }
         for event in decoder.finish()? {
-            if event.data.trim() == "[DONE]" {
-                continue;
-            }
-            let partial = event.as_partial()?;
-            on_partial(&partial)?;
-            assembler.apply(&partial["data"])?;
+            handle_anthropic_event(event, &mut assembler, &mut on_partial)?;
         }
         assembler.finish()
     }
@@ -180,6 +170,22 @@ impl SseEvent {
                 .with_context(|| format!("anthropic stream event {:?} was not JSON", self.event))?,
         }))
     }
+}
+
+fn handle_anthropic_event(
+    event: SseEvent,
+    assembler: &mut MessageStreamAssembler,
+    on_partial: &mut impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    if event.data.trim() == "[DONE]" {
+        return Ok(());
+    }
+    let partial = event.as_partial()?;
+    if partial["data"]["type"].as_str() == Some("error") {
+        return assembler.apply(&partial["data"]);
+    }
+    on_partial(&partial)?;
+    assembler.apply(&partial["data"])
 }
 
 #[derive(Default)]
@@ -663,14 +669,19 @@ mod tests {
         )
         .expect("test client should build");
 
+        let mut partials = Vec::new();
         let error = client
-            .create_message_streaming(&json!({"model": "mock", "messages": []}), |_| Ok(()))
+            .create_message_streaming(&json!({"model": "mock", "messages": []}), |partial| {
+                partials.push(partial.clone());
+                Ok(())
+            })
             .await
             .unwrap_err();
         let message = format!("{error:#}");
 
         assert!(message.contains("payload omitted"), "{message}");
         assert!(!message.contains(&echoed_secret), "{message}");
+        assert!(partials.is_empty(), "{partials:?}");
         assert_eq!(server.join(), 1);
     }
 
