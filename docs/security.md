@@ -48,7 +48,7 @@ Operational implications:
 
 Networked tools have explicit timeouts, retry policy, idempotency keys, secret handling, and egress allowlists. Remote MCP tools read bearer tokens from environment variables, require HTTPS for bearer auth except loopback test servers, fail before connecting when a required secret is missing, and never follow redirects. Transient failures retry only when the tool is idempotent or a configured `tool_use_id` idempotency key is available; ambiguous non-idempotent failures park the run as `needs_review`. SaaS API integrations and browser automation sessions should follow the same registry path so calls are journaled before side effects happen.
 
-`GET /_beater/agent/runs/<run_id>/events` streams journaled LLM partials for browser run UIs. It contains the same sensitive content as the journal and reuses the MCP origin and bearer-token policy.
+`GET /_beater/agent/runs`, `GET /_beater/agent/runs/<run_id>`, and `GET /_beater/agent/runs/<run_id>/events` expose journaled run history and LLM partials for browser run UIs. They contain the same sensitive content as the journal and reuse the MCP origin and bearer-token policy.
 
 ## Agentic Browsing
 

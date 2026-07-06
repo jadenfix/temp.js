@@ -80,6 +80,7 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
     );
     assert!(home.contains("data-beater-counter"), "{home}");
     assert!(home.contains("data-beater-run-events"), "{home}");
+    assert!(home.contains("data-run-history"), "{home}");
     assert!(home.contains("data-beater-action-form"), "{home}");
 
     let client =
@@ -94,7 +95,16 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         "{client}"
     );
     assert!(client.contains("new EventSource"), "{client}");
+    assert!(client.contains("fetch(\"/_beater/agent/runs\""), "{client}");
     assert!(!client.contains(": number"), "{client}");
+
+    let runs = http_request(port, "GET", "/_beater/agent/runs", None).expect("GET run history");
+    assert!(runs.starts_with("HTTP/1.1 200"), "{runs}");
+    assert!(runs.contains("\"runs\":["), "{runs}");
+
+    let missing_run =
+        http_request(port, "GET", "/_beater/agent/runs/not-a-run", None).expect("GET missing run");
+    assert!(missing_run.starts_with("HTTP/1.1 404"), "{missing_run}");
 
     let missing = http_request(port, "GET", "/not-a-route", None).expect("GET /not-a-route");
     assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
@@ -568,6 +578,7 @@ export function GET() {
         "{home}"
     );
     assert!(home.contains("data-beater-run-events"), "{home}");
+    assert!(home.contains("data-run-history"), "{home}");
     assert!(home.contains("data-beater-action-form"), "{home}");
 
     let client =
@@ -582,6 +593,7 @@ export function GET() {
         "{client}"
     );
     assert!(client.contains("new EventSource"), "{client}");
+    assert!(client.contains("fetch(\"/_beater/agent/runs\""), "{client}");
     assert!(!client.contains(": number"), "{client}");
 
     let flight =

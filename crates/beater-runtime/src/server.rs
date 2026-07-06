@@ -145,6 +145,8 @@ pub async fn serve(
         .route("/llms.txt", get(handle_llms))
         .route("/openapi.json", get(handle_openapi))
         .route("/.well-known/beater.json", get(handle_well_known))
+        .route("/_beater/agent/runs", get(handle_agent_runs))
+        .route("/_beater/agent/runs/{run_id}", get(handle_agent_run))
         .route(
             "/_beater/agent/runs/{run_id}/events",
             get(handle_agent_run_events),
@@ -487,20 +489,119 @@ async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
         .expect("static response")
 }
 
+async fn handle_agent_runs(State(state): State<DevState>, headers: HeaderMap) -> Response<Body> {
+    if let Some(response) = authorize_agent_run_surface(&state, &headers) {
+        return response;
+    }
+    let journal = match Journal::open(&state.app_dir) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("journal unavailable: {error:#}"),
+            );
+        }
+    };
+    match journal.list_runs() {
+        Ok(runs) => json_response(
+            StatusCode::OK,
+            json!({
+                "runs": runs.into_iter().map(|(run, steps)| {
+                    json!({
+                        "id": run.id,
+                        "agent": run.agent,
+                        "status": run.status,
+                        "input": run.input,
+                        "created_at": run.created_at,
+                        "updated_at": run.updated_at,
+                        "steps": steps,
+                    })
+                }).collect::<Vec<_>>()
+            }),
+        ),
+        Err(error) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("journal unavailable: {error:#}"),
+        ),
+    }
+}
+
+async fn handle_agent_run(
+    State(state): State<DevState>,
+    AxumPath(run_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Some(response) = authorize_agent_run_surface(&state, &headers) {
+        return response;
+    }
+    let journal = match Journal::open(&state.app_dir) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("journal unavailable: {error:#}"),
+            );
+        }
+    };
+    let run = match journal.run(&run_id) {
+        Ok(run) => run,
+        Err(_) => return text_response(StatusCode::NOT_FOUND, "run not found".to_string()),
+    };
+    let steps = match journal.steps(&run_id) {
+        Ok(steps) => steps,
+        Err(error) => {
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("journal unavailable: {error:#}"),
+            );
+        }
+    };
+    let mut step_values = Vec::with_capacity(steps.len());
+    for step in steps {
+        let partials = match journal.step_partials(&run_id, step.seq) {
+            Ok(partials) => partials,
+            Err(error) => {
+                return text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("journal unavailable: {error:#}"),
+                );
+            }
+        };
+        step_values.push(json!({
+            "seq": step.seq,
+            "kind": step.kind,
+            "status": step.status,
+            "request": step.request,
+            "result": step.result,
+            "tool_name": step.tool_name,
+            "tool_use_id": step.tool_use_id,
+            "attempt": step.attempt,
+            "partials": partials.len(),
+        }));
+    }
+    json_response(
+        StatusCode::OK,
+        json!({
+            "run": {
+                "id": run.id,
+                "agent": run.agent,
+                "status": run.status,
+                "input": run.input,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+            },
+            "steps": step_values,
+        }),
+    )
+}
+
 async fn handle_agent_run_events(
     State(state): State<DevState>,
     AxumPath(run_id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if !state.mcp_access.origin_allowed(&headers) {
-        return text_response(StatusCode::FORBIDDEN, "origin not allowed".to_string());
-    }
-    if !state.mcp_access.authorized(&headers) {
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("www-authenticate", "Bearer")
-            .body(Body::from("missing or invalid bearer token"))
-            .expect("static response");
+    if let Some(response) = authorize_agent_run_surface(&state, &headers) {
+        return response;
     }
     match Journal::open(&state.app_dir).and_then(|journal| journal.run(&run_id).map(|_| ())) {
         Ok(()) => {}
@@ -518,6 +619,25 @@ async fn handle_agent_run_events(
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
         .expect("stream response")
+}
+
+fn authorize_agent_run_surface(state: &DevState, headers: &HeaderMap) -> Option<Response<Body>> {
+    if !state.mcp_access.origin_allowed(headers) {
+        return Some(text_response(
+            StatusCode::FORBIDDEN,
+            "origin not allowed".to_string(),
+        ));
+    }
+    if !state.mcp_access.authorized(headers) {
+        return Some(
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer")
+                .body(Body::from("missing or invalid bearer token"))
+                .expect("static response"),
+        );
+    }
+    None
 }
 
 struct RunEventStreamState {
@@ -1293,6 +1413,14 @@ fn text_response(status: StatusCode, body: String) -> Response<Body> {
         .expect("static response")
 }
 
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static response")
+}
+
 fn method_not_allowed_response(allow: &'static str, body: &'static str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -1325,9 +1453,10 @@ mod tests {
     use super::{
         AgentSurfaces, DevState, apply_route_security_headers, cancel_on_drop_body_stream,
         client_module_response, client_module_route_path, crawlable_route_targets,
-        find_client_module, find_rsc_server_module, handle_agent_run_events,
-        method_not_allowed_response, route_response, route_response_body, rsc_flight_route_path,
-        secure_route_response, send_worker_msg, text_response, with_route_security_headers,
+        find_client_module, find_rsc_server_module, handle_agent_run, handle_agent_run_events,
+        handle_agent_runs, method_not_allowed_response, route_response, route_response_body,
+        rsc_flight_route_path, secure_route_response, send_worker_msg, text_response,
+        with_route_security_headers,
     };
     use crate::mcp;
     use crate::router::RouteTable;
@@ -1712,6 +1841,93 @@ mod tests {
         assert!(body.contains("\"text\":\"hel\""), "{body}");
         assert!(body.contains("\"text\":\"lo\""), "{body}");
         assert!(body.contains("event: done"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn agent_runs_lists_recent_journal_rows() {
+        let app = TempDir::new("agent-runs-list");
+        let journal = Journal::open(app.path()).unwrap();
+        journal.create_run("run-1", "support", "hello").unwrap();
+        let seq = journal
+            .start_step(
+                "run-1",
+                "tool_call",
+                &json!({"name": "get_time"}),
+                Some("get_time"),
+                None,
+                1,
+            )
+            .unwrap();
+        journal
+            .complete_step("run-1", seq, &json!({"ok": true}))
+            .unwrap();
+        journal.set_run_status("run-1", "completed").unwrap();
+
+        let response = handle_agent_runs(
+            State(test_state(&app, mcp::AccessConfig::default())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["runs"][0]["id"], "run-1");
+        assert_eq!(body["runs"][0]["agent"], "support");
+        assert_eq!(body["runs"][0]["status"], "completed");
+        assert_eq!(body["runs"][0]["steps"], 1);
+    }
+
+    #[tokio::test]
+    async fn agent_run_detail_includes_steps_and_partial_counts() {
+        let app = TempDir::new("agent-run-detail");
+        let journal = Journal::open(app.path()).unwrap();
+        journal.create_run("run-1", "support", "hello").unwrap();
+        let seq = journal
+            .start_step(
+                "run-1",
+                "llm_call",
+                &json!({"messages": [{"role": "user", "content": "hello"}]}),
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+        journal
+            .append_step_partial(
+                "run-1",
+                seq,
+                "content_block_delta",
+                &json!({"data": {"delta": {"text": "hi"}}}),
+            )
+            .unwrap();
+        journal
+            .complete_step("run-1", seq, &json!({"stop_reason": "end_turn"}))
+            .unwrap();
+
+        let response = handle_agent_run(
+            State(test_state(&app, mcp::AccessConfig::default())),
+            AxumPath("run-1".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["run"]["id"], "run-1");
+        assert_eq!(body["steps"][0]["seq"], seq);
+        assert_eq!(body["steps"][0]["kind"], "llm_call");
+        assert_eq!(body["steps"][0]["attempt"], 2);
+        assert_eq!(body["steps"][0]["partials"], 1);
     }
 
     #[tokio::test]

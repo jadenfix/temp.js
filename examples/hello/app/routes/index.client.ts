@@ -88,10 +88,19 @@ if (rscRoot) {
 }
 
 if (runEventsRoot) {
+  type RunSummary = {
+    id: string;
+    agent: string;
+    status: string;
+    input: string;
+    steps: number;
+  };
+
   const form = runEventsRoot.querySelector<HTMLFormElement>("[data-run-events-form]");
   const input = runEventsRoot.querySelector<HTMLInputElement>("[data-run-id-input]");
   const status = runEventsRoot.querySelector<HTMLElement>("[data-run-events-status]");
   const log = runEventsRoot.querySelector<HTMLElement>("[data-run-events-log]");
+  const history = runEventsRoot.querySelector<HTMLElement>("[data-run-history]");
   let source: EventSource | null = null;
 
   const setStatus = (value: string, state: string) => {
@@ -105,6 +114,73 @@ if (runEventsRoot) {
     line.textContent = value;
     log.append(line);
     log.scrollTop = log.scrollHeight;
+  };
+
+  const openRun = async (runId: string) => {
+    source?.close();
+    if (log) log.textContent = "";
+    if (input) input.value = runId;
+    setStatus("loading run", "connecting");
+
+    const detail = await fetch(`/_beater/agent/runs/${encodeURIComponent(runId)}`, {
+      headers: { accept: "application/json" },
+    });
+    if (!detail.ok) throw new Error(`run detail returned ${detail.status}`);
+    const body = await detail.json();
+    appendLine(`${body.run.agent} · ${body.run.status} · ${body.steps.length} steps`);
+    for (const step of body.steps.slice(-3)) {
+      appendLine(`#${step.seq} ${step.kind} ${step.status} partials=${step.partials}`);
+    }
+
+    setStatus("connecting", "connecting");
+    source = new EventSource(`/_beater/agent/runs/${encodeURIComponent(runId)}/events`);
+    source.addEventListener("open", () => setStatus("streaming", "streaming"));
+    source.addEventListener("llm_partial", (event) => partialText(event as MessageEvent<string>));
+    source.addEventListener("done", () => {
+      setStatus("complete", "done");
+      source?.close();
+      source = null;
+    });
+    source.addEventListener("error", () => {
+      setStatus("stream unavailable", "error");
+      source?.close();
+      source = null;
+    });
+  };
+
+  const renderHistory = (runs: RunSummary[]) => {
+    if (!history) return;
+    history.textContent = "";
+    if (runs.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "run-history-meta";
+      empty.textContent = "no runs yet";
+      history.append(empty);
+      return;
+    }
+    for (const run of runs.slice(0, 4)) {
+      const button = document.createElement("button");
+      button.className = "run-history-item";
+      button.type = "button";
+      button.dataset.runId = run.id;
+
+      const id = document.createElement("span");
+      id.className = "run-history-id";
+      id.textContent = run.id;
+
+      const meta = document.createElement("span");
+      meta.className = "run-history-meta";
+      meta.textContent = `${run.agent} · ${run.status} · ${run.steps}`;
+
+      button.append(id, meta);
+      button.addEventListener("click", () => {
+        openRun(run.id).catch((error) => {
+          setStatus("run unavailable", "error");
+          appendLine(error instanceof Error ? error.message : String(error));
+        });
+      });
+      history.append(button);
+    }
   };
 
   const partialText = (event: MessageEvent<string>) => {
@@ -122,21 +198,23 @@ if (runEventsRoot) {
       return;
     }
 
-    source?.close();
-    if (log) log.textContent = "";
-    setStatus("connecting", "connecting");
-    source = new EventSource(`/_beater/agent/runs/${encodeURIComponent(runId)}/events`);
-    source.addEventListener("open", () => setStatus("streaming", "streaming"));
-    source.addEventListener("llm_partial", (event) => partialText(event as MessageEvent<string>));
-    source.addEventListener("done", () => {
-      setStatus("complete", "done");
-      source?.close();
-      source = null;
-    });
-    source.addEventListener("error", () => {
-      setStatus("stream unavailable", "error");
-      source?.close();
-      source = null;
+    openRun(runId).catch((error) => {
+      setStatus("run unavailable", "error");
+      appendLine(error instanceof Error ? error.message : String(error));
     });
   });
+
+  fetch("/_beater/agent/runs", { headers: { accept: "application/json" } })
+    .then((response) => {
+      if (!response.ok) throw new Error(`runs returned ${response.status}`);
+      return response.json();
+    })
+    .then((body: { runs: RunSummary[] }) => {
+      renderHistory(body.runs ?? []);
+      setStatus((body.runs ?? []).length ? "ready" : "no runs", "idle");
+    })
+    .catch((error) => {
+      setStatus("history unavailable", "error");
+      appendLine(error instanceof Error ? error.message : String(error));
+    });
 }

@@ -541,6 +541,45 @@ a {
   padding: 0 14px;
 }
 
+.run-history {
+  display: grid;
+  gap: 6px;
+  min-height: 36px;
+}
+
+.run-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  border: 1px solid #d4dace;
+  border-radius: 8px;
+  background: #fbfcf6;
+  color: #20332e;
+  cursor: pointer;
+  font: inherit;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.run-history-id,
+.run-history-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-history-id {
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.run-history-meta {
+  color: #5d6658;
+  font-size: 11px;
+}
+
 .stream-status {
   margin: 0;
   color: #4d5549;
@@ -896,6 +935,7 @@ export default function Home({ request }: { request: PageRequest }) {
                   <button className="stream-button" type="submit">Open</button>
                 </form>
                 <p className="stream-status" data-run-events-status>idle</p>
+                <div className="run-history" data-run-history />
                 <div className="stream-log" data-run-events-log />
               </section>
 
