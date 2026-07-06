@@ -1,6 +1,8 @@
 # Observability
 
-beater.js can export journaled agent runs to the Beater native trace ingest API after `beater agent run` or `beater agent resume` returns. The exporter is disabled by default and is best effort: export failures are logged, but they do not change the agent run result.
+beater.js can export journaled agent runs after `beater agent run` or `beater agent resume` returns. Export is disabled by default and is best effort: failures are logged, but they do not change the agent run result.
+
+## Native Beater Ingest
 
 Enable it with:
 
@@ -12,13 +14,39 @@ export BEATER_ENVIRONMENT_ID="local"
 export BEATER_API_KEY="..." # optional when your Beater ingest requires it
 ```
 
-When enabled, each run is projected into Beater native spans and posted to `/v1/traces/native`:
+When enabled, each run is projected into Beater native spans and posted to `/v1/traces/native`.
+
+## OTLP HTTP Export
+
+Enable OTLP/HTTP JSON export with either Beater's explicit env var:
+
+```sh
+export BEATER_OTLP_EXPORT_URL="http://127.0.0.1:4318"
+```
+
+or standard OpenTelemetry endpoint variables:
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:4318"
+# or
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="http://127.0.0.1:4318/v1/traces"
+```
+
+`BEATER_OTLP_EXPORT_URL` and `OTEL_EXPORTER_OTLP_ENDPOINT` are treated as collector base URLs and post to `/v1/traces`; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is used as the full traces endpoint. `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` are forwarded as comma-separated `name=value` headers. `BEATER_API_KEY`, when set, is forwarded as `x-beater-api-key`.
+
+The OTLP payload contains one resource span batch for the run:
 
 - one `agent.run` span for the journal run
 - one `llm.call` span per journaled LLM step
 - one `tool.call` span per journaled tool step
 - `agent.step` spans for other step kinds
 
-Span attributes include the beater.js run id, agent name, step sequence, step kind/status/attempt, and tool name or tool use id when present. Span `input` and `output` fields are populated from the journaled prompt, request, and result payloads.
+Span attributes include the beater.js run id, agent name, step sequence, step kind/status/attempt, and tool name or tool use id when present. OTLP spans also include `beater.input` and `beater.output` events whose `beater.payload_json` attribute contains the journaled prompt, request, response, or tool result payload.
 
-This is the first native Beater bridge. Full OTLP export and dashboard proof remain future work for the observability milestone.
+Run the local OTLP proof with:
+
+```sh
+scripts/otlp-trace-gate.cjs
+```
+
+The gate starts a mock Anthropic SSE server, runs the real `beater agent run` CLI against a temp app, captures the OTLP `/v1/traces` request, and verifies the run, LLM, and tool spans. Dashboard proof against a running beater-agents deployment remains the external observability milestone.

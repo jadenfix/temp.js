@@ -633,6 +633,11 @@ def run(input):
                 std::env::remove_var("BEATER_PROJECT_ID");
                 std::env::remove_var("BEATER_ENVIRONMENT_ID");
                 std::env::remove_var("BEATER_API_KEY");
+                std::env::remove_var("BEATER_OTLP_EXPORT_URL");
+                std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+                std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+                std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS");
+                std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_HEADERS");
             }
         }
     }
@@ -1457,6 +1462,94 @@ def run(input):
         assert_eq!(tool["parent_span_id"], "run");
         assert_eq!(tool["attributes"]["beater.tool_name"], "browser.checkout");
         assert_eq!(tool["attributes"]["beater.tool_use_id"], "toolu_browser");
+    }
+
+    #[test]
+    fn run_exports_otlp_trace_when_configured() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let app = TempApp::new("otlp-trace-export");
+        let anthropic = MockAnthropic::new(vec![
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_browser",
+                    "name": "browser.checkout",
+                    "input": {
+                        "url": "https://shop.example/cart",
+                        "task": "verify checkout"
+                    },
+                }],
+                "stop_reason": "tool_use",
+            }),
+            json!({
+                "content": [{"type": "text", "text": "checkout verified"}],
+                "stop_reason": "end_turn",
+            }),
+        ]);
+        let trace_ingest = MockTraceIngest::new(1);
+        let _env = EnvGuard::set(&anthropic.base_url);
+        unsafe {
+            std::env::set_var("BEATER_OTLP_EXPORT_URL", &trace_ingest.base_url);
+            std::env::set_var("BEATER_TENANT_ID", "tenant");
+            std::env::set_var("BEATER_PROJECT_ID", "project");
+            std::env::set_var("BEATER_ENVIRONMENT_ID", "prod");
+            std::env::set_var("BEATER_API_KEY", "trace-key");
+            std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "x-extra-trace=ok");
+        }
+
+        run(
+            app.path(),
+            "support",
+            browser_config(),
+            None,
+            BeatboxConfig::default(),
+            "verify checkout",
+        )
+        .unwrap();
+        let _anthropic_requests = anthropic.join();
+        let trace_requests = trace_ingest.join();
+
+        assert_eq!(trace_requests.len(), 1);
+        assert_eq!(trace_requests[0].request_line, "POST /v1/traces HTTP/1.1");
+        let headers = trace_requests[0].headers.to_ascii_lowercase();
+        assert!(headers.contains("x-beater-api-key: trace-key"));
+        assert!(headers.contains("x-extra-trace: ok"));
+        let payload: Value = serde_json::from_str(&trace_requests[0].body).unwrap();
+        let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap();
+        assert_eq!(spans.len(), 4);
+        assert!(spans.iter().any(|span| {
+            span["name"] == "beater.js agent run"
+                && span["attributes"].as_array().unwrap().iter().any(|attr| {
+                    attr["key"] == "beater.run_id"
+                        && attr["value"]["stringValue"].as_str().unwrap().len() == 36
+                })
+        }));
+        assert_eq!(
+            spans
+                .iter()
+                .filter(
+                    |span| span["attributes"].as_array().unwrap().iter().any(|attr| {
+                        attr["key"] == "beater.span_kind"
+                            && attr["value"]["stringValue"] == "llm.call"
+                    })
+                )
+                .count(),
+            2
+        );
+        let tool = spans
+            .iter()
+            .find(|span| {
+                span["attributes"].as_array().unwrap().iter().any(|attr| {
+                    attr["key"] == "beater.span_kind" && attr["value"]["stringValue"] == "tool.call"
+                })
+            })
+            .expect("tool span");
+        assert_eq!(tool["parentSpanId"], spans[0]["spanId"]);
+        assert!(tool["attributes"].as_array().unwrap().iter().any(|attr| {
+            attr["key"] == "beater.tool_use_id" && attr["value"]["stringValue"] == "toolu_browser"
+        }));
     }
 
     #[test]

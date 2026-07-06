@@ -44,7 +44,7 @@ Operational implications:
 - redact secrets before passing them to agents or tools
 - add redaction hooks before production deployments that handle private data
 
-The optional Beater trace exporter reads from the same journal data and posts prompts, tool inputs, model responses, and tool outputs to the configured Beater ingest endpoint. Treat `BEATER_TRACE_EXPORT_URL` as a sensitive deployment decision, set `BEATER_API_KEY` through the environment or secret manager when required, and do not enable export for private data until redaction policy is in place.
+The optional trace exporters read from the same journal data and post prompts, tool inputs, model responses, and tool outputs to the configured Beater native or OTLP ingest endpoint. Treat `BEATER_TRACE_EXPORT_URL`, `BEATER_OTLP_EXPORT_URL`, and `OTEL_EXPORTER_OTLP_*` as sensitive deployment decisions, set `BEATER_API_KEY` or OTLP headers through the environment or secret manager when required, and do not enable export for private data until redaction policy is in place.
 
 ## Remote Integrations
 

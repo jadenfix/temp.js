@@ -47,7 +47,7 @@ docker build -t my-app-beater /tmp/my-app-bundle
 docker run --rm -e BEATER_MCP_TOKEN=dev-token -p 127.0.0.1:3000:3000 my-app-beater
 ```
 
-Set `BEATER_TRACE_EXPORT_URL` to export finished agent runs to Beater's native `/v1/traces/native` ingest endpoint. See [Observability](docs/observability.md) for the full environment contract.
+Set `BEATER_TRACE_EXPORT_URL` to export finished agent runs to Beater's native `/v1/traces/native` ingest endpoint, or `BEATER_OTLP_EXPORT_URL`/`OTEL_EXPORTER_OTLP_*` for OTLP/HTTP `/v1/traces`. See [Observability](docs/observability.md) for the full environment contract.
 
 When exposing `/mcp` beyond localhost, require a bearer token and add browser origins explicitly:
 
