@@ -79,6 +79,7 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         "{home}"
     );
     assert!(home.contains("data-beater-counter"), "{home}");
+    assert!(home.contains("data-beater-run-events"), "{home}");
 
     let client =
         http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
@@ -91,6 +92,7 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         client.contains("root.dataset.state = \"hydrated\""),
         "{client}"
     );
+    assert!(client.contains("new EventSource"), "{client}");
     assert!(!client.contains(": number"), "{client}");
 
     let missing = http_request(port, "GET", "/not-a-route", None).expect("GET /not-a-route");
@@ -472,6 +474,7 @@ export function GET() {
         home.contains(r#"<script type="module" src="/_beater/client/index.js"></script>"#),
         "{home}"
     );
+    assert!(home.contains("data-beater-run-events"), "{home}");
 
     let client =
         http_request(port, "GET", "/_beater/client/index.js", None).expect("GET client module");
@@ -484,6 +487,7 @@ export function GET() {
         client.contains("root.dataset.state = \"hydrated\""),
         "{client}"
     );
+    assert!(client.contains("new EventSource"), "{client}");
     assert!(!client.contains(": number"), "{client}");
 
     let flight =

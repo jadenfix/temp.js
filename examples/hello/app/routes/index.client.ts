@@ -1,5 +1,6 @@
 const root = document.querySelector<HTMLElement>("[data-beater-counter]");
 const rscRoot = document.querySelector<HTMLElement>("[data-beater-rsc-root]");
+const runEventsRoot = document.querySelector<HTMLElement>("[data-beater-run-events]");
 
 if (root) {
   const button = root.querySelector<HTMLButtonElement>("[data-beater-increment]");
@@ -83,5 +84,59 @@ if (rscRoot) {
   renderFlight().catch((error) => {
     rscRoot.dataset.state = "error";
     rscRoot.textContent = error instanceof Error ? error.message : String(error);
+  });
+}
+
+if (runEventsRoot) {
+  const form = runEventsRoot.querySelector<HTMLFormElement>("[data-run-events-form]");
+  const input = runEventsRoot.querySelector<HTMLInputElement>("[data-run-id-input]");
+  const status = runEventsRoot.querySelector<HTMLElement>("[data-run-events-status]");
+  const log = runEventsRoot.querySelector<HTMLElement>("[data-run-events-log]");
+  let source: EventSource | null = null;
+
+  const setStatus = (value: string, state: string) => {
+    runEventsRoot.dataset.state = state;
+    if (status) status.textContent = value;
+  };
+
+  const appendLine = (value: string) => {
+    if (!log) return;
+    const line = document.createElement("div");
+    line.textContent = value;
+    log.append(line);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  const partialText = (event: MessageEvent<string>) => {
+    const parsed = JSON.parse(event.data);
+    const payload = parsed.payload?.data ?? parsed.payload;
+    const text = payload?.delta?.text ?? payload?.text;
+    appendLine(typeof text === "string" ? text : `${parsed.kind} #${parsed.ordinal}`);
+  };
+
+  form?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const runId = input?.value.trim();
+    if (!runId) {
+      setStatus("enter a run id", "idle");
+      return;
+    }
+
+    source?.close();
+    if (log) log.textContent = "";
+    setStatus("connecting", "connecting");
+    source = new EventSource(`/_beater/agent/runs/${encodeURIComponent(runId)}/events`);
+    source.addEventListener("open", () => setStatus("streaming", "streaming"));
+    source.addEventListener("llm_partial", (event) => partialText(event as MessageEvent<string>));
+    source.addEventListener("done", () => {
+      setStatus("complete", "done");
+      source?.close();
+      source = null;
+    });
+    source.addEventListener("error", () => {
+      setStatus("stream unavailable", "error");
+      source?.close();
+      source = null;
+    });
   });
 }

@@ -506,6 +506,63 @@ a {
   display: block;
 }
 
+.run-stream {
+  display: grid;
+  gap: 12px;
+}
+
+.run-stream-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.run-id-input {
+  min-width: 0;
+  border: 1px solid #d4dace;
+  border-radius: 8px;
+  background: #fbfcf6;
+  color: #20332e;
+  font: inherit;
+  font-size: 13px;
+  padding: 10px 11px;
+}
+
+.stream-button {
+  min-height: 40px;
+  border: 1px solid #1f342f;
+  border-radius: 8px;
+  background: #20332e;
+  color: #f7f8f1;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 760;
+  padding: 0 14px;
+}
+
+.stream-status {
+  margin: 0;
+  color: #4d5549;
+  font-size: 12px;
+  font-weight: 760;
+  text-transform: uppercase;
+}
+
+.stream-log {
+  min-height: 104px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid #d4dace;
+  border-radius: 8px;
+  background: #f7faf2;
+  color: #32382f;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 @media (max-width: 980px) {
   .topbar,
   .grid,
@@ -780,6 +837,21 @@ export default function Home({ request }: { request: PageRequest }) {
                 <div className="rsc-root" data-beater-rsc-root data-state="loading">
                   waiting for server component flight
                 </div>
+              </section>
+
+              <section className="panel mini run-stream" data-beater-run-events data-state="idle">
+                <h3 className="section-title">Run stream</h3>
+                <form className="run-stream-form" data-run-events-form>
+                  <input
+                    className="run-id-input"
+                    name="run_id"
+                    placeholder="run id"
+                    data-run-id-input
+                  />
+                  <button className="stream-button" type="submit">Open</button>
+                </form>
+                <p className="stream-status" data-run-events-status>idle</p>
+                <div className="stream-log" data-run-events-log />
               </section>
             </aside>
           </section>
