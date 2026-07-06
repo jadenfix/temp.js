@@ -172,6 +172,7 @@ async fn resume_async(
                 // The last response needed no tools; the run actually finished.
                 ctx.journal.set_run_status(run_id, "completed")?;
                 println!("run {run_id} was already finished — marked completed");
+                close_browser_sessions_best_effort(ctx).await;
                 return Ok(());
             }
             if stop_reason == "pause_turn" {
@@ -180,6 +181,7 @@ async fn resume_async(
                 messages
             } else if stop_reason != "tool_use" {
                 ctx.journal.set_run_status(run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 if stop_reason == "refusal" {
                     bail!(
                         "run {run_id} failed before resume: model refused: {}",
@@ -202,6 +204,7 @@ async fn resume_async(
                     .unwrap_or_default();
                 if tool_uses.is_empty() {
                     ctx.journal.set_run_status(run_id, "failed")?;
+                    close_browser_sessions_best_effort(ctx).await;
                     bail!(
                         "run {run_id} failed before resume: stop_reason \"tool_use\" had no tool_use blocks"
                     );
@@ -239,6 +242,7 @@ async fn resume_async(
                                     "run {run_id} needs review: tool {name} ({id}) may have executed \
                                      before the crash and is not declared idempotent — not re-running"
                                 );
+                                close_browser_sessions_best_effort(ctx).await;
                                 return Ok(());
                             }
                             let prior_attempts = steps
@@ -260,6 +264,7 @@ async fn resume_async(
                                 Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
                                     println!("← needs review: {e:#}");
                                     ctx.journal.set_run_status(run_id, "needs_review")?;
+                                    close_browser_sessions_best_effort(ctx).await;
                                     return Ok(());
                                 }
                                 Err(e) => {
@@ -336,6 +341,7 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
             Err(e) => {
                 ctx.journal.fail_step(&ctx.run_id, seq, &format!("{e:#}"))?;
                 ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 return Err(e);
             }
         };
@@ -370,6 +376,7 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
                         Err(e) if e.downcast_ref::<ToolNeedsReview>().is_some() => {
                             println!("← needs review: {e:#}");
                             ctx.journal.set_run_status(&ctx.run_id, "needs_review")?;
+                            close_browser_sessions_best_effort(ctx).await;
                             return Ok(());
                         }
                         Err(e) => {
@@ -385,22 +392,35 @@ async fn agent_loop(ctx: &Ctx, mut messages: Vec<Value>, mut next_llm_attempt: i
             }
             "end_turn" => {
                 ctx.journal.set_run_status(&ctx.run_id, "completed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 return Ok(());
             }
             // server-side pause: assistant turn is already appended; re-send as-is
             "pause_turn" => continue,
             "refusal" => {
                 ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 bail!("model refused: {}", response["stop_details"]);
             }
             other => {
                 ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+                close_browser_sessions_best_effort(ctx).await;
                 bail!("unexpected stop_reason {other:?} — raise max_tokens or inspect the journal");
             }
         }
     }
     ctx.journal.set_run_status(&ctx.run_id, "failed")?;
+    close_browser_sessions_best_effort(ctx).await;
     bail!("agent exceeded {MAX_LOOP_STEPS} loop steps")
+}
+
+async fn close_browser_sessions_best_effort(ctx: &Ctx) {
+    if let Err(error) = ctx.registry.close_browser_sessions(&ctx.run_id).await {
+        tracing::warn!(
+            "browser session cleanup for run {} failed: {error:#}",
+            ctx.run_id
+        );
+    }
 }
 
 /// Journal-wrapped tool execution: started row committed before the tool runs.

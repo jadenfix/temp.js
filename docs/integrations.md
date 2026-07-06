@@ -148,21 +148,20 @@ Implemented behavior:
 
 - browser tools are declared through the same registry and exposed in agent tool metadata
 - `allowedOrigins` blocks navigation outside the declared origins
-- `session: {scope: "run", cleanup: "always"}` is accepted as the target provider policy, and browser tool results use the journal run id as the session id
-- mock browser sessions are cleaned up on success, failure, and timeout
-- `provider: "playwright"` reuses the pinned upstream `beater-browser` / `beater-browser-playwright` crates, launches Chromium through the upstream Node runner, and closes the session after each tool call
+- `session: {scope: "run", cleanup: "always"}` uses the journal run id as the session id and reuses the session across multiple browser calls in that run
+- browser sessions are cleaned up when an agent run or synthetic MCP run reaches a terminal state
+- `provider: "playwright"` reuses the pinned upstream `beater-browser` / `beater-browser-playwright` crates and launches Chromium through the upstream Node runner
 - the Playwright input path supports `input.url` plus one optional driver action such as `click`, `type`, `extract`, `wait`, `scroll`, `select`, or `goto`
 - non-empty `secrets` are rejected by `mock_cdp` and `playwright`; credential scoping remains production work
 - a mocked agent-loop test proves an agent can complete a browser task through a tool declaration
-- `scripts/playwright-browser-gate.cjs` installs the upstream runner dependencies in a temp directory, runs a local browser fixture plus Anthropic-compatible SSE mock, and verifies a completed `playwright` tool result in the journal
+- `scripts/playwright-browser-gate.cjs` installs the upstream runner dependencies in a temp directory, runs a local browser fixture plus Anthropic-compatible SSE mock, and verifies two completed `playwright` tool results reused one run-scoped session in the journal
 - destructive actions require non-idempotent handling or explicit review semantics
 
 Production Playwright/CDP release criteria:
 
-- browser sessions persist across multiple tool calls in the same run when requested
 - session cleanup survives process interruption and resume
 - credentials are scoped to the provider/session
-- browser e2e tests prove an agent can complete a real browser task
+- richer browser e2e tests cover authenticated actions and crash/restart cleanup
 
 ## Coexistence
 

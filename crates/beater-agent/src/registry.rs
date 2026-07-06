@@ -22,6 +22,7 @@ use beater_browser::{
 use beater_browser_playwright::{PlaywrightConfig, PlaywrightDriver};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::Mutex as AsyncMutex;
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 pub const DEFAULT_BEATBOX_URL: &str = "http://127.0.0.1:7300";
@@ -409,6 +410,18 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<&ToolEntry> {
         self.tools.iter().find(|t| t.name == name)
+    }
+
+    pub async fn close_browser_sessions(&self, run_id: &str) -> Result<()> {
+        for tool in &self.tools {
+            if let ToolImpl::Browser { config } = &tool.imp {
+                config
+                    .close_session(run_id)
+                    .await
+                    .with_context(|| format!("closing browser sessions for tool {}", tool.name))?;
+            }
+        }
+        Ok(())
     }
 
     /// Tool definitions in Messages API shape.
@@ -1000,6 +1013,19 @@ pub struct BrowserTool {
     timeout: Duration,
     session: BrowserSessionPolicy,
     allowed_origins: Vec<String>,
+    sessions: Arc<AsyncMutex<HashMap<String, BrowserSessionState>>>,
+}
+
+enum BrowserSessionState {
+    Mock {
+        _guard: BrowserSessionGuard,
+        calls: u64,
+    },
+    Playwright {
+        _guard: BrowserSessionGuard,
+        driver: PlaywrightDriver,
+        calls: u64,
+    },
 }
 
 enum BrowserProvider {
@@ -1106,19 +1132,21 @@ impl BrowserTool {
             timeout: Duration::from_millis(timeout_ms),
             session,
             allowed_origins,
+            sessions: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
 
     async fn execute(&self, input: &Value, context: &ToolCallContext) -> Result<String> {
         let fut = async {
-            let session_id = self.session.session_id(context);
-            let session = BrowserSessionGuard::start(session_id);
-            let result = match self.provider {
-                BrowserProvider::MockCdp => self.execute_mock_cdp(input, session.id()).await,
-                BrowserProvider::Playwright => self.execute_playwright(input, session.id()).await,
-            };
-            drop(session);
-            result
+            let session_id = self.session.session_id(context).to_string();
+            match self.provider {
+                BrowserProvider::MockCdp => {
+                    self.execute_mock_cdp(input, &session_id, context).await
+                }
+                BrowserProvider::Playwright => {
+                    self.execute_playwright(input, &session_id, context).await
+                }
+            }
         };
         tokio::time::timeout(self.timeout, fut)
             .await
@@ -1130,7 +1158,12 @@ impl BrowserTool {
             })?
     }
 
-    async fn execute_mock_cdp(&self, input: &Value, session_id: &str) -> Result<String> {
+    async fn execute_mock_cdp(
+        &self,
+        input: &Value,
+        session_id: &str,
+        context: &ToolCallContext,
+    ) -> Result<String> {
         if let Some(delay_ms) = input.get("delayMs").and_then(Value::as_u64) {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
@@ -1142,12 +1175,35 @@ impl BrowserTool {
             .get("task")
             .and_then(Value::as_str)
             .unwrap_or("inspect page");
+        let (calls, reused, transient_guard) = if self.session.is_persistent(context) {
+            let mut sessions = self.sessions.lock().await;
+            let reused = sessions.contains_key(session_id);
+            let state = sessions.entry(session_id.to_string()).or_insert_with(|| {
+                BrowserSessionState::Mock {
+                    _guard: BrowserSessionGuard::start(session_id),
+                    calls: 0,
+                }
+            });
+            let BrowserSessionState::Mock { calls, .. } = state else {
+                bail!("browser session {session_id} has a mismatched provider");
+            };
+            *calls += 1;
+            (*calls, reused, None)
+        } else {
+            (1, false, Some(BrowserSessionGuard::start(session_id)))
+        };
+        let output_session_id = transient_guard
+            .as_ref()
+            .map(BrowserSessionGuard::id)
+            .unwrap_or(session_id);
         Ok(json!({
             "provider": "mock_cdp",
             "session": {
-                "id": session_id,
+                "id": output_session_id,
                 "scope": self.session.scope.as_str(),
                 "cleanup": self.session.cleanup.as_str(),
+                "calls": calls,
+                "reused": reused,
             },
             "url": url,
             "title": "Mock Browser Page",
@@ -1156,7 +1212,12 @@ impl BrowserTool {
         .to_string())
     }
 
-    async fn execute_playwright(&self, input: &Value, session_id: &str) -> Result<String> {
+    async fn execute_playwright(
+        &self,
+        input: &Value,
+        session_id: &str,
+        context: &ToolCallContext,
+    ) -> Result<String> {
         let url = input
             .get("url")
             .and_then(Value::as_str)
@@ -1167,10 +1228,66 @@ impl BrowserTool {
         if let Some(BrowserAction::Goto { url }) = &action {
             self.ensure_url_allowed(url)?;
         }
+        if self.session.is_persistent(context) {
+            let mut sessions = self.sessions.lock().await;
+            let reused = sessions.contains_key(session_id);
+            if !reused {
+                let driver = PlaywrightDriver::launch(playwright_config())
+                    .await
+                    .map_err(anyhow::Error::new)?
+                    .with_policy(UrlPolicy::allow_all());
+                sessions.insert(
+                    session_id.to_string(),
+                    BrowserSessionState::Playwright {
+                        _guard: BrowserSessionGuard::start(session_id),
+                        driver,
+                        calls: 0,
+                    },
+                );
+            }
+            let state = sessions
+                .get_mut(session_id)
+                .context("browser session disappeared after insert")?;
+            let BrowserSessionState::Playwright { driver, calls, .. } = state else {
+                bail!("browser session {session_id} has a mismatched provider");
+            };
+            *calls += 1;
+            let calls = *calls;
+            return self
+                .execute_playwright_with_driver(driver, input, session_id, calls, reused)
+                .await;
+        }
+
+        let guard = BrowserSessionGuard::start(session_id);
         let mut driver = PlaywrightDriver::launch(playwright_config())
             .await
             .map_err(anyhow::Error::new)?
             .with_policy(UrlPolicy::allow_all());
+        let result = self
+            .execute_playwright_with_driver(&mut driver, input, guard.id(), 1, false)
+            .await;
+        let close_result = driver.close().await.map_err(anyhow::Error::new);
+        drop(guard);
+        match (result, close_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(_), Err(error)) => Err(error).context("closing Playwright browser session"),
+            (Err(error), _) => Err(error),
+        }
+    }
+
+    async fn execute_playwright_with_driver(
+        &self,
+        driver: &mut PlaywrightDriver,
+        input: &Value,
+        session_id: &str,
+        calls: u64,
+        reused: bool,
+    ) -> Result<String> {
+        let url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .context("playwright browser tool requires string input.url")?;
+        let action = browser_action_from_input(input)?;
         let result = async {
             let mut observation = driver.goto(url).await.map_err(anyhow::Error::new)?;
             let mut outcome = None;
@@ -1192,6 +1309,8 @@ impl BrowserTool {
                         "id": session_id,
                         "scope": self.session.scope.as_str(),
                         "cleanup": self.session.cleanup.as_str(),
+                        "calls": calls,
+                        "reused": reused,
                     },
                     "url": observation.url,
                     "title": observation.title,
@@ -1205,12 +1324,7 @@ impl BrowserTool {
             )
         }
         .await;
-        let close_result = driver.close().await.map_err(anyhow::Error::new);
-        match (result, close_result) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Ok(_), Err(error)) => Err(error).context("closing Playwright browser session"),
-            (Err(error), _) => Err(error),
-        }
+        result
     }
 
     fn ensure_url_allowed(&self, raw_url: &str) -> Result<()> {
@@ -1223,6 +1337,18 @@ impl BrowserTool {
             self.allowed_origins
         );
         Ok(())
+    }
+
+    async fn close_session(&self, session_id: &str) -> Result<()> {
+        let state = self.sessions.lock().await.remove(session_id);
+        match state {
+            Some(BrowserSessionState::Playwright { mut driver, .. }) => driver
+                .close()
+                .await
+                .map_err(anyhow::Error::new)
+                .context("closing Playwright browser session"),
+            Some(BrowserSessionState::Mock { .. }) | None => Ok(()),
+        }
     }
 }
 
@@ -1368,6 +1494,10 @@ impl BrowserSessionPolicy {
                 .or(context.tool_use_id.as_deref())
                 .unwrap_or("manual"),
         }
+    }
+
+    fn is_persistent(&self, context: &ToolCallContext) -> bool {
+        matches!(self.scope, BrowserSessionScope::Run) && context.run_id.is_some()
     }
 }
 
@@ -2927,23 +3057,44 @@ def run(input):
         let registry = ToolRegistry::build(PathBuf::new().as_path(), &[browser_decl()])
             .expect("browser registry should build");
 
-        let result = registry
+        let context = ToolCallContext {
+            run_id: Some("run-browser-session".to_string()),
+            tool_use_id: Some("toolu_browser".to_string()),
+            ..ToolCallContext::default()
+        };
+        let first = registry
             .execute_with_context(
                 "browser.checkout",
                 &json!({"url": "https://shop.example/cart", "task": "verify checkout"}),
-                &ToolCallContext {
-                    run_id: Some("run-browser-session".to_string()),
-                    tool_use_id: Some("toolu_browser".to_string()),
-                    ..ToolCallContext::default()
-                },
+                &context,
             )
             .await
-            .expect("browser tool should run");
+            .expect("first browser tool call should run");
+        let second = registry
+            .execute_with_context(
+                "browser.checkout",
+                &json!({"url": "https://shop.example/cart", "task": "verify checkout again"}),
+                &context,
+            )
+            .await
+            .expect("second browser tool call should reuse the run session");
 
+        assert!(browser_session_active_for_tests("run-browser-session"));
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let second: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(first["session"]["id"], "run-browser-session");
+        assert_eq!(first["session"]["scope"], "run");
+        assert_eq!(first["session"]["calls"], 1);
+        assert_eq!(first["session"]["reused"], false);
+        assert_eq!(second["session"]["id"], "run-browser-session");
+        assert_eq!(second["session"]["calls"], 2);
+        assert_eq!(second["session"]["reused"], true);
+
+        registry
+            .close_browser_sessions("run-browser-session")
+            .await
+            .expect("browser session cleanup should succeed");
         assert!(!browser_session_active_for_tests("run-browser-session"));
-        let result: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["session"]["id"], "run-browser-session");
-        assert_eq!(result["session"]["scope"], "run");
     }
 
     #[tokio::test(flavor = "current_thread")]

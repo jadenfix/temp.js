@@ -449,6 +449,9 @@ async fn tools_call(
             .execute_with_context(name, &arguments, &context)
             .await
     };
+    if let Err(error) = registry.close_browser_sessions(&run_id).await {
+        tracing::warn!("browser session cleanup for MCP run {run_id} failed: {error:#}");
+    }
     match result {
         Ok(result) => {
             let journal = open_journal(app_dir)?;

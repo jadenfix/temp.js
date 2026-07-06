@@ -175,6 +175,16 @@ function startAnthropicServer(fixtureBase) {
             selector: "#checkout-button",
           },
         },
+        {
+          type: "tool_use",
+          id: "toolu_playwright_gate_extract",
+          name: "browser.checkout",
+          input: {
+            url: fixtureBase,
+            action: "extract",
+            selector: "#checkout",
+          },
+        },
       ],
       stop_reason: "tool_use",
     },
@@ -280,22 +290,42 @@ async function main() {
       throw new Error(`final agent text missing from output:\n${result.stdout}`);
     }
     const journal = path.join(app, ".beater/journal.db");
-    const query = `SELECT json_object('status', status, 'result', result) FROM steps WHERE run_id='${runId}' AND kind='tool_call' AND tool_name='browser.checkout';`;
+    const query = `SELECT json_object('status', status, 'tool_use_id', tool_use_id, 'result', result) FROM steps WHERE run_id='${runId}' AND kind='tool_call' AND tool_name='browser.checkout' ORDER BY seq;`;
     const { stdout } = await run("sqlite3", [journal, query], { cwd: root });
-    const row = JSON.parse(stdout.trim());
-    const toolResult = JSON.parse(row.result);
-    const providerPayload = JSON.parse(toolResult.content);
+    const rows = stdout
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    if (rows.length !== 2) {
+      throw new Error(`expected two browser tool rows, saw ${rows.length}: ${stdout}`);
+    }
+    const payloads = rows.map((row) => {
+      const toolResult = JSON.parse(row.result);
+      return JSON.parse(toolResult.content);
+    });
+    for (const [index, row] of rows.entries()) {
+      const providerPayload = payloads[index];
+      if (
+        row.status !== "completed" ||
+        providerPayload.provider !== "playwright" ||
+        providerPayload.session?.id !== runId ||
+        providerPayload.session?.scope !== "run" ||
+        providerPayload.outcome?.status !== "ok" ||
+        providerPayload.title !== "Beater Playwright Gate"
+      ) {
+        throw new Error(
+          `unexpected journal browser result: ${JSON.stringify({ row, providerPayload })}`,
+        );
+      }
+    }
     if (
-      row.status !== "completed" ||
-      providerPayload.provider !== "playwright" ||
-      providerPayload.session?.id !== runId ||
-      providerPayload.session?.scope !== "run" ||
-      providerPayload.outcome?.status !== "ok" ||
-      providerPayload.title !== "Beater Playwright Gate"
+      payloads[0].session?.calls !== 1 ||
+      payloads[0].session?.reused !== false ||
+      payloads[1].session?.calls !== 2 ||
+      payloads[1].session?.reused !== true
     ) {
-      throw new Error(
-        `unexpected journal browser result: ${JSON.stringify({ row, providerPayload })}`,
-      );
+      throw new Error(`browser session was not reused: ${JSON.stringify(payloads)}`);
     }
     if (anthropic.requests.length !== 2) {
       throw new Error(`expected 2 Anthropic requests, saw ${anthropic.requests.length}`);
