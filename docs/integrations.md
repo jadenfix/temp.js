@@ -154,6 +154,7 @@ Implemented behavior:
 - the Playwright input path supports `input.url` plus one optional driver action such as `click`, `type`, `extract`, `wait`, `scroll`, `select`, or `goto`
 - non-empty `secrets` are rejected by `mock_cdp` and `playwright`; credential scoping remains production work
 - a mocked agent-loop test proves an agent can complete a browser task through a tool declaration
+- `scripts/playwright-browser-gate.cjs` installs the upstream runner dependencies in a temp directory, runs a local browser fixture plus Anthropic-compatible SSE mock, and verifies a completed `playwright` tool result in the journal
 - destructive actions require non-idempotent handling or explicit review semantics
 
 Production Playwright/CDP release criteria:

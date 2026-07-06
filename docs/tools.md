@@ -151,7 +151,7 @@ Use `idempotent: false` for tools that send email, charge money, mutate external
 
 ## Integration roadmap
 
-Remote MCP servers and browser-control providers enter through the same registry shape: name, description, input schema, implementation kind, timeout/retry policy, secret source, egress allowlist, and idempotency. They should not bypass the journal. Remote MCP tools are mock-server tested. Browser tools currently include a mock CDP provider for contract, cleanup, and agent-loop tests; production Playwright/CDP providers still need real browser e2e coverage.
+Remote MCP servers and browser-control providers enter through the same registry shape: name, description, input schema, implementation kind, timeout/retry policy, secret source, egress allowlist, and idempotency. They should not bypass the journal. Remote MCP tools are mock-server tested. Browser tools include a mock CDP provider for contract, cleanup, and agent-loop tests plus a Playwright provider with a real-browser gate; production Playwright/CDP work still needs run-attached sessions, crash cleanup, and scoped credentials.
 
 ## Remote MCP tools
 
@@ -220,5 +220,7 @@ For native browser execution, set `provider: "playwright"`. The Playwright provi
 The optional action also accepts the upstream driver shape, for example `{"action": {"action": "type", "args": {"selector": "#email", "text": "a@example.com"}}}`. Install the upstream runner dependencies before live use; default tests do not launch Playwright.
 
 Browser tools default to non-idempotent because they create sessions and may perform side effects. `allowedOrigins` is enforced before navigation. Mock sessions are per tool call with cleanup on success, failure, and timeout; Playwright sessions are closed after each tool call. `mock_cdp` and `playwright` currently reject non-empty `secrets`; credential scoping remains production work.
+
+Run `scripts/playwright-browser-gate.cjs` for the live provider proof. It installs the upstream Playwright runner dependencies in a temp directory, drives a real Chromium session through `beater agent run`, and verifies the completed browser tool result in the journal.
 
 See [Integration Registry](integrations.md) for the full contract and target declaration shapes.

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use beater_browser::{
-    BrowserAction, BrowserDriver, BrowserEngine, Observation, StepOutcome, StepStatus,
+    BrowserAction, BrowserDriver, BrowserEngine, Observation, StepOutcome, StepStatus, UrlPolicy,
 };
 use beater_browser_playwright::{PlaywrightConfig, PlaywrightDriver};
 use serde::Deserialize;
@@ -26,6 +26,8 @@ use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBu
 
 pub const DEFAULT_BEATBOX_URL: &str = "http://127.0.0.1:7300";
 const DEFAULT_PYTHON_TIMEOUT_MS: u64 = 10_000;
+const PLAYWRIGHT_NODE_ENV: &str = "BEATER_PLAYWRIGHT_NODE";
+const PLAYWRIGHT_RUNNER_ENV: &str = "BEATER_PLAYWRIGHT_RUNNER";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct BeatboxConfig {
@@ -1164,9 +1166,10 @@ impl BrowserTool {
         if let Some(BrowserAction::Goto { url }) = &action {
             self.ensure_url_allowed(url)?;
         }
-        let mut driver = PlaywrightDriver::launch(PlaywrightConfig::new(BrowserEngine::Chromium))
+        let mut driver = PlaywrightDriver::launch(playwright_config())
             .await
-            .map_err(anyhow::Error::new)?;
+            .map_err(anyhow::Error::new)?
+            .with_policy(UrlPolicy::allow_all());
         let result = async {
             let mut observation = driver.goto(url).await.map_err(anyhow::Error::new)?;
             let mut outcome = None;
@@ -1220,6 +1223,24 @@ impl BrowserTool {
         );
         Ok(())
     }
+}
+
+fn playwright_config() -> PlaywrightConfig {
+    let mut config = PlaywrightConfig::new(BrowserEngine::Chromium);
+    if let Some(node_bin) = non_empty_env(PLAYWRIGHT_NODE_ENV) {
+        config = config.with_node_bin(node_bin);
+    }
+    if let Some(runner_script) = non_empty_env(PLAYWRIGHT_RUNNER_ENV) {
+        config = config.with_runner_script(runner_script);
+    }
+    config
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn browser_action_from_input(input: &Value) -> Result<Option<BrowserAction>> {
@@ -2808,6 +2829,27 @@ def run(input):
         };
         assert!(
             format!("{error:#}").contains("provider playwright does not support secrets"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn browser_playwright_provider_enforces_allowed_origins_before_driver() {
+        let mut decl = browser_decl();
+        decl.provider = Some("playwright".to_string());
+        let registry = ToolRegistry::build(PathBuf::new().as_path(), &[decl])
+            .expect("playwright browser registry should build");
+        let tool = registry
+            .get("browser.checkout")
+            .expect("browser tool should exist");
+        let ToolImpl::Browser { config } = &tool.imp else {
+            panic!("expected browser tool");
+        };
+        let error = config
+            .ensure_url_allowed("https://evil.example/cart")
+            .expect_err("disallowed origin should fail before driver launch");
+        assert!(
+            format!("{error:#}").contains("not allowed by allowedOrigins"),
             "{error:#}"
         );
     }
