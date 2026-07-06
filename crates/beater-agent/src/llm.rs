@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -19,7 +18,6 @@ use crate::registry::AgentConfig;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
-static OPENAI_FALLBACK_TOOL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct LlmSelection {
     pub provider: String,
@@ -135,7 +133,9 @@ impl OpenAiCompatible {
         }
 
         let mut decoder = SseDecoder::default();
-        let mut assembler = OpenAiStreamAssembler::new(names.provider_to_original);
+        let fallback_tool_id_prefix = openai_fallback_tool_id_prefix(&request);
+        let mut assembler =
+            OpenAiStreamAssembler::new(names.provider_to_original, fallback_tool_id_prefix);
         let mut saw_done = false;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -433,8 +433,7 @@ struct ToolCallState {
 }
 
 impl OpenAiStreamAssembler {
-    fn new(provider_to_original: HashMap<String, String>) -> Self {
-        let fallback_id = OPENAI_FALLBACK_TOOL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    fn new(provider_to_original: HashMap<String, String>, fallback_tool_id_prefix: String) -> Self {
         Self {
             id: None,
             model: None,
@@ -442,7 +441,7 @@ impl OpenAiStreamAssembler {
             tool_calls: Vec::new(),
             finish_reason: None,
             provider_to_original,
-            fallback_tool_id_prefix: format!("toolu_openai_{fallback_id}"),
+            fallback_tool_id_prefix,
         }
     }
 
@@ -623,6 +622,12 @@ fn openai_tool_name(original: &str) -> String {
     format!("{sanitized}{suffix}")
 }
 
+fn openai_fallback_tool_id_prefix(request: &Value) -> String {
+    let encoded = serde_json::to_vec(request).unwrap_or_else(|_| request.to_string().into_bytes());
+    let hash = fnv1a64(&encoded);
+    format!("toolu_openai_{hash:016x}")
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
@@ -635,8 +640,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_openai_event, openai_request_body, openai_tool_name, validate_openai_base_url,
-        OpenAiStreamAssembler, SseEvent, ToolNameMap,
+        handle_openai_event, openai_fallback_tool_id_prefix, openai_request_body, openai_tool_name,
+        validate_openai_base_url, OpenAiStreamAssembler, SseEvent, ToolNameMap,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -706,8 +711,36 @@ mod tests {
     }
 
     #[test]
+    fn openai_fallback_tool_id_prefix_is_request_scoped_and_stable() {
+        let first = json!({
+            "model": "mock",
+            "stream": true,
+            "messages": [{"role": "user", "content": "first"}]
+        });
+        let first_again = json!({
+            "model": "mock",
+            "stream": true,
+            "messages": [{"role": "user", "content": "first"}]
+        });
+        let second = json!({
+            "model": "mock",
+            "stream": true,
+            "messages": [{"role": "user", "content": "second"}]
+        });
+
+        assert_eq!(
+            openai_fallback_tool_id_prefix(&first),
+            openai_fallback_tool_id_prefix(&first_again)
+        );
+        assert_ne!(
+            openai_fallback_tool_id_prefix(&first),
+            openai_fallback_tool_id_prefix(&second)
+        );
+    }
+
+    #[test]
     fn openai_stream_requires_terminal_finish_reason() {
-        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new(), "toolu_test".to_string());
         assembler
             .apply(&json!({
                 "id": "chatcmpl_1",
@@ -724,7 +757,7 @@ mod tests {
 
     #[test]
     fn openai_stream_requires_done_frame() {
-        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new(), "toolu_test".to_string());
         assembler
             .apply(&json!({
                 "id": "chatcmpl_1",
@@ -738,7 +771,7 @@ mod tests {
 
     #[test]
     fn openai_stream_rejects_data_after_done() {
-        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new(), "toolu_test".to_string());
         let mut saw_done = false;
         let mut partials = Vec::new();
         let error = {
@@ -777,7 +810,7 @@ mod tests {
     #[test]
     fn openai_stream_error_events_are_not_journaled() {
         let provider_secret = format!("{}{}", "nv", "api-test-fixture");
-        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new(), "toolu_test".to_string());
         let mut saw_done = false;
         let mut partials = Vec::new();
         let error = {
@@ -827,7 +860,7 @@ mod tests {
 
     #[test]
     fn openai_stream_translates_legacy_function_call_delta() {
-        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new(), "toolu_test".to_string());
         assembler
             .apply(&json!({
                 "id": "chatcmpl_1",
@@ -847,13 +880,13 @@ mod tests {
 
     #[test]
     fn openai_fallback_tool_ids_are_unique_across_responses() {
-        let first_id = fallback_tool_id_for_omitted_provider_id();
-        let second_id = fallback_tool_id_for_omitted_provider_id();
+        let first_id = fallback_tool_id_for_omitted_provider_id("toolu_openai_request_a");
+        let second_id = fallback_tool_id_for_omitted_provider_id("toolu_openai_request_b");
         assert_ne!(first_id, second_id);
     }
 
-    fn fallback_tool_id_for_omitted_provider_id() -> String {
-        let mut assembler = OpenAiStreamAssembler::new(HashMap::new());
+    fn fallback_tool_id_for_omitted_provider_id(prefix: &str) -> String {
+        let mut assembler = OpenAiStreamAssembler::new(HashMap::new(), prefix.to_string());
         assembler
             .apply(&json!({
                 "model": "mock",
