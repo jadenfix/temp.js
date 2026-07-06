@@ -188,6 +188,42 @@ fn dev_server_serves_routes_ssr_and_mcp_without_api_key() {
         "{route_action_tool}"
     );
 
+    let openapi = http_request(port, "GET", "/openapi.json", None).expect("GET /openapi.json");
+    assert!(openapi.starts_with("HTTP/1.1 200"), "{openapi}");
+    assert!(openapi.contains("\"openapi\":\"3.1.0\""), "{openapi}");
+    assert!(
+        openapi.contains("\"operationId\":\"hello.contact\""),
+        "{openapi}"
+    );
+    assert!(openapi.contains("\"/api/actions/contact\""), "{openapi}");
+    assert!(
+        openapi.contains("\"idempotencyRequired\":true"),
+        "{openapi}"
+    );
+
+    let manifest =
+        http_request(port, "GET", "/.well-known/beater.json", None).expect("GET manifest");
+    assert!(manifest.starts_with("HTTP/1.1 200"), "{manifest}");
+    assert!(manifest.contains("\"openapi\""), "{manifest}");
+    assert!(
+        manifest.contains(&format!("\"http://127.0.0.1:{port}/openapi.json\"")),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("\"name\":\"hello.contact\""),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("\"path\":\"/api/actions/contact\""),
+        "{manifest}"
+    );
+
+    let llms = http_request(port, "GET", "/llms.txt", None).expect("GET /llms.txt");
+    assert!(llms.starts_with("HTTP/1.1 200"), "{llms}");
+    assert!(llms.contains("## Actions"), "{llms}");
+    assert!(llms.contains("hello.contact"), "{llms}");
+    assert!(llms.contains("/api/actions/contact"), "{llms}");
+
     let mcp_get = http_request(port, "GET", "/mcp", None).expect("GET /mcp");
     assert!(mcp_get.starts_with("HTTP/1.1 405"), "{mcp_get}");
 }

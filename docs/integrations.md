@@ -44,7 +44,7 @@ beater-connect print forms
 beater-connect print mcp
 ```
 
-Runtime route actions use `defineAction` in an API route's `agent.actions` metadata. The route remains a normal form target for humans, and the dev server exposes the same action through live `/mcp tools/list` and `/mcp tools/call` with journaled execution, confirmation checks, and idempotency keys.
+Runtime route actions use `defineAction` in an API route's `agent.actions` metadata. The route remains a normal form target for humans, and the dev server exposes the same action through live `/mcp tools/list` and `/mcp tools/call` with journaled execution, confirmation checks, idempotency keys, runtime `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`.
 
 ### First-Party Python
 

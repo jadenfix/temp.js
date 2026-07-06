@@ -99,8 +99,9 @@ Every other framework treats the crawl layer as hand-maintained files or plugins
 |---|---|---|
 | `/robots.txt` | crawl policy + sitemap pointer | M3 |
 | `/sitemap.xml` | route table (lastmod = file mtime) | M3 |
-| `/llms.txt` | route table + per-route `agent` metadata | M3 |
-| `/.well-known/beater.json` | manifest: MCP endpoint, sitemap, llms.txt, auth requirements | M3 |
+| `/llms.txt` | route table + per-route `agent` metadata + route actions | M3 |
+| `/.well-known/beater.json` | manifest: MCP endpoint, OpenAPI, sitemap, llms.txt, auth requirements, route actions | M3 |
+| `/openapi.json` | route action definitions | M3 |
 | markdown views (`Accept: text/markdown` / `.md`) | rendered routes | post-SSR |
 | MCP `resources/list` / `resources/read` | route table → clean markdown | post-SSR |
 | JSON-LD (schema.org) in pages | per-route `agent.schema` | later |
@@ -115,7 +116,7 @@ export const agent = {
 };
 ```
 
-The implemented route-action slice lets a route export `agent.actions: [defineAction(...)]`; the same route can receive a human HTML form post and appear in live `/mcp tools/list`, and `/mcp tools/call` dispatches back through the route handler with journaled execution, confirmation checks, and idempotency keys. The remaining end state is to fold this live route binding into runtime OpenAPI and crawler metadata generation.
+The implemented route-action slice lets a route export `agent.actions: [defineAction(...)]`; the same route can receive a human HTML form post, appear in live `/mcp tools/list`, dispatch through `/mcp tools/call` with journaled execution, confirmation checks, and idempotency keys, and publish the same action metadata through runtime `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`.
 
 ## 7. Developer experience
 
@@ -141,7 +142,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **Wasmtime sandbox expansion** — local `wasmtime` tools now run hermetic scalar wasm with empty imports; broader WASI/capability handles for files, sockets, and richer value passing remain future work.
 - **C++ tools** — `cpp_double` proves the `cxx` bridge on the Rust built-in path; richer C++ tool packaging remains future work.
 - **Production agentic browsing** — the registry has a mock CDP browser provider for contract tests; reuse beater-agents' real CDP/Playwright crates as the production provider.
-- **defineAction runtime binding** — route modules can now export `agent.actions: [defineAction(...)]`; the hello form posts to the route handler and the same action is exposed through live MCP `tools/list` + journaled `tools/call`. `beater-connect` still emits static forms/OpenAPI/MCP/crawl docs; runtime OpenAPI/crawler unification remains future work.
+- **defineAction runtime binding** — route modules can now export `agent.actions: [defineAction(...)]`; the hello form posts to the route handler and the same action is exposed through live MCP `tools/list` + journaled `tools/call`, runtime `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`. `beater-connect` still covers static action-doc generation; richer production API docs remain future work.
 - **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.
 - **Isolate pool production hardening / per-request isolation** — `[app].workers = N` starts N route isolates; smoke tests prove round-robin dispatch, and `scripts/isolate-pool-scaling-gate.cjs` proved 7.65x route throughput on ten local workers. Per-request isolation hardening and worker-count tuning remain production work.
 - **LLM streaming to browser** — Anthropic SSE ingestion, partial-step journal records, `GET /_beater/agent/runs/<run_id>/events`, and the hello example's EventSource run stream panel are in place; production run history/navigation polish remains.

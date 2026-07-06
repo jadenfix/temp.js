@@ -143,6 +143,7 @@ pub async fn serve(
         .route("/robots.txt", get(handle_robots))
         .route("/sitemap.xml", get(handle_sitemap))
         .route("/llms.txt", get(handle_llms))
+        .route("/openapi.json", get(handle_openapi))
         .route("/.well-known/beater.json", get(handle_well_known))
         .route(
             "/_beater/agent/runs/{run_id}/events",
@@ -271,13 +272,12 @@ async fn handle_mcp_post(
     body: axum::body::Bytes,
 ) -> Response<Body> {
     let surfaces = agent_surfaces(&state).await;
-    let route_actions = if state.mcp_access.origin_allowed(&headers)
-        && state.mcp_access.authorized(&headers)
-    {
-        route_actions(&state).await
-    } else {
-        Vec::new()
-    };
+    let route_actions =
+        if state.mcp_access.origin_allowed(&headers) && state.mcp_access.authorized(&headers) {
+            route_actions(&state).await
+        } else {
+            Vec::new()
+        };
     let action_state = state.clone();
     mcp::handle_post(
         &surfaces.registry,
@@ -441,6 +441,7 @@ async fn handle_sitemap(State(state): State<DevState>) -> Response<Body> {
 
 async fn handle_llms(State(state): State<DevState>) -> Response<Body> {
     let surfaces = agent_surfaces(&state).await;
+    let actions = route_actions(&state).await;
     let routes: Vec<(String, Option<RouteMeta>)> = crawlable_routes(&state)
         .await
         .into_iter()
@@ -452,18 +453,31 @@ async fn handle_llms(State(state): State<DevState>) -> Response<Body> {
             &state.app_name,
             &state.base_url,
             &routes,
+            &actions,
             &surfaces.agents,
             &state.mcp_access,
         ),
     )
 }
 
+async fn handle_openapi(State(state): State<DevState>) -> Response<Body> {
+    let actions = route_actions(&state).await;
+    let openapi = crawl::openapi_json(&state.app_name, &state.base_url, &actions);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(openapi.to_string()))
+        .expect("static response")
+}
+
 async fn handle_well_known(State(state): State<DevState>) -> Response<Body> {
     let surfaces = agent_surfaces(&state).await;
+    let actions = route_actions(&state).await;
     let manifest = crawl::well_known(
         &state.app_name,
         &state.base_url,
         &surfaces.agents,
+        &actions,
         &state.mcp_access,
     );
     Response::builder()

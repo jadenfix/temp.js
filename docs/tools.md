@@ -70,7 +70,7 @@ export function POST(request) {
 }
 ```
 
-The route remains a normal HTML form target. The dev server also imports `agent.actions` into `/mcp tools/list`; `/mcp tools/call` journals a synthetic MCP run, enforces confirmation and idempotency metadata, then dispatches the call through the route handler with JSON arguments.
+The route remains a normal HTML form target. The dev server also imports `agent.actions` into `/mcp tools/list`; `/mcp tools/call` journals a synthetic MCP run, enforces confirmation and idempotency metadata, then dispatches the call through the route handler with JSON arguments. The same action metadata is published through `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`.
 
 ## Python tools
 
