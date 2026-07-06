@@ -221,6 +221,7 @@ impl ToolNeedsReview {
 
 #[derive(Clone, Default)]
 pub struct ToolCallContext {
+    pub run_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
@@ -1110,7 +1111,7 @@ impl BrowserTool {
 
     async fn execute(&self, input: &Value, context: &ToolCallContext) -> Result<String> {
         let fut = async {
-            let session_id = context.tool_use_id.as_deref().unwrap_or("manual");
+            let session_id = self.session.session_id(context);
             let session = BrowserSessionGuard::start(session_id);
             let result = match self.provider {
                 BrowserProvider::MockCdp => self.execute_mock_cdp(input, session.id()).await,
@@ -1357,6 +1358,16 @@ impl BrowserSessionPolicy {
             ),
         };
         Ok(Self { scope, cleanup })
+    }
+
+    fn session_id<'a>(&self, context: &'a ToolCallContext) -> &'a str {
+        match self.scope {
+            BrowserSessionScope::Run => context
+                .run_id
+                .as_deref()
+                .or(context.tool_use_id.as_deref())
+                .unwrap_or("manual"),
+        }
     }
 }
 
@@ -2710,6 +2721,7 @@ def run(input):
                 "crm.lookup_contact",
                 &json!({"email": "a@example.com"}),
                 &ToolCallContext {
+                    run_id: None,
                     tool_use_id: Some("toolu_provider".to_string()),
                     idempotency_key: None,
                 },
@@ -2908,6 +2920,30 @@ def run(input):
         assert_eq!(result["session"]["cleanup"], "always");
         assert_eq!(result["url"], "https://shop.example/cart");
         assert!(result["text"].as_str().unwrap().contains("verify checkout"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_run_scope_uses_run_id_for_session() {
+        let registry = ToolRegistry::build(PathBuf::new().as_path(), &[browser_decl()])
+            .expect("browser registry should build");
+
+        let result = registry
+            .execute_with_context(
+                "browser.checkout",
+                &json!({"url": "https://shop.example/cart", "task": "verify checkout"}),
+                &ToolCallContext {
+                    run_id: Some("run-browser-session".to_string()),
+                    tool_use_id: Some("toolu_browser".to_string()),
+                    ..ToolCallContext::default()
+                },
+            )
+            .await
+            .expect("browser tool should run");
+
+        assert!(!browser_session_active_for_tests("run-browser-session"));
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["session"]["id"], "run-browser-session");
+        assert_eq!(result["session"]["scope"], "run");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3316,6 +3352,7 @@ def run(input):
                 "crm.lookup",
                 &json!({"email": "a@example.com"}),
                 &ToolCallContext {
+                    run_id: None,
                     tool_use_id: Some("toolu_journaled".to_string()),
                     idempotency_key: Some("beater:run-1:tool:toolu_journaled".to_string()),
                 },
@@ -3362,6 +3399,7 @@ def run(input):
                 "crm.lookup",
                 &json!({"email": "a@example.com"}),
                 &ToolCallContext {
+                    run_id: None,
                     tool_use_id: Some("toolu_raw".to_string()),
                     idempotency_key: Some("beater:run-1:tool:toolu_raw".to_string()),
                 },

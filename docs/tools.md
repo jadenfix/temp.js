@@ -219,8 +219,8 @@ For native browser execution, set `provider: "playwright"`. The Playwright provi
 
 The optional action also accepts the upstream driver shape, for example `{"action": {"action": "type", "args": {"selector": "#email", "text": "a@example.com"}}}`. Install the upstream runner dependencies before live use; default tests do not launch Playwright.
 
-Browser tools default to non-idempotent because they create sessions and may perform side effects. `allowedOrigins` is enforced before navigation. Mock sessions are per tool call with cleanup on success, failure, and timeout; Playwright sessions are closed after each tool call. `mock_cdp` and `playwright` currently reject non-empty `secrets`; credential scoping remains production work.
+Browser tools default to non-idempotent because they create sessions and may perform side effects. `allowedOrigins` is enforced before navigation. With `session: {scope: "run", cleanup: "always"}`, browser tool results use the journal run id as the session id. Mock sessions are per tool call with cleanup on success, failure, and timeout; Playwright sessions are closed after each tool call. `mock_cdp` and `playwright` currently reject non-empty `secrets`; credential scoping remains production work.
 
-Run `scripts/playwright-browser-gate.cjs` for the live provider proof. It installs the upstream Playwright runner dependencies in a temp directory, drives a real Chromium session through `beater agent run`, and verifies the completed browser tool result in the journal.
+Run `scripts/playwright-browser-gate.cjs` for the live provider proof. It installs the upstream Playwright runner dependencies in a temp directory, drives a real Chromium session through `beater agent run`, and verifies the completed browser tool result and run-scoped session id in the journal.
 
 See [Integration Registry](integrations.md) for the full contract and target declaration shapes.

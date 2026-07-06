@@ -288,6 +288,8 @@ async function main() {
     if (
       row.status !== "completed" ||
       providerPayload.provider !== "playwright" ||
+      providerPayload.session?.id !== runId ||
+      providerPayload.session?.scope !== "run" ||
       providerPayload.outcome?.status !== "ok" ||
       providerPayload.title !== "Beater Playwright Gate"
     ) {

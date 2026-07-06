@@ -433,6 +433,7 @@ pub fn start_journaled_tool_call(
     Ok(JournaledToolCall {
         seq,
         context: ToolCallContext {
+            run_id: Some(run_id.to_string()),
             tool_use_id: Some(tool_use_id.to_string()),
             idempotency_key,
         },

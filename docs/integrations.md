@@ -148,7 +148,7 @@ Implemented behavior:
 
 - browser tools are declared through the same registry and exposed in agent tool metadata
 - `allowedOrigins` blocks navigation outside the declared origins
-- `session: {scope: "run", cleanup: "always"}` is accepted as the target provider policy
+- `session: {scope: "run", cleanup: "always"}` is accepted as the target provider policy, and browser tool results use the journal run id as the session id
 - mock browser sessions are cleaned up on success, failure, and timeout
 - `provider: "playwright"` reuses the pinned upstream `beater-browser` / `beater-browser-playwright` crates, launches Chromium through the upstream Node runner, and closes the session after each tool call
 - the Playwright input path supports `input.url` plus one optional driver action such as `click`, `type`, `extract`, `wait`, `scroll`, `select`, or `goto`
@@ -159,7 +159,7 @@ Implemented behavior:
 
 Production Playwright/CDP release criteria:
 
-- real browser sessions are attached to run IDs rather than one tool call
+- browser sessions persist across multiple tool calls in the same run when requested
 - session cleanup survives process interruption and resume
 - credentials are scoped to the provider/session
 - browser e2e tests prove an agent can complete a real browser task
