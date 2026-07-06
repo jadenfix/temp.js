@@ -5,7 +5,7 @@ description: Run beater.js verification gates on this local macOS workspace, inc
 
 # beater.js test gates
 
-Use this skill when a change needs local verification in `jadenfix/beater.js`, especially if `cargo test` touches `pyo3` or `beater-py`.
+Use this skill when a change needs local verification in `jadenfix/beater.js`, especially if `cargo test` touches `pyo3` or `beater-py`, or when checking the local e2e gates listed in `final.md`.
 
 ## Full workspace gate
 
@@ -26,6 +26,7 @@ git diff --check
 PYO3_CONFIG_FILE="$tmp_config" \
   DYLD_FRAMEWORK_PATH=/Library/Developer/CommandLineTools/Library/Frameworks \
   cargo test
+rm -f "$tmp_config"
 ```
 
 ## Focused gate
@@ -38,7 +39,44 @@ PYO3_CONFIG_FILE="$tmp_config" \
   cargo test -p beater-cli dev_server_serves_routes_ssr_and_mcp_without_api_key -- --nocapture
 ```
 
+## Browser provider gate
+
+`scripts/playwright-browser-gate.cjs` is the live provider proof for `browserTool(..., {provider: "playwright"})`. It installs the upstream Playwright runner dependencies in a temp directory, starts a local browser fixture and Anthropic-compatible SSE mock, runs `beater agent run`, and verifies the completed Chromium tool result in SQLite.
+
+Build the local binary with the same PyO3 settings first, then run the gate:
+
+```sh
+tmp_config=$(mktemp /tmp/beater-pyo3-config.XXXXXX)
+printf '%s\n' \
+  'implementation=CPython' \
+  'version=3.9' \
+  'shared=true' \
+  'abi3=false' \
+  'lib_name=python3.9' \
+  'lib_dir=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib' \
+  'executable=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9' > "$tmp_config"
+PYO3_CONFIG_FILE="$tmp_config" \
+  DYLD_FRAMEWORK_PATH=/Library/Developer/CommandLineTools/Library/Frameworks \
+  cargo build --bin beater
+rm -f "$tmp_config"
+scripts/playwright-browser-gate.cjs
+```
+
+If the gate fails and you need to inspect its temp app/journal, rerun with `BEATER_KEEP_GATE_WORKDIR=1`.
+
+## Deploy gate probe
+
+The deploy proof is `scripts/docker-cold-start-gate.sh`. Before running it, check both free space and Docker availability:
+
+```sh
+df -h / /Users/jadenfix
+docker version --format '{{.Server.Version}}'
+scripts/docker-cold-start-gate.sh
+```
+
+The Docker gate needs roughly 12 GiB free by default. It is safe to run `cargo clean` to remove generated Rust build artifacts when local disk pressure blocks progress; expect the next Rust build/test run to rebuild dependencies.
+
 ## Known local blockers
 
-- Docker Desktop may fail locally with containerd metadata I/O errors; do not treat that as proof the Docker cold-start gate is good or bad.
+- Docker Desktop may fail locally with a missing daemon socket or containerd metadata I/O errors; do not treat that as proof the Docker cold-start gate is good or bad.
 - Live Anthropic gates require `ANTHROPIC_API_KEY`; without it, only mock/unit/smoke coverage can run.
