@@ -109,6 +109,25 @@ export function remoteMcpTool(name, opts = {}) {
   };
 }
 
+// Remote MCP provider discovery. The Rust registry calls tools/list at startup
+// and imports every provider tool as `${prefix}.${remoteToolName}`.
+export function remoteMcpProvider(prefix, opts = {}) {
+  if (!opts.endpoint) {
+    throw new Error("remoteMcpProvider requires opts.endpoint");
+  }
+  return {
+    kind: "remote_mcp_provider",
+    name: prefix,
+    idempotent: opts.idempotent ?? false,
+    endpoint: opts.endpoint,
+    auth: opts.auth ?? null,
+    timeoutMs: opts.timeoutMs ?? 10000,
+    retry: opts.retry ?? null,
+    session: opts.session ?? null,
+    egress: opts.egress ?? [],
+  };
+}
+
 // Browser automation tool source. The Rust side currently ships a mock CDP
 // provider for deterministic lifecycle tests; real Playwright/CDP providers
 // use the same declaration shape.

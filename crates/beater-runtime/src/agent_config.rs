@@ -160,6 +160,49 @@ export default defineAgent({
     }
 
     #[test]
+    fn remote_mcp_provider_serializes_discovery_contract() {
+        let app = TempApp::new("remote-mcp-provider");
+        fs::write(
+            app.path().join("agents/operator/agent.ts"),
+            r#"
+import { defineAgent, remoteMcpProvider } from "beater:agent";
+
+export default defineAgent({
+  name: "operator",
+  tools: [
+    remoteMcpProvider("crm", {
+      endpoint: "http://127.0.0.1:9000/mcp",
+      auth: {type: "bearer", env: "CRM_MCP_TOKEN"},
+      timeoutMs: 5000,
+      retry: {attempts: 2, backoffMs: 25, idempotencyKey: "tool_use_id"},
+      session: {scope: "run", cleanup: "always"},
+      egress: ["127.0.0.1:9000"],
+      idempotent: true,
+    }),
+  ],
+});
+"#,
+        )
+        .unwrap();
+
+        let config = load_agent_config(app.path(), "operator").unwrap();
+        assert_eq!(
+            config["tools"][0],
+            json!({
+                "kind": "remote_mcp_provider",
+                "name": "crm",
+                "idempotent": true,
+                "endpoint": "http://127.0.0.1:9000/mcp",
+                "auth": {"type": "bearer", "env": "CRM_MCP_TOKEN"},
+                "timeoutMs": 5000,
+                "retry": {"attempts": 2, "backoffMs": 25, "idempotencyKey": "tool_use_id"},
+                "session": {"scope": "run", "cleanup": "always"},
+                "egress": ["127.0.0.1:9000"]
+            })
+        );
+    }
+
+    #[test]
     fn browser_tool_serializes_session_contract() {
         let app = TempApp::new("browser-tool");
         fs::write(

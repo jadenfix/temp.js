@@ -74,7 +74,7 @@ fn default_model() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct ToolDecl {
-    pub kind: String, // "python" | "rust" | "remote_mcp" | "browser" | "sandbox" | "wasmtime"
+    pub kind: String, // "python" | "rust" | "remote_mcp" | "remote_mcp_provider" | "browser" | "sandbox" | "wasmtime"
     pub name: String,
     #[serde(default)]
     pub path: Option<String>,
@@ -126,7 +126,7 @@ pub enum SandboxSourceDecl {
     ModuleRef { sha256: String },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RemoteMcpAuthDecl {
     #[serde(rename = "type")]
     kind: String,
@@ -134,7 +134,7 @@ pub struct RemoteMcpAuthDecl {
     env: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RemoteMcpRetryDecl {
     #[serde(default)]
     attempts: Option<u32>,
@@ -144,7 +144,7 @@ pub struct RemoteMcpRetryDecl {
     idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct BrowserSessionDecl {
     #[serde(default)]
     scope: Option<String>,
@@ -233,6 +233,12 @@ impl ToolRegistry {
     ) -> Result<Self> {
         let mut tools = Vec::new();
         for decl in decls {
+            if decl.kind == "remote_mcp_provider" {
+                for entry in remote_mcp_provider_entries(decl)? {
+                    push_unique_tool(&mut tools, entry);
+                }
+                continue;
+            }
             let entry = match decl.kind.as_str() {
                 "python" => {
                     let timeout = python_timeout(decl)?;
@@ -1621,6 +1627,270 @@ impl RemoteMcpTool {
     }
 }
 
+fn remote_mcp_provider_entries(decl: &ToolDecl) -> Result<Vec<ToolEntry>> {
+    let prefix = decl.name.trim();
+    ensure!(
+        !prefix.is_empty(),
+        "remote_mcp_provider requires a non-empty name prefix"
+    );
+    let endpoint = parse_remote_endpoint(
+        decl.endpoint
+            .as_deref()
+            .with_context(|| format!("remote_mcp_provider {} requires endpoint", decl.name))?,
+    )?;
+    ensure!(
+        egress_allows(&endpoint, &decl.egress),
+        "remote_mcp_provider {} endpoint {} is not allowed by egress policy {:?}",
+        decl.name,
+        endpoint,
+        decl.egress
+    );
+    let timeout_ms = decl.timeout_ms.unwrap_or(10_000);
+    ensure!(
+        timeout_ms > 0,
+        "remote_mcp_provider {} timeoutMs must be greater than 0",
+        decl.name
+    );
+    ensure!(
+        !matches!(
+            decl.auth.as_ref().map(|auth| auth.kind.as_str()),
+            Some("bearer")
+        ) || endpoint.scheme() == "https"
+            || is_loopback_endpoint(&endpoint),
+        "remote_mcp_provider {} bearer auth requires https for non-loopback endpoints: {}",
+        decl.name,
+        endpoint
+    );
+
+    let bearer = remote_mcp_provider_bearer(decl)?;
+    let timeout = Duration::from_millis(timeout_ms);
+    let provider_name = decl.name.clone();
+    let discovered = {
+        let endpoint = endpoint.clone();
+        let bearer = bearer.clone();
+        thread::spawn(move || {
+            remote_mcp_provider_discover_blocking(
+                &provider_name,
+                endpoint,
+                timeout,
+                bearer.as_deref(),
+            )
+        })
+        .join()
+        .map_err(|_| anyhow!("remote_mcp_provider {} discovery panicked", decl.name))??
+    };
+
+    let mut entries = Vec::new();
+    for tool in discovered {
+        let remote_name = tool["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .with_context(|| {
+                format!(
+                    "remote_mcp_provider {} returned a tool without a string name",
+                    decl.name
+                )
+            })?;
+        let local_name = format!("{prefix}.{remote_name}");
+        let description = tool["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Remote MCP tool {remote_name}."));
+        let input_schema = tool
+            .get("inputSchema")
+            .or_else(|| tool.get("input_schema"))
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        let remote_decl = ToolDecl {
+            kind: "remote_mcp".to_string(),
+            name: local_name.clone(),
+            path: None,
+            idempotent: decl.idempotent,
+            description: Some(description.clone()),
+            input_schema: Some(input_schema.clone()),
+            endpoint: decl.endpoint.clone(),
+            tool: Some(remote_name.to_string()),
+            auth: decl.auth.clone(),
+            timeout_ms: decl.timeout_ms,
+            retry: decl.retry.clone(),
+            egress: decl.egress.clone(),
+            provider: None,
+            session: decl.session.clone(),
+            allowed_origins: Vec::new(),
+            secrets: Value::Null,
+            lane: None,
+            source: None,
+            policy: None,
+            entrypoint: None,
+        };
+        let config = RemoteMcpTool::from_decl(&remote_decl)?;
+        entries.push(ToolEntry {
+            name: local_name,
+            description,
+            input_schema,
+            idempotent: decl.idempotent,
+            imp: ToolImpl::RemoteMcp { config },
+        });
+    }
+    Ok(entries)
+}
+
+fn remote_mcp_provider_discover_blocking(
+    provider_name: &str,
+    endpoint: reqwest::Url,
+    timeout: Duration,
+    bearer: Option<&str>,
+) -> Result<Vec<Value>> {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build remote MCP discovery HTTP client")?;
+    let session_id = remote_mcp_provider_initialize(&client, &endpoint, timeout, bearer)
+        .with_context(|| format!("initializing remote_mcp_provider {provider_name}"))?;
+    remote_mcp_provider_tools_list(&client, &endpoint, timeout, bearer, session_id.as_deref())
+        .with_context(|| format!("listing tools for remote_mcp_provider {provider_name}"))
+}
+
+fn remote_mcp_provider_bearer(decl: &ToolDecl) -> Result<Option<String>> {
+    match &decl.auth {
+        None => Ok(None),
+        Some(auth) if auth.kind == "bearer" => {
+            let env = auth
+                .env
+                .as_deref()
+                .map(str::trim)
+                .filter(|env| !env.is_empty())
+                .with_context(|| {
+                    format!("remote_mcp_provider {} bearer auth requires env", decl.name)
+                })?;
+            let value = std::env::var(env)
+                .with_context(|| format!("remote_mcp_provider bearer env {env} is not set"))?;
+            ensure!(
+                !value.trim().is_empty(),
+                "remote_mcp_provider bearer env {env} is empty"
+            );
+            Ok(Some(value))
+        }
+        Some(auth) if auth.kind == "none" => Ok(None),
+        Some(auth) => bail!(
+            "remote_mcp_provider {} has unsupported auth type {:?}",
+            decl.name,
+            auth.kind
+        ),
+    }
+}
+
+fn remote_mcp_provider_initialize(
+    client: &reqwest::blocking::Client,
+    endpoint: &reqwest::Url,
+    timeout: Duration,
+    bearer: Option<&str>,
+) -> Result<Option<String>> {
+    let id = "beater:discover:init";
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "beater.js", "version": env!("CARGO_PKG_VERSION")},
+        },
+    });
+    let (message, session_id) =
+        remote_mcp_provider_request(client, endpoint, timeout, bearer, None, &body)?;
+    ensure!(
+        message.get("result").is_some(),
+        "remote MCP initialize response has no result"
+    );
+    Ok(session_id)
+}
+
+fn remote_mcp_provider_tools_list(
+    client: &reqwest::blocking::Client,
+    endpoint: &reqwest::Url,
+    timeout: Duration,
+    bearer: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Vec<Value>> {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": "beater:discover:tools",
+        "method": "tools/list",
+        "params": {},
+    });
+    let (message, _) =
+        remote_mcp_provider_request(client, endpoint, timeout, bearer, session_id, &body)?;
+    let tools = message["result"]["tools"]
+        .as_array()
+        .with_context(|| format!("remote MCP tools/list response has no tools array: {message}"))?;
+    Ok(tools.clone())
+}
+
+fn remote_mcp_provider_request(
+    client: &reqwest::blocking::Client,
+    endpoint: &reqwest::Url,
+    timeout: Duration,
+    bearer: Option<&str>,
+    session_id: Option<&str>,
+    body: &Value,
+) -> Result<(Value, Option<String>)> {
+    let id = body["id"].as_str().unwrap_or_default();
+    let method = body["method"].as_str().unwrap_or("request");
+    let mut request = client
+        .post(endpoint.clone())
+        .timeout(timeout)
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(body);
+    if let Some(bearer) = bearer {
+        request = request.header("authorization", format!("Bearer {bearer}"));
+    }
+    if let Some(session_id) = session_id {
+        request = request.header("mcp-session-id", session_id);
+    }
+    let response = request
+        .send()
+        .with_context(|| format!("remote MCP discovery {method} request to {endpoint} failed"))?;
+    let status = response.status();
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let text = response
+        .text()
+        .with_context(|| format!("remote MCP discovery {method} response body failed"))?;
+    ensure!(
+        status.is_success(),
+        "remote MCP discovery {method} returned HTTP {status}: {text}"
+    );
+    let message: Value = serde_json::from_str(&text)
+        .with_context(|| format!("remote MCP discovery {method} returned invalid JSON: {text}"))?;
+    ensure!(
+        message["jsonrpc"] == "2.0",
+        "remote MCP discovery {method} response has invalid jsonrpc version: {}",
+        message["jsonrpc"]
+    );
+    ensure!(
+        message["id"] == id,
+        "remote MCP discovery {method} response id {} did not match request id {id:?}",
+        message["id"]
+    );
+    ensure!(
+        message.get("error").is_none(),
+        "remote MCP discovery {method} returned JSON-RPC error: {}",
+        message["error"]
+    );
+    Ok((message, session_id))
+}
+
 impl RemoteMcpSessionPolicy {
     fn from_decl(decl: &ToolDecl) -> Result<Option<Self>> {
         let Some(session) = decl.session.as_ref() else {
@@ -2198,6 +2468,91 @@ def run(input):
             let body: Value = serde_json::from_str(&request.body).unwrap();
             assert_eq!(body["method"], "tools/call");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_mcp_provider_discovers_tools_list_and_executes_imported_tool() {
+        let server = MockMcp::new(vec![
+            MockResponse::json(
+                "200 OK",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "beater:discover:init",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "mock-mcp", "version": "1.0.0"}
+                    }
+                }),
+            ),
+            MockResponse::json(
+                "200 OK",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "beater:discover:tools",
+                    "result": {
+                        "tools": [{
+                            "name": "lookup_contact",
+                            "description": "Look up a CRM contact from the provider.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"email": {"type": "string"}},
+                                "required": ["email"]
+                            }
+                        }]
+                    }
+                }),
+            ),
+            MockResponse::json(
+                "200 OK",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "toolu_provider",
+                    "result": {
+                        "content": [{"type": "text", "text": "{\"ok\":true}"}],
+                        "isError": false
+                    }
+                }),
+            ),
+        ]);
+        let registry = ToolRegistry::build(
+            PathBuf::new().as_path(),
+            &[provider_decl(&server.endpoint, "crm")],
+        )
+        .expect("provider registry should discover tools");
+
+        let tool = registry
+            .get("crm.lookup_contact")
+            .expect("discovered provider tool should be imported");
+        assert_eq!(tool.description, "Look up a CRM contact from the provider.");
+        assert_eq!(tool.input_schema["properties"]["email"]["type"], "string");
+
+        let result = registry
+            .execute_with_context(
+                "crm.lookup_contact",
+                &json!({"email": "a@example.com"}),
+                &ToolCallContext {
+                    tool_use_id: Some("toolu_provider".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .expect("imported provider tool should execute");
+        assert_eq!(result, "{\"ok\":true}");
+
+        let requests = server.wait_for_requests(3, Duration::from_secs(1));
+        assert!(requests[0].body.contains(r#""method":"initialize""#));
+        assert!(requests[1].body.contains(r#""method":"tools/list""#));
+        assert!(
+            requests[2].body.contains(r#""name":"lookup_contact""#),
+            "{}",
+            requests[2].body
+        );
+        assert!(
+            requests[2].body.contains(r#""email":"a@example.com""#),
+            "{}",
+            requests[2].body
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3003,6 +3358,24 @@ def run(input):
             value["auth"] = json!({"type": "bearer", "env": env});
         }
         serde_json::from_value(value).unwrap()
+    }
+
+    fn provider_decl(endpoint: &str, prefix: &str) -> ToolDecl {
+        let url = reqwest::Url::parse(endpoint).unwrap();
+        let host = url.host_str().unwrap();
+        let host_port = url
+            .port()
+            .map(|port| format!("{host}:{port}"))
+            .unwrap_or_else(|| host.to_string());
+        serde_json::from_value(json!({
+            "kind": "remote_mcp_provider",
+            "name": prefix,
+            "endpoint": endpoint,
+            "timeoutMs": 1000,
+            "idempotent": true,
+            "egress": [host_port]
+        }))
+        .unwrap()
     }
 
     fn sandbox_decl(idempotent: bool) -> ToolDecl {

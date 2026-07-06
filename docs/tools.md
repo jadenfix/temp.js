@@ -128,7 +128,20 @@ remoteMcpTool("crm.lookup", {
 })
 ```
 
-Secrets are read from environment variables at execution time and are never stored in `agent.ts` or the journal. Missing secrets fail before a network connection is opened. Bearer-auth endpoints must use HTTPS except for loopback test servers. The endpoint host must match `egress`; use `host` or `host:port` entries. Redirects are not followed. When `session` is set, beater initializes the remote MCP provider once, stores the returned `Mcp-Session-Id` in memory for the tool, and sends it on later `tools/call` requests.
+Use `remoteMcpProvider` when the provider's `tools/list` catalog should be imported at startup:
+
+```ts
+remoteMcpProvider("crm", {
+  endpoint: "https://mcp.crm.example/mcp",
+  auth: {type: "bearer", env: "CRM_MCP_TOKEN"},
+  timeoutMs: 10_000,
+  retry: {attempts: 2, backoffMs: 250, idempotencyKey: "tool_use_id"},
+  egress: ["mcp.crm.example"],
+  idempotent: true,
+})
+```
+
+Each discovered provider tool is exposed as `<prefix>.<provider tool name>` in `/mcp tools/list`; execution still calls the original provider tool name. Secrets are read from environment variables at execution time and are never stored in `agent.ts` or the journal. Missing secrets fail before a network connection is opened. Bearer-auth endpoints must use HTTPS except for loopback test servers. The endpoint host must match `egress`; use `host` or `host:port` entries. Redirects are not followed. When `session` is set, beater initializes the remote MCP provider once, stores the returned `Mcp-Session-Id` in memory for the tool, and sends it on later `tools/call` requests.
 
 ## Browser tools
 

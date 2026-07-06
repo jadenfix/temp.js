@@ -92,9 +92,24 @@ remoteMcpTool("linear.create_issue", {
 })
 ```
 
+When startup should import the provider's catalog directly, use `remoteMcpProvider`. The registry sends `initialize`, then `tools/list`, and exposes each returned tool as `<prefix>.<provider tool name>` while execution still calls the original provider tool name:
+
+```ts
+remoteMcpProvider("linear", {
+  endpoint: "https://mcp.linear.example/mcp",
+  auth: {type: "bearer", env: "LINEAR_MCP_TOKEN"},
+  timeoutMs: 10_000,
+  retry: {attempts: 2, backoffMs: 250, idempotencyKey: "tool_use_id"},
+  session: {scope: "run", cleanup: "always"},
+  egress: ["mcp.linear.example"],
+  idempotent: false,
+})
+```
+
 Implemented behavior:
 
 - calls are tested against a local mock MCP server
+- provider discovery can import `tools/list` schemas at registry-build time with `remoteMcpProvider(prefix, ...)`
 - bearer auth reads tokens from environment variables only; missing or empty secrets fail before any network connection
 - bearer auth requires HTTPS for non-loopback endpoints
 - endpoint hosts must match the declaration's `egress` allowlist
@@ -107,7 +122,6 @@ Implemented behavior:
 
 Planned next steps:
 
-- remote `tools/list` discovery for provider health checks and schema import
 - resumable transport metadata beyond the current in-memory provider session id
 
 ### Browser Providers

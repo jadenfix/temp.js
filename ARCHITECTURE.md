@@ -145,7 +145,7 @@ CLI: `beater new <app>` · `beater dev` · `beater build` · `beater agent run <
 - **Deploy** — first slice exists: `beater build --out <dir>` emits a runnable host-platform bundle with copied app assets, the current binary, a launcher, a manifest, and a non-root Docker context while excluding runtime state and common local credential files. `scripts/docker-cold-start-gate.sh` codifies the Linux-builder path and `docker run` health check; a passing gate, target-OS binary selection, and venv baking guarantees remain.
 - **Isolate pool production hardening / per-request isolation** — `[app].workers = N` starts N route isolates; smoke tests prove round-robin dispatch, and `scripts/isolate-pool-scaling-gate.cjs` proved 7.65x route throughput on ten local workers. Per-request isolation hardening and worker-count tuning remain production work.
 - **LLM streaming to browser** — Anthropic SSE ingestion, partial-step journal records, `GET /_beater/agent/runs/<run_id>/events`, and the hello example's EventSource run stream panel are in place; production run history/navigation polish remains.
-- **MCP discovery/SSE + the 2026-07-28 spec** — remote MCP `tools/call` plus provider session initialization are in place; add `tools/list` discovery and adopt the next transport spec when released.
+- **MCP discovery/SSE + the 2026-07-28 spec** — remote MCP `tools/call`, provider session initialization, and startup `tools/list` schema import via `remoteMcpProvider` are in place; adopt the next transport spec when released.
 - **Observability/evals** — integrate beater-agents (OTLP out of the agent loop) rather than rebuilding.
 
 ## 9. Milestones
