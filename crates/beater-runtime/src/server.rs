@@ -35,6 +35,7 @@ use crate::{crawl, mcp};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const AGENT_RUN_HISTORY_LIMIT: usize = 50;
 const CLIENT_MODULE_PREFIX: &str = "/_beater/client/";
 const RSC_FLIGHT_PREFIX: &str = "/_beater/rsc/";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -506,7 +507,8 @@ async fn handle_agent_runs(State(state): State<DevState>, headers: HeaderMap) ->
         Ok(runs) => json_response(
             StatusCode::OK,
             json!({
-                "runs": runs.into_iter().map(|(run, steps)| {
+                "limit": AGENT_RUN_HISTORY_LIMIT,
+                "runs": runs.into_iter().take(AGENT_RUN_HISTORY_LIMIT).map(|(run, steps)| {
                     json!({
                         "id": run.id,
                         "agent": run.agent,
@@ -1878,10 +1880,38 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["limit"], super::AGENT_RUN_HISTORY_LIMIT);
         assert_eq!(body["runs"][0]["id"], "run-1");
         assert_eq!(body["runs"][0]["agent"], "support");
         assert_eq!(body["runs"][0]["status"], "completed");
         assert_eq!(body["runs"][0]["steps"], 1);
+    }
+
+    #[tokio::test]
+    async fn agent_runs_caps_history_response() {
+        let app = TempDir::new("agent-runs-cap");
+        let journal = Journal::open(app.path()).unwrap();
+        for index in 0..(super::AGENT_RUN_HISTORY_LIMIT + 5) {
+            journal
+                .create_run(&format!("run-{index}"), "support", "hello")
+                .unwrap();
+        }
+
+        let response = handle_agent_runs(
+            State(test_state(&app, mcp::AccessConfig::default())),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["runs"].as_array().unwrap().len(),
+            super::AGENT_RUN_HISTORY_LIMIT
+        );
     }
 
     #[tokio::test]
