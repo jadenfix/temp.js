@@ -25,12 +25,22 @@ pub struct LlmSelection {
 }
 
 impl LlmSelection {
-    pub fn from_config(config: &AgentConfig) -> Self {
-        Self {
-            provider: std::env::var("BEATER_LLM_PROVIDER")
-                .unwrap_or_else(|_| config.provider.clone()),
+    pub fn from_config(config: &AgentConfig) -> Result<Self> {
+        let generic_provider_env = std::env::var_os("BEATER_LLM_API_KEY").is_some()
+            || std::env::var_os("BEATER_LLM_BASE_URL").is_some();
+        let provider = match std::env::var("BEATER_LLM_PROVIDER") {
+            Ok(provider) => provider,
+            Err(_) if generic_provider_env => {
+                bail!(
+                    "BEATER_LLM_PROVIDER is required when using BEATER_LLM_API_KEY or BEATER_LLM_BASE_URL"
+                )
+            }
+            Err(_) => config.provider.clone(),
+        };
+        Ok(Self {
+            provider,
             model: std::env::var("BEATER_LLM_MODEL").unwrap_or_else(|_| config.model.clone()),
-        }
+        })
     }
 }
 
@@ -642,10 +652,89 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiStreamAssembler, SseEvent, ToolNameMap, handle_openai_event,
+        LlmSelection, OpenAiStreamAssembler, SseEvent, ToolNameMap, handle_openai_event,
         openai_fallback_tool_id_prefix, openai_request_body, openai_tool_name,
         validate_openai_base_url,
     };
+    use crate::registry::AgentConfig;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self { name, previous }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let previous = std::env::var(name).ok();
+            unsafe {
+                std::env::remove_var(name);
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var(self.name, previous),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    fn fixture_config() -> AgentConfig {
+        AgentConfig {
+            name: "support".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-fixture".to_string(),
+            system: String::new(),
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn generic_llm_env_requires_explicit_provider_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _key = EnvGuard::set("BEATER_LLM_API_KEY", "fixture-key");
+        let _base = EnvGuard::unset("BEATER_LLM_BASE_URL");
+        let _provider = EnvGuard::unset("BEATER_LLM_PROVIDER");
+
+        let err = match LlmSelection::from_config(&fixture_config()) {
+            Ok(_) => panic!("generic LLM env should require an explicit provider override"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("BEATER_LLM_PROVIDER is required"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn generic_llm_env_accepts_explicit_provider_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _key = EnvGuard::set("BEATER_LLM_API_KEY", "fixture-key");
+        let _provider = EnvGuard::set("BEATER_LLM_PROVIDER", "openai-compatible");
+        let _model = EnvGuard::set("BEATER_LLM_MODEL", "provider-model");
+
+        let selection = LlmSelection::from_config(&fixture_config()).unwrap();
+
+        assert_eq!(selection.provider, "openai-compatible");
+        assert_eq!(selection.model, "provider-model");
+    }
     use serde_json::json;
     use std::collections::HashMap;
 

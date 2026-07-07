@@ -60,7 +60,15 @@ grep -q "BEATER_LLM_MODEL or M2_GATE_MODEL" "$TMP/provider-missing-model.err" ||
   fail "openai-compatible provider failure did not explain the missing model"
 }
 
-bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL; export BEATER_LLM_PROVIDER=openai; export BEATER_LLM_MODEL=model-fixture; export BEATER_LLM_API_KEY=fixture-key; export BEATER_LLM_BASE_URL=https://integrate.api.nvidia.com/v1; configure_provider; [[ "$LLM_PROVIDER" == "openai-compatible" ]] && [[ "$BEATER_LLM_PROVIDER" == "openai-compatible" ]] && [[ "$BEATER_LLM_MODEL" == "model-fixture" ]] && [[ "$LLM_BASE_URL" == "https://integrate.api.nvidia.com/v1" ]]' _ "$SCRIPT"
+if bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL; export BEATER_LLM_PROVIDER=openai; export BEATER_LLM_MODEL=model-fixture; export BEATER_LLM_API_KEY=fixture-key; export BEATER_LLM_BASE_URL=https://integrate.api.nvidia.com/v1; configure_provider' _ "$SCRIPT" >"$TMP/custom-openai-without-flag.out" 2>"$TMP/custom-openai-without-flag.err"; then
+  fail "configure_provider should reject custom OpenAI-compatible HTTPS origins without an opt-in flag"
+fi
+grep -q "BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL" "$TMP/custom-openai-without-flag.err" || {
+  cat "$TMP/custom-openai-without-flag.err" >&2
+  fail "custom OpenAI-compatible HTTPS failure did not explain the missing opt-in"
+}
+
+bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL; export BEATER_LLM_PROVIDER=openai; export BEATER_LLM_MODEL=model-fixture; export BEATER_LLM_API_KEY=fixture-key; export BEATER_LLM_BASE_URL=https://integrate.api.nvidia.com/v1; export BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1; configure_provider; [[ "$LLM_PROVIDER" == "openai-compatible" ]] && [[ "$BEATER_LLM_PROVIDER" == "openai-compatible" ]] && [[ "$BEATER_LLM_MODEL" == "model-fixture" ]] && [[ "$LLM_BASE_URL" == "https://integrate.api.nvidia.com/v1" ]]' _ "$SCRIPT"
 
 bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL BEATER_LLM_PROVIDER BEATER_LLM_API_KEY ANTHROPIC_API_KEY; export OPENAI_API_KEY=fixture-key; export BEATER_LLM_MODEL=model-fixture; configure_provider; [[ "$LLM_PROVIDER" == "openai-compatible" ]]' _ "$SCRIPT"
 
@@ -108,6 +116,7 @@ BEATER_LLM_PROVIDER="openai-compatible" \
 BEATER_LLM_MODEL="model-fixture" \
 BEATER_LLM_API_KEY="fixture-key" \
 BEATER_LLM_BASE_URL="https://integrate.api.nvidia.com/v1" \
+BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL="1" \
 bash "$SCRIPT" --dry-run >"$TMP/dry-run.out"
 
 grep -q "M2 live gate preflight passed" "$TMP/dry-run.out" || {

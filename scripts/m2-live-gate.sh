@@ -177,6 +177,71 @@ validate_provider_base_url_for_evidence() {
   fi
 }
 
+env_flag() {
+  local value="${!1:-}"
+  [[ "$value" == "1" || "$value" == "true" || "$value" == "TRUE" || "$value" == "yes" || "$value" == "YES" ]]
+}
+
+base_url_host() {
+  local raw="$1"
+  local authority="${raw#*://}"
+  authority="${authority%%/*}"
+  if [[ "$authority" == \[*\]* ]]; then
+    local host="${authority%%]*}"
+    printf '%s\n' "${host#[}"
+  else
+    printf '%s\n' "${authority%%:*}"
+  fi
+}
+
+is_loopback_host() {
+  local host
+  host="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$host" == "localhost" || "$host" == "127."* || "$host" == "::1" ]]
+}
+
+validate_provider_base_url_policy() {
+  local provider="$1"
+  local raw="$2"
+  local scheme="${raw%%:*}"
+  local host
+
+  [[ "$raw" == *"://"* ]] || fail "$provider base URL must include a scheme and host"
+  host="$(base_url_host "$raw")"
+  [[ -n "$host" ]] || fail "$provider base URL must include a host"
+
+  case "$provider" in
+    anthropic)
+      if [[ "$scheme" == "https" && "$host" == "api.anthropic.com" ]]; then
+        return 0
+      fi
+      if [[ "$scheme" == "https" ]]; then
+        env_flag BEATER_ANTHROPIC_ALLOW_CUSTOM_BASE_URL || fail "custom Anthropic HTTPS origins require BEATER_ANTHROPIC_ALLOW_CUSTOM_BASE_URL=1"
+        return 0
+      fi
+      if [[ "$scheme" == "http" ]] && is_loopback_host "$host"; then
+        env_flag BEATER_ANTHROPIC_ALLOW_INSECURE_LOOPBACK || fail "Anthropic HTTP loopback requires BEATER_ANTHROPIC_ALLOW_INSECURE_LOOPBACK=1"
+        return 0
+      fi
+      fail "Anthropic base URL must use https, or http loopback with BEATER_ANTHROPIC_ALLOW_INSECURE_LOOPBACK=1"
+      ;;
+    openai-compatible)
+      if [[ "$scheme" == "https" && "$host" == "api.openai.com" ]]; then
+        return 0
+      fi
+      if [[ "$scheme" == "https" ]]; then
+        env_flag BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL || fail "custom OpenAI-compatible HTTPS origins require BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1"
+        return 0
+      fi
+      if [[ "$scheme" == "http" ]] && is_loopback_host "$host"; then
+        env_flag BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK || fail "OpenAI-compatible HTTP loopback requires BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1"
+        return 0
+      fi
+      fail "OpenAI-compatible base URL must use https, or http loopback with BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1"
+      ;;
+  esac
+}
+
 configure_provider() {
   LLM_PROVIDER="$(selected_provider)"
   LLM_MODEL="${M2_GATE_MODEL:-${BEATER_LLM_MODEL:-}}"
@@ -195,6 +260,7 @@ configure_provider() {
   esac
 
   validate_provider_base_url_for_evidence "$LLM_BASE_URL"
+  validate_provider_base_url_policy "$LLM_PROVIDER" "$LLM_BASE_URL"
   export BEATER_LLM_PROVIDER="$LLM_PROVIDER"
   if [[ -n "$LLM_MODEL" ]]; then
     export BEATER_LLM_MODEL="$LLM_MODEL"
