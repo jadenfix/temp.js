@@ -53,6 +53,7 @@ fn vendor_specifier(specifier: &str) -> Option<&'static str> {
         "react/jsx-runtime" | "react/jsx-dev-runtime" => Some("beater:vendor/react-jsx-runtime"),
         "react-dom/server" => Some("beater:vendor/react-dom-server"),
         "node:buffer" | "buffer" => Some("beater:vendor/node-buffer"),
+        "node:events" | "events" => Some("beater:vendor/node-events"),
         "node:os" | "os" => Some("beater:vendor/node-os"),
         "node:path" | "path" => Some("beater:vendor/node-path"),
         "node:process" | "process" => Some("beater:vendor/node-process"),
@@ -72,6 +73,7 @@ fn vendor_source(specifier: &str) -> Option<&'static str> {
             Some(include_str!("../assets/vendor/react-dom-server.mjs"))
         }
         "beater:vendor/node-buffer" => Some(include_str!("../assets/vendor/node-buffer.mjs")),
+        "beater:vendor/node-events" => Some(include_str!("../assets/vendor/node-events.mjs")),
         "beater:vendor/node-os" => Some(include_str!("../assets/vendor/node-os.mjs")),
         "beater:vendor/node-path" => Some(include_str!("../assets/vendor/node-path.mjs")),
         "beater:vendor/node-process" => Some(include_str!("../assets/vendor/node-process.mjs")),
@@ -1420,6 +1422,23 @@ mod tests {
     }
 
     #[test]
+    fn node_events_vendor_specifiers_resolve_to_checked_in_shim() {
+        assert_eq!(
+            super::vendor_specifier("node:events"),
+            Some("beater:vendor/node-events")
+        );
+        assert_eq!(
+            super::vendor_specifier("events"),
+            Some("beater:vendor/node-events")
+        );
+
+        let source = super::vendor_source("beater:vendor/node-events").unwrap();
+        assert!(source.contains("Minimal EventEmitter shim"));
+        assert!(source.contains("export class EventEmitter"));
+        assert!(source.contains("export function once"));
+    }
+
+    #[test]
     fn node_os_vendor_specifiers_resolve_to_checked_in_shim() {
         assert_eq!(
             super::vendor_specifier("node:os"),
@@ -1476,6 +1495,16 @@ mod tests {
         assert!(source.contains("sep = \"/\""));
         assert!(source.contains("default path"));
         assert!(source.contains("posix"));
+    }
+
+    #[test]
+    fn node_events_vendor_module_loads_from_beater_scheme() {
+        let specifier = ModuleSpecifier::parse("beater:vendor/node-events").unwrap();
+        let source = source_text(load_sync(&specifier).unwrap());
+
+        assert!(source.contains("EventEmitter"));
+        assert!(source.contains("listenerCount"));
+        assert!(source.contains("default EventEmitter"));
     }
 
     #[test]
