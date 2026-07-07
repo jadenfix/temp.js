@@ -397,6 +397,174 @@ export async function inspectUtil() {
 }
 JS
 
+mkdir -p "$APP/node_modules/asserted"
+cat >"$APP/node_modules/asserted/package.json" <<'JSON'
+{
+  "name": "asserted",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+JSON
+
+cat >"$APP/node_modules/asserted/index.js" <<'JS'
+import assert, {
+  deepEqual,
+  AssertionError,
+  deepStrictEqual,
+  doesNotMatch,
+  doesNotReject,
+  doesNotThrow,
+  equal,
+  fail,
+  ifError,
+  match,
+  notDeepStrictEqual,
+  notDeepEqual,
+  notEqual,
+  notStrictEqual,
+  ok,
+  rejects,
+  strict,
+  strictEqual,
+  throws,
+} from "node:assert";
+import strictAssert from "node:assert/strict";
+import bareAssert from "assert";
+import bareStrict from "assert/strict";
+
+function capture(callback) {
+  try {
+    callback();
+    return null;
+  } catch (error) {
+    return {
+      actual: error.actual === undefined ? null : error.actual,
+      code: error.code,
+      expected: error.expected === undefined ? null : error.expected,
+      generatedMessage: error.generatedMessage,
+      message: error.message,
+      name: error.name,
+      operator: error.operator,
+    };
+  }
+}
+
+async function captureAsync(callback) {
+  try {
+    await callback();
+    return null;
+  } catch (error) {
+    return {
+      actualName: error.actual?.name ?? null,
+      code: error.code,
+      expectedName: error.expected?.name ?? null,
+      generatedMessage: error.generatedMessage,
+      name: error.name,
+      operator: error.operator,
+    };
+  }
+}
+
+export async function inspectAssert() {
+  assert(true);
+  ok(1);
+  equal("7", 7);
+  notEqual(7, 8);
+  strictEqual(7, 7);
+  notStrictEqual(7, "7");
+  deepStrictEqual({ a: [1] }, { a: [1] });
+  notDeepStrictEqual({ a: 1 }, { a: 2 });
+  deepEqual({ a: [1] }, { a: ["1"] });
+  assert.deepEqual(1, "1");
+  notDeepEqual({ a: 1 }, { a: 2 });
+  throws(() => {
+    throw new TypeError("bad");
+  }, TypeError);
+  doesNotThrow(() => ok(true));
+  await rejects(Promise.reject(new Error("no")), /no/);
+  await rejects(async () => {
+    throw new TypeError("async bad");
+  }, TypeError);
+  await doesNotReject(Promise.resolve("ok"));
+  match("beater", /beat/);
+  doesNotMatch("beater", /node/);
+  ifError(null);
+
+  const custom = new AssertionError({
+    actual: 1,
+    expected: 2,
+    message: "m",
+    operator: "===",
+  });
+  const strictFailure = capture(() => strictEqual(1, 2));
+  const failFailure = capture(() => fail("manual"));
+  const ifErrorFailure = capture(() => ifError(new Error("err")));
+  const matchTypeFailure = capture(() => match(123, /123/));
+  const doesNotMatchTypeFailure = capture(() => doesNotMatch(123, /123/));
+  const throwsMismatch = capture(() =>
+    throws(() => {
+      throw new TypeError("bad");
+    }, RangeError)
+  );
+  const rejectsMismatch = await captureAsync(() => rejects(Promise.reject(new TypeError("bad")), RangeError));
+
+  return {
+    assertionError: {
+      actual: custom.actual,
+      code: custom.code,
+      expected: custom.expected,
+      generatedMessage: custom.generatedMessage,
+      message: custom.message,
+      name: custom.name,
+      operator: custom.operator,
+    },
+    assertStatics:
+      assert.AssertionError === AssertionError &&
+      assert.deepStrictEqual === deepStrictEqual &&
+      assert.strict === strict,
+    bareDefaultMatches: bareAssert === assert,
+    bareStrictDefaultMatches: bareStrict === strictAssert,
+    defaultHasOk: assert.ok === ok,
+    doesNotMatchTypeFailure: {
+      message: doesNotMatchTypeFailure.message,
+      name: doesNotMatchTypeFailure.name,
+    },
+    failFailure,
+    ifErrorFailure: {
+      actualName: ifErrorFailure.actual.name,
+      code: ifErrorFailure.code,
+      message: ifErrorFailure.message,
+      name: ifErrorFailure.name,
+      operator: ifErrorFailure.operator,
+    },
+    legacyDeepEqual: true,
+    matchTypeFailure: {
+      message: matchTypeFailure.message,
+      name: matchTypeFailure.name,
+    },
+    rejectsMismatch,
+    strictAliases:
+      strict.equal === strict.strictEqual &&
+      strict.equal === strictEqual &&
+      strict.notEqual === notStrictEqual &&
+      strict.deepEqual === deepStrictEqual &&
+      strict.notDeepEqual === notDeepStrictEqual &&
+      strictAssert.equal === strictEqual,
+    strictFailure,
+    throwsMismatch: {
+      actualName: throwsMismatch.actual.name,
+      code: throwsMismatch.code,
+      expectedName: throwsMismatch.expected.name,
+      generatedMessage: throwsMismatch.generatedMessage,
+      name: throwsMismatch.name,
+      operator: throwsMismatch.operator,
+    },
+  };
+}
+JS
+
 mkdir -p "$APP/node_modules/pathed"
 cat >"$APP/node_modules/pathed/package.json" <<'JSON'
 {
@@ -639,6 +807,18 @@ export async function GET() {
 }
 TS
 
+cat >"$APP/app/routes/api/asserted.ts" <<'TS'
+import { inspectAssert } from "asserted";
+
+export async function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(await inspectAssert()),
+  };
+}
+TS
+
 cat >"$APP/app/routes/api/pathed.ts" <<'TS'
 import { inspectPath } from "pathed";
 
@@ -859,6 +1039,83 @@ if util_payload != expected_util:
     sys.exit(f"unexpected /api/utiled payload: {util_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("GET", "/api/asserted")
+response = conn.getresponse()
+body = response.read().decode("utf-8")
+conn.close()
+if response.status != 200:
+    sys.exit(f"expected 200 from /api/asserted, got {response.status}: {body}")
+assert_payload = json.loads(body)
+expected_assert = {
+    "assertionError": {
+        "actual": 1,
+        "code": "ERR_ASSERTION",
+        "expected": 2,
+        "generatedMessage": False,
+        "message": "m",
+        "name": "AssertionError",
+        "operator": "===",
+    },
+    "assertStatics": True,
+    "bareDefaultMatches": True,
+    "bareStrictDefaultMatches": True,
+    "defaultHasOk": True,
+    "doesNotMatchTypeFailure": {
+        "message": "assert.doesNotMatch requires a string input",
+        "name": "TypeError",
+    },
+    "failFailure": {
+        "actual": None,
+        "code": "ERR_ASSERTION",
+        "expected": None,
+        "generatedMessage": False,
+        "message": "manual",
+        "name": "AssertionError",
+        "operator": "fail",
+    },
+    "ifErrorFailure": {
+        "actualName": "Error",
+        "code": "ERR_ASSERTION",
+        "message": "ifError got unwanted exception: err",
+        "name": "AssertionError",
+        "operator": "ifError",
+    },
+    "legacyDeepEqual": True,
+    "matchTypeFailure": {
+        "message": "assert.match requires a string input",
+        "name": "TypeError",
+    },
+    "rejectsMismatch": {
+        "actualName": "TypeError",
+        "code": "ERR_ASSERTION",
+        "expectedName": "RangeError",
+        "generatedMessage": True,
+        "name": "AssertionError",
+        "operator": "rejects",
+    },
+    "strictAliases": True,
+    "strictFailure": {
+        "actual": 1,
+        "code": "ERR_ASSERTION",
+        "expected": 2,
+        "generatedMessage": True,
+        "message": "1 strictEqual 2",
+        "name": "AssertionError",
+        "operator": "strictEqual",
+    },
+    "throwsMismatch": {
+        "actualName": "TypeError",
+        "code": "ERR_ASSERTION",
+        "expectedName": "RangeError",
+        "generatedMessage": True,
+        "name": "AssertionError",
+        "operator": "throws",
+    },
+}
+if assert_payload != expected_assert:
+    sys.exit(f"unexpected /api/asserted payload: {assert_payload!r}")
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/pathed")
 response = conn.getresponse()
 body = response.read().decode("utf-8")
@@ -1025,6 +1282,7 @@ print(
     f"cjs doubled {cjs_payload['doubled']}; "
     f"events seen {','.join(events_payload['seen'])}; "
     f"util format {util_payload['format']}; "
+    f"assert strict {assert_payload['strictFailure']['operator']}; "
     f"path resolved {path_payload['resolved']}; "
     f"os platform {os_payload['platform']}; "
     f"url file {url_payload['filePath']}; "
