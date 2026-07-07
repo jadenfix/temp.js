@@ -226,9 +226,15 @@ function selectedProviders(requested) {
     .map(canonicalProvider)
     .map((value) => value.trim())
     .filter(Boolean);
+  const usesGenericProviderEnv = process.env.BEATER_LLM_API_KEY || process.env.BEATER_LLM_BASE_URL;
+  if (usesGenericProviderEnv && values.length !== 1) {
+    throw new Error(
+      "BEATER_LLM_API_KEY or BEATER_LLM_BASE_URL requires exactly one BEATER_LIVE_PROVIDER or BEATER_LLM_PROVIDER",
+    );
+  }
   if (
     (values.length === 0 || values.includes("all-configured")) &&
-    (process.env.BEATER_LLM_API_KEY || process.env.BEATER_LLM_BASE_URL)
+    usesGenericProviderEnv
   ) {
     throw new Error(
       "BEATER_LIVE_PROVIDER or BEATER_LLM_PROVIDER is required when using BEATER_LLM_API_KEY or BEATER_LLM_BASE_URL",
