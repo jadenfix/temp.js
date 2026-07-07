@@ -60,6 +60,8 @@ fn vendor_specifier(specifier: &str) -> Option<&'static str> {
         "node:path" | "path" => Some("beater:vendor/node-path"),
         "node:process" | "process" => Some("beater:vendor/node-process"),
         "node:querystring" | "querystring" => Some("beater:vendor/node-querystring"),
+        "node:stream/promises" | "stream/promises" => Some("beater:vendor/node-stream-promises"),
+        "node:stream" | "stream" => Some("beater:vendor/node-stream"),
         "node:timers/promises" | "timers/promises" => Some("beater:vendor/node-timers-promises"),
         "node:timers" | "timers" => Some("beater:vendor/node-timers"),
         "node:url" | "url" => Some("beater:vendor/node-url"),
@@ -90,6 +92,10 @@ fn vendor_source(specifier: &str) -> Option<&'static str> {
         "beater:vendor/node-process" => Some(include_str!("../assets/vendor/node-process.mjs")),
         "beater:vendor/node-querystring" => {
             Some(include_str!("../assets/vendor/node-querystring.mjs"))
+        }
+        "beater:vendor/node-stream" => Some(include_str!("../assets/vendor/node-stream.mjs")),
+        "beater:vendor/node-stream-promises" => {
+            Some(include_str!("../assets/vendor/node-stream-promises.mjs"))
         }
         "beater:vendor/node-timers" => Some(include_str!("../assets/vendor/node-timers.mjs")),
         "beater:vendor/node-timers-promises" => {
@@ -1568,6 +1574,35 @@ mod tests {
     }
 
     #[test]
+    fn node_stream_vendor_specifiers_resolve_to_checked_in_shims() {
+        assert_eq!(
+            super::vendor_specifier("node:stream"),
+            Some("beater:vendor/node-stream")
+        );
+        assert_eq!(
+            super::vendor_specifier("stream"),
+            Some("beater:vendor/node-stream")
+        );
+        assert_eq!(
+            super::vendor_specifier("node:stream/promises"),
+            Some("beater:vendor/node-stream-promises")
+        );
+        assert_eq!(
+            super::vendor_specifier("stream/promises"),
+            Some("beater:vendor/node-stream-promises")
+        );
+
+        let source = super::vendor_source("beater:vendor/node-stream").unwrap();
+        assert!(source.contains("Minimal in-memory stream shim"));
+        assert!(source.contains("export class PassThrough"));
+        assert!(source.contains("stream buffer limit exceeded"));
+
+        let promises_source = super::vendor_source("beater:vendor/node-stream-promises").unwrap();
+        assert!(promises_source.contains("Promise helpers"));
+        assert!(promises_source.contains("callbackPipeline"));
+    }
+
+    #[test]
     fn node_util_vendor_specifiers_resolve_to_checked_in_shim() {
         assert_eq!(
             super::vendor_specifier("node:util"),
@@ -1666,6 +1701,23 @@ mod tests {
         assert!(promises_source.contains("scheduler"));
         assert!(promises_source.contains("AbortError"));
         assert!(promises_source.contains("[Symbol.asyncIterator]"));
+    }
+
+    #[test]
+    fn node_stream_vendor_modules_load_from_beater_scheme() {
+        let specifier = ModuleSpecifier::parse("beater:vendor/node-stream").unwrap();
+        let source = source_text(load_sync(&specifier).unwrap());
+
+        assert!(source.contains("class Readable"));
+        assert!(source.contains("class Writable"));
+        assert!(source.contains("default stream"));
+
+        let promises_specifier =
+            ModuleSpecifier::parse("beater:vendor/node-stream-promises").unwrap();
+        let promises_source = source_text(load_sync(&promises_specifier).unwrap());
+
+        assert!(promises_source.contains("export function pipeline"));
+        assert!(promises_source.contains("export function finished"));
     }
 
     #[test]
@@ -2070,6 +2122,10 @@ mod tests {
             "import timers from 'timers/promises';\nconsole.log(timers);\n",
         );
         app.write(
+            "app/routes/stream-promises.client.ts",
+            "import streams from 'stream/promises';\nconsole.log(streams);\n",
+        );
+        app.write(
             "app/routes/url.client.ts",
             "import 'https://cdn.example.test/module.js';\n",
         );
@@ -2086,6 +2142,10 @@ mod tests {
             ),
             (
                 "timers-promises.client.ts",
+                "Node built-in imports are not supported",
+            ),
+            (
+                "stream-promises.client.ts",
                 "Node built-in imports are not supported",
             ),
             ("url.client.ts", "URL imports are not supported"),
