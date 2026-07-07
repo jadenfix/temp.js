@@ -103,6 +103,107 @@ mod tests {
     }
 
     #[test]
+    fn define_action_serializes_canonical_self_contained_input_schema() {
+        let app = TempApp::new("define-action-canonical");
+        fs::write(
+            app.path().join("agents/operator/agent.ts"),
+            r#"
+import { defineAction, defineAgent } from "beater:agent";
+
+export default defineAgent({
+  name: "operator",
+  tools: [
+    defineAction({
+      name: "hello.contact",
+      inputSchema: {
+        type: "object",
+        properties: {email: {type: "string"}},
+        required: ["email"],
+      },
+    }),
+  ],
+});
+"#,
+        )
+        .unwrap();
+
+        let config = load_agent_config(app.path(), "operator").unwrap();
+
+        assert_eq!(config["tools"][0]["name"], "hello.contact");
+        assert_eq!(
+            config["tools"][0]["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {"email": {"type": "string"}},
+                "required": ["email"],
+            })
+        );
+    }
+
+    #[test]
+    fn define_action_rejects_legacy_or_ref_input_schema() {
+        for (name, action_config, expected) in [
+            (
+                "legacy-alias",
+                r#"{
+                  name: "hello.contact",
+                  input_schema: {type: "object"},
+                }"#,
+                "input_schema",
+            ),
+            (
+                "legacy-side-effect",
+                r#"{
+                  name: "hello.contact",
+                  inputSchema: {type: "object"},
+                  side_effect: "write",
+                }"#,
+                "side_effect",
+            ),
+            (
+                "missing-schema",
+                r#"{
+                  name: "hello.contact",
+                }"#,
+                "requires config.inputSchema",
+            ),
+            (
+                "ref-schema",
+                r##"{
+                  name: "hello.contact",
+                  inputSchema: {
+                    type: "object",
+                    properties: {email: {$ref: "#/$defs/Email"}},
+                  },
+                }"##,
+                "must not use $ref",
+            ),
+        ] {
+            let app = TempApp::new(name);
+            fs::write(
+                app.path().join("agents/operator/agent.ts"),
+                format!(
+                    r#"
+import {{ defineAction, defineAgent }} from "beater:agent";
+
+export default defineAgent({{
+  name: "operator",
+  tools: [
+    defineAction({action_config}),
+  ],
+}});
+"#
+                ),
+            )
+            .unwrap();
+
+            let error = load_agent_config(app.path(), "operator")
+                .expect_err("invalid defineAction schema should fail");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
     fn remote_mcp_tool_serializes_network_contract() {
         let app = TempApp::new("remote-mcp");
         fs::write(

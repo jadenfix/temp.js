@@ -502,10 +502,12 @@ fn route_action_tool(path: &str, action: RouteActionMeta) -> Option<mcp::RouteAc
         .description
         .filter(|description| !description.trim().is_empty())
         .unwrap_or_else(|| format!("Call route action {name}."));
-    let input_schema = if action.input_schema.is_object() {
-        action.input_schema
-    } else {
-        json!({"type": "object", "properties": {}})
+    let input_schema = match route_action_input_schema(&action.input_schema) {
+        Ok(schema) => schema.clone(),
+        Err(error) => {
+            tracing::warn!("route action {name} ignored: {error}");
+            return None;
+        }
     };
     Some(mcp::RouteActionTool {
         name: name.to_string(),
@@ -523,6 +525,32 @@ fn route_action_tool(path: &str, action: RouteActionMeta) -> Option<mcp::RouteAc
             json!({"type": "public"})
         },
     })
+}
+
+fn route_action_input_schema(schema: &serde_json::Value) -> Result<&serde_json::Value> {
+    let Some(object) = schema.as_object() else {
+        anyhow::bail!("inputSchema must be an object JSON Schema");
+    };
+    if !matches!(
+        object.get("type").and_then(|value| value.as_str()),
+        Some("object")
+    ) {
+        anyhow::bail!("inputSchema.type must be \"object\"");
+    }
+    if json_schema_contains_ref(schema) {
+        anyhow::bail!("inputSchema must be self-contained and must not use $ref");
+    }
+    Ok(schema)
+}
+
+fn json_schema_contains_ref(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.contains_key("$ref") || object.values().any(json_schema_contains_ref)
+        }
+        serde_json::Value::Array(items) => items.iter().any(json_schema_contains_ref),
+        _ => false,
+    }
 }
 
 fn crawlable_route_targets(table: &RouteTable) -> Vec<(String, PathBuf, Option<String>)> {
@@ -1589,13 +1617,13 @@ mod tests {
         AgentSurfaces, DevState, apply_route_security_headers, cancel_on_drop_body_stream,
         client_module_response, client_module_route_path, crawlable_route_targets,
         find_client_module, find_rsc_server_module, handle_agent_run, handle_agent_run_events,
-        handle_agent_runs, method_not_allowed_response, route_response, route_response_body,
-        rsc_flight_route_path, secure_route_response, send_worker_msg, text_response,
-        with_route_security_headers,
+        handle_agent_runs, method_not_allowed_response, route_action_tool, route_response,
+        route_response_body, rsc_flight_route_path, secure_route_response, send_worker_msg,
+        text_response, with_route_security_headers,
     };
     use crate::mcp;
     use crate::router::RouteTable;
-    use crate::worker;
+    use crate::worker::{self, RouteActionMeta};
 
     #[test]
     fn route_security_headers_are_added_by_default() {
@@ -1890,6 +1918,105 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn test_route_action(schema: serde_json::Value) -> RouteActionMeta {
+        RouteActionMeta {
+            name: "hello.contact".to_string(),
+            description: Some("Send a contact request.".to_string()),
+            method: Some("POST".to_string()),
+            input_schema: schema,
+            side_effect: Some("write".to_string()),
+            confirm: true,
+            dry_run: false,
+            idempotency_required: true,
+            auth: json!({"type": "public"}),
+        }
+    }
+
+    #[test]
+    fn route_action_tool_preserves_canonical_self_contained_input_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "email": {"type": "string"},
+                "confirm": {"type": "boolean"}
+            },
+            "required": ["email", "confirm"],
+            "additionalProperties": false
+        });
+
+        let tool = route_action_tool("/api/actions/contact", test_route_action(schema.clone()))
+            .expect("canonical action schema should publish");
+
+        assert_eq!(tool.input_schema, schema);
+        assert_eq!(tool.name, "hello.contact");
+        assert_eq!(tool.path, "/api/actions/contact");
+    }
+
+    #[test]
+    fn route_action_tool_rejects_opaque_or_ref_input_schemas() {
+        for schema in [
+            json!(null),
+            json!([]),
+            json!({"type": "string"}),
+            json!({"type": "object", "$ref": "#/$defs/Input"}),
+            json!({
+                "type": "object",
+                "properties": {
+                    "email": {"$ref": "#/$defs/Email"}
+                }
+            }),
+        ] {
+            assert!(
+                route_action_tool("/api/actions/contact", test_route_action(schema)).is_none(),
+                "schema should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn route_action_meta_rejects_legacy_or_ambiguous_schema_aliases() {
+        let legacy = serde_json::from_value::<RouteActionMeta>(json!({
+            "name": "hello.contact",
+            "input_schema": {"type": "object"}
+        }))
+        .expect_err("legacy input_schema should be rejected");
+        assert!(
+            legacy.to_string().contains("inputSchema")
+                || legacy.to_string().contains("input_schema"),
+            "{legacy}"
+        );
+
+        let ambiguous = serde_json::from_value::<RouteActionMeta>(json!({
+            "name": "hello.contact",
+            "inputSchema": {"type": "object"},
+            "input_schema": {"type": "object", "properties": {"shadow": {"type": "string"}}}
+        }))
+        .expect_err("mixed inputSchema/input_schema should be rejected");
+        assert!(
+            ambiguous.to_string().contains("input_schema"),
+            "{ambiguous}"
+        );
+
+        let snake_case_metadata = serde_json::from_value::<RouteActionMeta>(json!({
+            "name": "hello.contact",
+            "inputSchema": {"type": "object"},
+            "idempotency_required": true
+        }))
+        .expect_err("snake_case action metadata should be rejected");
+        assert!(
+            snake_case_metadata
+                .to_string()
+                .contains("idempotency_required"),
+            "{snake_case_metadata}"
+        );
+
+        let missing = serde_json::from_value::<RouteActionMeta>(json!({
+            "name": "hello.contact"
+        }))
+        .expect_err("missing inputSchema should be rejected");
+        assert!(missing.to_string().contains("inputSchema"), "{missing}");
     }
 
     fn test_state(app: &TempDir, mcp_access: mcp::AccessConfig) -> DevState {

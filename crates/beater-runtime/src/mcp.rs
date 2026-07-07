@@ -1056,6 +1056,7 @@ mod tests {
         AETHER_PAYMENT_HASH_HEADER, AETHER_PAYMENT_HEADER, AccessConfig, MAX_PROMPT_ARGUMENT_BYTES,
         MAX_RESOURCE_MARKDOWN_BYTES, MAX_RESOURCE_ROWS, PaymentHeaders, RouteActionTool,
         RouteCatalog, RouteResource, handle_get, handle_options, handle_post, mcp_tool_use_id,
+        tools_json,
     };
 
     struct TempApp {
@@ -1413,6 +1414,37 @@ mod tests {
                 .contains("arguments.scope exceeds"),
             "{oversized_argument}"
         );
+    }
+
+    #[test]
+    fn tools_json_publishes_route_action_input_schema_without_rewriting() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "email": {"type": "string"},
+                "confirm": {"type": "boolean"}
+            },
+            "required": ["email", "confirm"],
+            "additionalProperties": false
+        });
+        let route_actions = vec![RouteActionTool {
+            name: "hello.contact".to_string(),
+            description: "Send a contact request.".to_string(),
+            input_schema: schema.clone(),
+            method: "POST".to_string(),
+            path: "/api/actions/contact".to_string(),
+            side_effect: "write".to_string(),
+            confirm: true,
+            dry_run: false,
+            idempotency_required: true,
+            auth: json!({"type": "public"}),
+        }];
+
+        let tools = tools_json(&ToolRegistry::empty(), &route_actions);
+
+        assert_eq!(tools[0]["name"], "hello.contact");
+        assert_eq!(tools[0]["inputSchema"], schema);
+        assert_eq!(tools[0]["x-beater-action"]["path"], "/api/actions/contact");
     }
 
     #[tokio::test]

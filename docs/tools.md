@@ -75,6 +75,8 @@ export function POST(request) {
 
 The route remains a normal HTML form target. The dev server also imports `agent.actions` into `/mcp tools/list`; `/mcp tools/call` journals a synthetic MCP run, enforces confirmation and idempotency metadata, then dispatches the call through the route handler with JSON arguments. The same action metadata is published through `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`.
 
+Route actions use canonical camelCase metadata. Legacy snake_case aliases such as `input_schema`, `side_effect`, `dry_run`, and `idempotency_required` are rejected for route actions. `inputSchema` is required, and it must be a self-contained object JSON Schema with `type: "object"` and no `$ref` anywhere in the schema, so MCP and OpenAPI callers see one authoritative argument shape.
+
 ## Python tools
 
 Python tools are `.py` files loaded into embedded CPython. Each file must define:

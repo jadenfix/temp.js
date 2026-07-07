@@ -485,6 +485,7 @@ mod tests {
 
     #[test]
     fn openapi_json_groups_route_actions_by_path() {
+        let expected_schema = action().input_schema;
         let mut delete = action();
         delete.name = "hello.contact.delete".to_string();
         delete.method = "DELETE".to_string();
@@ -508,6 +509,11 @@ mod tests {
             openapi["paths"]["/api/actions/contact"]["post"]["requestBody"]["content"]["application/json"]
                 ["schema"]["required"][0],
             "email"
+        );
+        assert_eq!(
+            openapi["paths"]["/api/actions/contact"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"],
+            expected_schema
         );
     }
 

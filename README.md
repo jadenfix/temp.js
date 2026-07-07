@@ -62,6 +62,8 @@ export BEATER_MCP_TRUSTED_ORIGINS="https://ops.example.com" # browser-based oper
 
 MCP clients can call `resources/list` and `resources/read` on the same `/mcp` endpoint to read `beater://routes`, a markdown index of the app's crawlable route table and route-bound actions. Routes marked `export const agent = { crawl: false }` are omitted. The endpoint also advertises static workflow prompts through `prompts/list` and `prompts/get`: `beater.review_pr`, `beater.update_docs`, `beater.systems_design`, and `beater.choose_stack`. `/.well-known/beater.json` publishes the same MCP capability, resource, and prompt metadata for clients that discover the app before opening JSON-RPC.
 
+Route-bound actions publish one canonical model-facing argument contract: `inputSchema`. The dev server rejects legacy snake_case action aliases such as `input_schema` and `idempotency_required`, missing schemas, non-object schemas, and schemas containing `$ref` before they can appear in `/mcp tools/list` or `/openapi.json`.
+
 ## Current limits
 
 `beater dev` defaults to one JS route isolate, so TS routes and React SSR serialize unless you set `[app].workers = N` in `beater.toml`. One dev server serves one app directory. See [Runtime limits](docs/runtime-limits.md) for the exact concurrency model and scaling gate.
