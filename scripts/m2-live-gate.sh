@@ -48,6 +48,7 @@ Configuration is read from environment variables:
   BEATER_APP, BEATER_BIN, M2_GATE_OUT
   M2_GATE_PROVIDER or BEATER_LLM_PROVIDER
   M2_GATE_MODEL or BEATER_LLM_MODEL
+  BEATER_LLM_API_KEY, BEATER_LLM_BASE_URL
   ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
   BEATER_OPENAI_API_KEY or OPENAI_API_KEY
   BEATER_OPENAI_BASE_URL or OPENAI_BASE_URL
@@ -147,6 +148,9 @@ canonical_provider() {
 selected_provider() {
   local requested="${M2_GATE_PROVIDER:-${BEATER_LLM_PROVIDER:-}}"
   if [[ -z "$requested" ]]; then
+    if [[ -n "${BEATER_LLM_API_KEY:-}${BEATER_LLM_BASE_URL:-}" ]]; then
+      fail "BEATER_LLM_PROVIDER is required when using BEATER_LLM_API_KEY or BEATER_LLM_BASE_URL"
+    fi
     if [[ -z "${ANTHROPIC_API_KEY:-}" && -n "${BEATER_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}" ]]; then
       requested="openai-compatible"
     else
@@ -180,13 +184,13 @@ configure_provider() {
 
   case "$LLM_PROVIDER" in
     anthropic)
-      [[ -n "${ANTHROPIC_API_KEY:-}" ]] || fail "ANTHROPIC_API_KEY is not set for provider anthropic"
-      LLM_BASE_URL="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+      [[ -n "${BEATER_LLM_API_KEY:-${ANTHROPIC_API_KEY:-}}" ]] || fail "BEATER_LLM_API_KEY or ANTHROPIC_API_KEY is not set for provider anthropic"
+      LLM_BASE_URL="${BEATER_LLM_BASE_URL:-${ANTHROPIC_BASE_URL:-https://api.anthropic.com}}"
       ;;
     openai-compatible)
-      [[ -n "${BEATER_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}" ]] || fail "BEATER_OPENAI_API_KEY or OPENAI_API_KEY is not set for provider openai-compatible"
+      [[ -n "${BEATER_LLM_API_KEY:-${BEATER_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}}" ]] || fail "BEATER_LLM_API_KEY, BEATER_OPENAI_API_KEY, or OPENAI_API_KEY is not set for provider openai-compatible"
       [[ -n "$LLM_MODEL" ]] || fail "BEATER_LLM_MODEL or M2_GATE_MODEL is required for provider openai-compatible so the Anthropic example model is not sent to a different provider"
-      LLM_BASE_URL="${BEATER_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}"
+      LLM_BASE_URL="${BEATER_LLM_BASE_URL:-${BEATER_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}}"
       ;;
   esac
 

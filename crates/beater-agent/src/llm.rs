@@ -78,12 +78,14 @@ pub struct OpenAiCompatible {
 
 impl OpenAiCompatible {
     fn from_env() -> Result<Self> {
-        let api_key = std::env::var("BEATER_OPENAI_API_KEY")
+        let api_key = std::env::var("BEATER_LLM_API_KEY")
+            .or_else(|_| std::env::var("BEATER_OPENAI_API_KEY"))
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .context(
-                "BEATER_OPENAI_API_KEY or OPENAI_API_KEY is not set for provider openai-compatible",
+                "BEATER_LLM_API_KEY, BEATER_OPENAI_API_KEY, or OPENAI_API_KEY is not set for provider openai-compatible",
             )?;
-        let base_url = std::env::var("BEATER_OPENAI_BASE_URL")
+        let base_url = std::env::var("BEATER_LLM_BASE_URL")
+            .or_else(|_| std::env::var("BEATER_OPENAI_BASE_URL"))
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
         Self::new(api_key, &base_url, DEFAULT_REQUEST_TIMEOUT)
