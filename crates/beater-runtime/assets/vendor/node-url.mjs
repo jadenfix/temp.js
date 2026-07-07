@@ -22,6 +22,9 @@ export class URLSearchParams {
 
   constructor(init = "", onChange = undefined) {
     this.#onChange = onChange;
+    if (init == null) {
+      return;
+    }
     if (typeof init === "string") {
       const raw = init.startsWith("?") ? init.slice(1) : init;
       if (raw) {

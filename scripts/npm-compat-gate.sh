@@ -202,6 +202,7 @@ export function inspectUrl() {
     ["q", "beater js"],
     ["q", "agent"],
   ]);
+  const nullParams = new URLSearchParams(null);
   const mutable = new URL("https://idp.example/cb");
   mutable.searchParams.append("state", "a=b=");
   return {
@@ -214,6 +215,7 @@ export function inspectUrl() {
     parsedHref: parsed.href,
     paramsAll: params.getAll("q"),
     stringParam: new URLSearchParams("sig=a=b=&empty").get("sig"),
+    nullParams: nullParams.toString(),
     mutableHref: mutable.href,
     queryOnlyHref: new URL("?page=2", "https://example.test/app/items?old=1#top").href,
     hashOnlyHref: new URL("#next", "https://example.test/app/items?old=1#top").href,
@@ -439,6 +441,7 @@ expected_url = {
     "parsedHref": "https://example.test/app/api/health?q=beater#frag",
     "paramsAll": ["beater js", "agent"],
     "stringParam": "a=b=",
+    "nullParams": "",
     "mutableHref": "https://idp.example/cb?state=a%3Db%3D",
     "queryOnlyHref": "https://example.test/app/items?page=2",
     "hashOnlyHref": "https://example.test/app/items?old=1#next",
