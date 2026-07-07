@@ -53,6 +53,7 @@ fn vendor_specifier(specifier: &str) -> Option<&'static str> {
         "react/jsx-runtime" | "react/jsx-dev-runtime" => Some("beater:vendor/react-jsx-runtime"),
         "react-dom/server" => Some("beater:vendor/react-dom-server"),
         "node:buffer" | "buffer" => Some("beater:vendor/node-buffer"),
+        "node:os" | "os" => Some("beater:vendor/node-os"),
         "node:path" | "path" => Some("beater:vendor/node-path"),
         "node:process" | "process" => Some("beater:vendor/node-process"),
         "node:url" | "url" => Some("beater:vendor/node-url"),
@@ -71,6 +72,7 @@ fn vendor_source(specifier: &str) -> Option<&'static str> {
             Some(include_str!("../assets/vendor/react-dom-server.mjs"))
         }
         "beater:vendor/node-buffer" => Some(include_str!("../assets/vendor/node-buffer.mjs")),
+        "beater:vendor/node-os" => Some(include_str!("../assets/vendor/node-os.mjs")),
         "beater:vendor/node-path" => Some(include_str!("../assets/vendor/node-path.mjs")),
         "beater:vendor/node-process" => Some(include_str!("../assets/vendor/node-process.mjs")),
         "beater:vendor/node-url" => Some(include_str!("../assets/vendor/node-url.mjs")),
@@ -1418,6 +1420,20 @@ mod tests {
     }
 
     #[test]
+    fn node_os_vendor_specifiers_resolve_to_checked_in_shim() {
+        assert_eq!(
+            super::vendor_specifier("node:os"),
+            Some("beater:vendor/node-os")
+        );
+        assert_eq!(super::vendor_specifier("os"), Some("beater:vendor/node-os"));
+
+        let source = super::vendor_source("beater:vendor/node-os").unwrap();
+        assert!(source.contains("sanitized OS shim"));
+        assert!(source.contains("export function platform"));
+        assert!(source.contains("export function availableParallelism"));
+    }
+
+    #[test]
     fn node_url_vendor_specifiers_resolve_to_checked_in_shim() {
         assert_eq!(
             super::vendor_specifier("node:url"),
@@ -1460,6 +1476,16 @@ mod tests {
         assert!(source.contains("sep = \"/\""));
         assert!(source.contains("default path"));
         assert!(source.contains("posix"));
+    }
+
+    #[test]
+    fn node_os_vendor_module_loads_from_beater_scheme() {
+        let specifier = ModuleSpecifier::parse("beater:vendor/node-os").unwrap();
+        let source = source_text(load_sync(&specifier).unwrap());
+
+        assert!(source.contains("platform()"));
+        assert!(source.contains("networkInterfaces()"));
+        assert!(source.contains("default os"));
     }
 
     #[test]

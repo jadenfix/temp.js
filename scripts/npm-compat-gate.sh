@@ -167,6 +167,72 @@ export function inspectPath() {
 }
 JS
 
+mkdir -p "$APP/node_modules/osed"
+cat >"$APP/node_modules/osed/package.json" <<'JSON'
+{
+  "name": "osed",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+JSON
+
+cat >"$APP/node_modules/osed/index.js" <<'JS'
+import os, {
+  arch,
+  availableParallelism,
+  cpus,
+  devNull,
+  EOL,
+  freemem,
+  homedir,
+  hostname,
+  loadavg,
+  networkInterfaces,
+  platform,
+  tmpdir,
+  totalmem,
+  userInfo,
+} from "node:os";
+import { platform as barePlatform } from "os";
+
+function rejects(callback) {
+  try {
+    callback();
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export function inspectOs() {
+  return {
+    arch: arch(),
+    availableParallelism: availableParallelism(),
+    barePlatform: barePlatform(),
+    cpus: cpus(),
+    defaultPlatform: os.platform(),
+    devNull,
+    eol: EOL,
+    freemem: freemem(),
+    homedir: homedir(),
+    hostname: hostname(),
+    loadavg: loadavg(),
+    networkInterfaces: networkInterfaces(),
+    platform: platform(),
+    priority: os.getPriority(),
+    setPriorityRejected: rejects(() => os.setPriority(10)),
+    tmpdir: tmpdir(),
+    totalmem: totalmem(),
+    type: os.type(),
+    uptime: os.uptime(),
+    userInfo: userInfo(),
+    version: os.version(),
+  };
+}
+JS
+
 mkdir -p "$APP/node_modules/urled"
 cat >"$APP/node_modules/urled/package.json" <<'JSON'
 {
@@ -283,6 +349,18 @@ export function GET() {
 }
 TS
 
+cat >"$APP/app/routes/api/osed.ts" <<'TS'
+import { inspectOs } from "osed";
+
+export function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(inspectOs()),
+  };
+}
+TS
+
 cat >"$APP/app/routes/api/urled.ts" <<'TS'
 import { inspectUrl } from "urled";
 
@@ -325,6 +403,9 @@ mkdir -p "$(dirname "$LOG")"
   unset BEATER_BASE_URL
   unset BEATER_MCP_TOKEN
   unset BEATER_MCP_TRUSTED_ORIGINS
+  export HOME=/host/home/leak
+  export HOSTNAME=host-name-leak
+  export USER=host-user-leak
   "$BIN" dev "$APP" --host 127.0.0.1 --port "$PORT"
 ) >"$LOG" 2>&1 &
 pid=$!
@@ -424,6 +505,46 @@ if path_payload != expected_path:
     sys.exit(f"unexpected /api/pathed payload: {path_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("GET", "/api/osed")
+response = conn.getresponse()
+body = response.read().decode("utf-8")
+conn.close()
+if response.status != 200:
+    sys.exit(f"expected 200 from /api/osed, got {response.status}: {body}")
+os_payload = json.loads(body)
+expected_os = {
+    "arch": "wasm32",
+    "availableParallelism": 1,
+    "barePlatform": "beater",
+    "cpus": [],
+    "defaultPlatform": "beater",
+    "devNull": "/dev/null",
+    "eol": "\n",
+    "freemem": 0,
+    "homedir": "/",
+    "hostname": "localhost",
+    "loadavg": [0, 0, 0],
+    "networkInterfaces": {},
+    "platform": "beater",
+    "priority": 0,
+    "setPriorityRejected": True,
+    "tmpdir": "/tmp",
+    "totalmem": 0,
+    "type": "Beater",
+    "uptime": 0,
+    "userInfo": {
+        "uid": -1,
+        "gid": -1,
+        "username": "beater",
+        "homedir": "/",
+        "shell": None,
+    },
+    "version": "0.0.0",
+}
+if os_payload != expected_os:
+    sys.exit(f"unexpected /api/osed payload: {os_payload!r}")
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/urled")
 response = conn.getresponse()
 body = response.read().decode("utf-8")
@@ -507,6 +628,7 @@ print(
     f"zod import returned {zod_payload['value']}; "
     f"cjs doubled {cjs_payload['doubled']}; "
     f"path resolved {path_payload['resolved']}; "
+    f"os platform {os_payload['platform']}; "
     f"url file {url_payload['filePath']}; "
     f"buffer base64 {buffer_payload['base64']}; "
     f"process env {process_payload['nodeEnv']}; "
