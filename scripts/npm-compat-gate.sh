@@ -119,6 +119,123 @@ export async function inspect() {
 }
 JS
 
+mkdir -p "$APP/node_modules/evented"
+cat >"$APP/node_modules/evented/package.json" <<'JSON'
+{
+  "name": "evented",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+JSON
+
+cat >"$APP/node_modules/evented/index.js" <<'JS'
+import EventEmitter, {
+  EventEmitter as NamedEventEmitter,
+  addAbortListener,
+  defaultMaxListeners,
+  getEventListeners,
+  getMaxListeners,
+  listenerCount,
+  once,
+  on,
+  setMaxListeners,
+} from "node:events";
+import { EventEmitter as BareEventEmitter } from "events";
+
+function rejects(callback) {
+  try {
+    callback();
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export async function inspectEvents() {
+  const emitter = new EventEmitter();
+  const seen = [];
+  const listener = (value) => seen.push(`on:${value}`);
+  emitter.on("data", listener);
+  emitter.once("data", (value) => seen.push(`once:${value}`));
+  const before = listenerCount(emitter, "data");
+  emitter.emit("data", "a");
+  emitter.emit("data", "b");
+  emitter.off("data", listener);
+
+  const readyPromise = once(emitter, "ready");
+  emitter.emit("ready", "ok", 7);
+  const ready = await readyPromise;
+
+  const ordered = [];
+  emitter.on("order", () => ordered.push("last"));
+  emitter.prependListener("order", () => ordered.push("first"));
+  emitter.emit("order");
+
+  const raw = new EventEmitter();
+  function original() {}
+  raw.once("x", original);
+  const rawHasWrapper = raw.rawListeners("x")[0] !== raw.listeners("x")[0];
+  const listenerCopy = getEventListeners(raw, "x");
+  raw.removeAllListeners("x");
+
+  const duplicateOrder = [];
+  function duplicate() {
+    duplicateOrder.push("duplicate");
+  }
+  emitter.on("duplicate", () => duplicateOrder.push("head"));
+  emitter.on("duplicate", duplicate);
+  emitter.on("duplicate", () => duplicateOrder.push("middle"));
+  emitter.on("duplicate", duplicate);
+  emitter.removeListener("duplicate", duplicate);
+  emitter.emit("duplicate");
+  emitter.removeAllListeners("duplicate");
+
+  const maxBefore = getMaxListeners(emitter);
+  setMaxListeners(3, emitter);
+  const maxAfter = emitter.getMaxListeners();
+
+  let errorMessage = "";
+  try {
+    new EventEmitter().emit("error", new Error("boom"));
+  } catch (error) {
+    errorMessage = error.message;
+  }
+
+  const abortSignalLike = {
+    addEventListener() {},
+    removeEventListener() {},
+  };
+
+  return {
+    addAbortRejected: rejects(() => addAbortListener(abortSignalLike, () => {})),
+    asyncIteratorRejected: rejects(() => on(emitter, "data")),
+    bareIsNamed: BareEventEmitter === NamedEventEmitter,
+    before,
+    defaultHasStatics:
+      EventEmitter.EventEmitter === NamedEventEmitter &&
+      EventEmitter.once === once &&
+      EventEmitter.listenerCount === listenerCount,
+    defaultIsNamed: EventEmitter === NamedEventEmitter,
+    defaultMaxListeners,
+    duplicateOrder,
+    errorMessage,
+    eventNames: emitter.eventNames(),
+    listenerCopyLength: listenerCopy.length,
+    maxAfter,
+    maxBefore,
+    missingEmit: emitter.emit("missing"),
+    ordered,
+    rawAfterRemove: raw.listenerCount("x"),
+    rawHasWrapper,
+    ready,
+    remainingData: emitter.listenerCount("data"),
+    seen,
+  };
+}
+JS
+
 mkdir -p "$APP/node_modules/pathed"
 cat >"$APP/node_modules/pathed/package.json" <<'JSON'
 {
@@ -337,6 +454,18 @@ export function GET() {
 }
 TS
 
+cat >"$APP/app/routes/api/evented.ts" <<'TS'
+import { inspectEvents } from "evented";
+
+export async function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(await inspectEvents()),
+  };
+}
+TS
+
 cat >"$APP/app/routes/api/pathed.ts" <<'TS'
 import { inspectPath } from "pathed";
 
@@ -461,6 +590,39 @@ if response.status != 200:
 cjs_payload = json.loads(body)
 if cjs_payload != {"label": "legacy-cjs", "doubled": 42}:
     sys.exit(f"unexpected /api/cjs payload: {cjs_payload!r}")
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("GET", "/api/evented")
+response = conn.getresponse()
+body = response.read().decode("utf-8")
+conn.close()
+if response.status != 200:
+    sys.exit(f"expected 200 from /api/evented, got {response.status}: {body}")
+events_payload = json.loads(body)
+expected_events = {
+    "addAbortRejected": True,
+    "asyncIteratorRejected": True,
+    "bareIsNamed": True,
+    "before": 2,
+    "defaultHasStatics": True,
+    "defaultIsNamed": True,
+    "defaultMaxListeners": 10,
+    "duplicateOrder": ["head", "duplicate", "middle"],
+    "errorMessage": "boom",
+    "eventNames": ["order"],
+    "listenerCopyLength": 1,
+    "maxAfter": 3,
+    "maxBefore": 10,
+    "missingEmit": False,
+    "ordered": ["first", "last"],
+    "rawAfterRemove": 0,
+    "rawHasWrapper": True,
+    "ready": ["ok", 7],
+    "remainingData": 0,
+    "seen": ["on:a", "once:a", "on:b"],
+}
+if events_payload != expected_events:
+    sys.exit(f"unexpected /api/evented payload: {events_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/pathed")
@@ -627,6 +789,7 @@ print(
     "npm compat passed: "
     f"zod import returned {zod_payload['value']}; "
     f"cjs doubled {cjs_payload['doubled']}; "
+    f"events seen {','.join(events_payload['seen'])}; "
     f"path resolved {path_payload['resolved']}; "
     f"os platform {os_payload['platform']}; "
     f"url file {url_payload['filePath']}; "
