@@ -70,7 +70,15 @@ grep -q "BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL" "$TMP/custom-openai-without-flag.e
 
 bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL; export BEATER_LLM_PROVIDER=openai; export BEATER_LLM_MODEL=model-fixture; export BEATER_LLM_API_KEY=fixture-key; export BEATER_LLM_BASE_URL=https://integrate.api.nvidia.com/v1; export BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1; configure_provider; [[ "$LLM_PROVIDER" == "openai-compatible" ]] && [[ "$BEATER_LLM_PROVIDER" == "openai-compatible" ]] && [[ "$BEATER_LLM_MODEL" == "model-fixture" ]] && [[ "$LLM_BASE_URL" == "https://integrate.api.nvidia.com/v1" ]]' _ "$SCRIPT"
 
-bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL BEATER_LLM_PROVIDER BEATER_LLM_API_KEY ANTHROPIC_API_KEY; export OPENAI_API_KEY=fixture-key; export BEATER_LLM_MODEL=model-fixture; configure_provider; [[ "$LLM_PROVIDER" == "openai-compatible" ]]' _ "$SCRIPT"
+bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL BEATER_LLM_PROVIDER BEATER_LLM_API_KEY BEATER_LLM_BASE_URL ANTHROPIC_API_KEY; export OPENAI_API_KEY=fixture-key; export BEATER_LLM_MODEL=model-fixture; configure_provider; [[ "$LLM_PROVIDER" == "openai-compatible" ]]' _ "$SCRIPT"
+
+if bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL; export BEATER_LLM_PROVIDER=openai-compatible; export BEATER_LLM_MODEL=model-fixture; export BEATER_LLM_API_KEY=fixture-key; export BEATER_LLM_BASE_URL=http://127.evil.test/v1; export BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1; configure_provider' _ "$SCRIPT" >"$TMP/evil-loopback.out" 2>"$TMP/evil-loopback.err"; then
+  fail "configure_provider should reject hostnames that only look like loopback addresses"
+fi
+grep -q "OpenAI-compatible base URL must use https" "$TMP/evil-loopback.err" || {
+  cat "$TMP/evil-loopback.err" >&2
+  fail "fake loopback hostname failure did not explain the runtime policy"
+}
 
 if bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER BEATER_LLM_PROVIDER ANTHROPIC_API_KEY BEATER_OPENAI_API_KEY OPENAI_API_KEY; export BEATER_LLM_API_KEY=fixture-key; selected_provider' _ "$SCRIPT" >"$TMP/generic-without-provider.out" 2>"$TMP/generic-without-provider.err"; then
   fail "selected_provider should require BEATER_LLM_PROVIDER when generic key is used"
@@ -137,6 +145,7 @@ if BEATER_APP="$DRY_APP" \
   BEATER_LLM_PROVIDER="openai-compatible" \
   BEATER_LLM_MODEL="model-fixture" \
   BEATER_LLM_API_KEY="fixture-key" \
+  BEATER_LLM_BASE_URL="https://api.openai.com/v1" \
   bash "$SCRIPT" --dry-run >"$TMP/non-empty.out" 2>"$TMP/non-empty.err"; then
   fail "dry-run should reject non-empty output directories"
 fi
