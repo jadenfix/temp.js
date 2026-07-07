@@ -130,6 +130,9 @@ export function basename(path, suffix = "") {
 export function extname(path) {
   assertPath(path);
   const base = basename(path);
+  if (base === "." || base === "..") {
+    return "";
+  }
   const index = base.lastIndexOf(".");
   if (index <= 0) {
     return "";
@@ -162,10 +165,14 @@ export function relative(from, to) {
 export function parse(path) {
   assertPath(path);
   const root = isAbsolute(path) ? "/" : "";
-  const dir = dirname(path);
-  const base = basename(path);
+  const trimmed = trimTrailingSlashes(path);
+  const base = basename(trimmed);
   const ext = extname(path);
   const name = ext ? base.slice(0, -ext.length) : base;
+  let dir = dirname(trimmed);
+  if (!root && dir === ".") {
+    dir = "";
+  }
   return { root, dir, base, ext, name };
 }
 
