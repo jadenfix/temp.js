@@ -84,6 +84,60 @@
     Promise.resolve().then(cb);
   };
 
+  if (!globalThis.AbortController) {
+    class AbortSignal {
+      constructor() {
+        this.aborted = false;
+        this.reason = undefined;
+        this.onabort = null;
+        this._listeners = new Set();
+      }
+
+      addEventListener(type, listener, options = undefined) {
+        if (type !== "abort" || typeof listener !== "function") return;
+        const entry = { listener, once: options?.once === true };
+        this._listeners.add(entry);
+      }
+
+      removeEventListener(type, listener) {
+        if (type !== "abort") return;
+        for (const entry of [...this._listeners]) {
+          if (entry.listener === listener) this._listeners.delete(entry);
+        }
+      }
+
+      throwIfAborted() {
+        if (this.aborted) throw this.reason ?? new Error("The operation was aborted");
+      }
+
+      _abort(reason) {
+        if (this.aborted) return;
+        this.aborted = true;
+        this.reason = reason ?? new Error("The operation was aborted");
+        const event = { type: "abort", target: this };
+        for (const entry of [...this._listeners]) {
+          try {
+            entry.listener.call(this, event);
+          } finally {
+            if (entry.once) this._listeners.delete(entry);
+          }
+        }
+        if (typeof this.onabort === "function") this.onabort.call(this, event);
+      }
+    }
+
+    globalThis.AbortSignal = AbortSignal;
+    globalThis.AbortController = class AbortController {
+      constructor() {
+        this.signal = new AbortSignal();
+      }
+
+      abort(reason = undefined) {
+        this.signal._abort(reason);
+      }
+    };
+  }
+
   if (!globalThis.process) {
     const env = Object.freeze({
       NODE_ENV: "production",

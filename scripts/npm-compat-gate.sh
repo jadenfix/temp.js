@@ -781,6 +781,302 @@ export async function inspectTimers() {
 }
 JS
 
+mkdir -p "$APP/node_modules/streamed"
+cat >"$APP/node_modules/streamed/package.json" <<'JSON'
+{
+  "name": "streamed",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+JSON
+
+cat >"$APP/node_modules/streamed/index.js" <<'JS'
+import stream, {
+  PassThrough,
+  Readable,
+  Transform,
+  Writable,
+  finished as callbackFinished,
+  isReadable,
+  isWritable,
+  pipeline as callbackPipeline,
+} from "node:stream";
+import bareStream from "stream";
+import {
+  finished as promiseFinished,
+  pipeline as promisePipeline,
+} from "node:stream/promises";
+import bareStreamPromises from "stream/promises";
+import { setTimeout as promiseTimeout } from "node:timers/promises";
+
+function waitFinished(target) {
+  return new Promise((resolve, reject) => {
+    callbackFinished(target, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+export async function inspectStreams() {
+  const fromChunks = [];
+  for await (const chunk of Readable.from(["a", "b", "c"])) {
+    fromChunks.push(String(chunk));
+  }
+
+  const iterator = Readable.from(["once"])[Symbol.asyncIterator]();
+  const iteratorFirst = await iterator.next();
+  const iteratorSecond = await iterator.next();
+
+  const pass = new PassThrough();
+  const passChunks = [];
+  pass.on("data", (chunk) => passChunks.push(String(chunk)));
+  pass.write("x");
+  pass.end("y");
+  await promiseFinished(pass);
+
+  const upper = new Transform({
+    transform(chunk, _encoding, callback) {
+      callback(null, String(chunk).toUpperCase());
+    },
+  });
+  const upperChunks = [];
+  upper.on("data", (chunk) => upperChunks.push(String(chunk)));
+  upper.write("m");
+  upper.end("n");
+  await waitFinished(upper);
+
+  const written = [];
+  const writable = new Writable({
+    write(chunk, _encoding, callback) {
+      written.push(String(chunk));
+      callback();
+    },
+  });
+  writable.write("w1");
+  writable.end("w2");
+  await promiseFinished(writable);
+
+  const callbackPipelineChunks = [];
+  await new Promise((resolve, reject) => {
+    callbackPipeline(
+      Readable.from(["p", "q"]),
+      new Writable({
+        write(chunk, _encoding, callback) {
+          callbackPipelineChunks.push(String(chunk));
+          callback();
+        },
+      }),
+      (error) => (error ? reject(error) : resolve())
+    );
+  });
+
+  const promisePipelineChunks = [];
+  await promisePipeline(
+    Readable.from(["r", "s"]),
+    new Writable({
+      write(chunk, _encoding, callback) {
+        promisePipelineChunks.push(String(chunk));
+        callback();
+      },
+    })
+  );
+
+  const passThroughPipelineChunks = [];
+  await promisePipeline(
+    Readable.from(["pipe-a", "pipe-b", "pipe-c"]),
+    new PassThrough(),
+    new Writable({
+      write(chunk, _encoding, callback) {
+        passThroughPipelineChunks.push(String(chunk));
+        callback();
+      },
+    })
+  );
+
+  const asyncWritten = [];
+  const asyncWritable = new Writable({
+    write(chunk, _encoding, callback) {
+      setTimeout(() => {
+        asyncWritten.push(String(chunk));
+        callback();
+      }, 1);
+    },
+  });
+  asyncWritable.end("late-write");
+  await promiseFinished(asyncWritable);
+
+  const asyncUpper = new Transform({
+    transform(chunk, _encoding, callback) {
+      setTimeout(() => callback(null, String(chunk).toUpperCase()), 1);
+    },
+  });
+  const asyncUpperChunks = [];
+  asyncUpper.on("data", (chunk) => asyncUpperChunks.push(String(chunk)));
+  asyncUpper.write("u");
+  asyncUpper.end("v");
+  await promiseFinished(asyncUpper);
+
+  const writeErrorStream = new Writable({
+    write(_chunk, _encoding, callback) {
+      setTimeout(() => callback(new Error("write-boom")), 1);
+    },
+  });
+  const writeError = promiseFinished(writeErrorStream).then(
+    () => "ok",
+    (error) => error.message
+  );
+  writeErrorStream.end("x");
+
+  const pipelineError = await promisePipeline(
+    Readable.from(["x"]),
+    new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(new Error("pipeline-boom"));
+      },
+    })
+  ).then(
+    () => "ok",
+    (error) => error.message
+  );
+
+  const premature = new PassThrough();
+  const prematureClose = promiseFinished(premature).then(
+    () => "ok",
+    (error) => error.message
+  );
+  premature.destroy();
+
+  const prematureReadable = new Readable();
+  const prematureReadableClose = promiseFinished(prematureReadable).then(
+    () => "ok",
+    (error) => error.message
+  );
+  prematureReadable.destroy();
+
+  const prematureWritable = new Writable();
+  const prematureWritableClose = promiseFinished(prematureWritable).then(
+    () => "ok",
+    (error) => error.message
+  );
+  prematureWritable.destroy();
+
+  let sourceCancelled = false;
+  async function* cancellableSource() {
+    try {
+      yield "keep";
+      await new Promise(() => {});
+    } finally {
+      await promiseTimeout(1);
+      sourceCancelled = true;
+    }
+  }
+  const cancellableIterator = Readable.from(cancellableSource())[Symbol.asyncIterator]();
+  const cancellableFirst = await cancellableIterator.next();
+  await cancellableIterator.return();
+
+  const erroredReadable = new Readable();
+  erroredReadable.once("error", () => {});
+  erroredReadable.destroy(new Error("read-boom"));
+  const erroredNext = await erroredReadable[Symbol.asyncIterator]().next().then(
+    () => "ok",
+    (error) => error.message
+  );
+
+  const pendingWritable = new Writable({
+    maxPendingOps: 1,
+    write(_chunk, _encoding, callback) {
+      setTimeout(callback, 10);
+    },
+  });
+  const pendingError = new Promise((resolve) => {
+    pendingWritable.once("error", (error) => resolve(error.message));
+  });
+  pendingWritable.write("first");
+  const pendingSecond = pendingWritable.write("second");
+  const pendingMessage = await pendingError;
+  pendingWritable.destroy();
+
+  const pendingBytesWritable = new Writable({
+    maxPendingBytes: 8,
+    write(_chunk, _encoding, callback) {
+      setTimeout(callback, 10);
+    },
+  });
+  const pendingBytesError = new Promise((resolve) => {
+    pendingBytesWritable.once("error", (error) => resolve(error.message));
+  });
+  const pendingBytesWrite = pendingBytesWritable.write("too-large");
+  const pendingBytesMessage = await pendingBytesError;
+  pendingBytesWritable.destroy();
+
+  const bytePressureWritable = new Writable({
+    maxPendingBytes: 8,
+    write(_chunk, _encoding, callback) {
+      setTimeout(callback, 10);
+    },
+  });
+  const bytePressureDrain = new Promise((resolve) => {
+    bytePressureWritable.once("drain", () => resolve("drain"));
+  });
+  const bytePressureWrite = bytePressureWritable.write("12345678");
+  const bytePressureDrainResult = await bytePressureDrain;
+  bytePressureWritable.end();
+  await promiseFinished(bytePressureWritable);
+
+  const bounded = new PassThrough({ highWaterMark: 1, highWaterBytes: 8 });
+  const boundedError = new Promise((resolve) => {
+    bounded.once("error", (error) => resolve(error.message));
+  });
+  const boundedSecond = bounded.write("too-large");
+  const boundedMessage = await boundedError;
+
+  return {
+    asyncUpperChunks,
+    asyncWritten,
+    bareDefaultMatches: bareStream.PassThrough === PassThrough,
+    bytePressure: {
+      drain: bytePressureDrainResult,
+      write: bytePressureWrite,
+    },
+    bounded: {
+      secondWrite: boundedSecond,
+      message: boundedMessage,
+    },
+    callbackPipelineChunks,
+    defaultStatics: stream.Readable === Readable && stream.Writable === Writable,
+    fromChunks,
+    isReadable: isReadable(Readable.from(["ok"])),
+    isWritable: isWritable(new Writable()),
+    iterator: {
+      first: iteratorFirst.value,
+      secondDone: iteratorSecond.done,
+    },
+    pending: {
+      message: pendingMessage,
+      secondWrite: pendingSecond,
+    },
+    pendingBytes: {
+      message: pendingBytesMessage,
+      write: pendingBytesWrite,
+    },
+    passChunks,
+    passThroughPipelineChunks,
+    pipelineError,
+    prematureClose: await prematureClose,
+    prematureReadableClose: await prematureReadableClose,
+    prematureWritableClose: await prematureWritableClose,
+    promiseBareMatches: bareStreamPromises.pipeline === promisePipeline,
+    promisePipelineChunks,
+    sourceCancelled,
+    sourceFirst: cancellableFirst.value,
+    upperChunks,
+    written,
+    writeError: await writeError,
+    erroredNext,
+  };
+}
+JS
+
 mkdir -p "$APP/node_modules/pathed"
 cat >"$APP/node_modules/pathed/package.json" <<'JSON'
 {
@@ -1055,6 +1351,18 @@ export async function GET() {
     status: 200,
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify(await inspectTimers()),
+  };
+}
+TS
+
+cat >"$APP/app/routes/api/streamed.ts" <<'TS'
+import { inspectStreams } from "streamed";
+
+export async function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(await inspectStreams()),
   };
 }
 TS
@@ -1459,6 +1767,61 @@ if timer_payload != expected_timer:
     sys.exit(f"unexpected /api/timered payload: {timer_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("GET", "/api/streamed")
+response = conn.getresponse()
+body = response.read().decode("utf-8")
+conn.close()
+if response.status != 200:
+    sys.exit(f"expected 200 from /api/streamed, got {response.status}: {body}")
+stream_payload = json.loads(body)
+expected_stream = {
+    "asyncUpperChunks": ["U", "V"],
+    "asyncWritten": ["late-write"],
+    "bareDefaultMatches": True,
+    "bytePressure": {
+        "drain": "drain",
+        "write": False,
+    },
+    "bounded": {
+        "message": "stream buffer limit exceeded",
+        "secondWrite": False,
+    },
+    "callbackPipelineChunks": ["p", "q"],
+    "defaultStatics": True,
+    "fromChunks": ["a", "b", "c"],
+    "isReadable": True,
+    "isWritable": True,
+    "iterator": {
+        "first": "once",
+        "secondDone": True,
+    },
+    "pending": {
+        "message": "stream pending operation limit exceeded",
+        "secondWrite": False,
+    },
+    "pendingBytes": {
+        "message": "stream buffer limit exceeded",
+        "write": False,
+    },
+    "passChunks": ["x", "y"],
+    "passThroughPipelineChunks": ["pipe-a", "pipe-b", "pipe-c"],
+    "pipelineError": "pipeline-boom",
+    "prematureClose": "stream closed before finishing",
+    "prematureReadableClose": "stream closed before finishing",
+    "prematureWritableClose": "stream closed before finishing",
+    "promiseBareMatches": True,
+    "promisePipelineChunks": ["r", "s"],
+    "sourceCancelled": True,
+    "sourceFirst": "keep",
+    "upperChunks": ["M", "N"],
+    "written": ["w1", "w2"],
+    "writeError": "write-boom",
+    "erroredNext": "read-boom",
+}
+if stream_payload != expected_stream:
+    sys.exit(f"unexpected /api/streamed payload: {stream_payload!r}")
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/pathed")
 response = conn.getresponse()
 body = response.read().decode("utf-8")
@@ -1628,6 +1991,7 @@ print(
     f"assert strict {assert_payload['strictFailure']['operator']}; "
     f"query {query_payload['stringified']}; "
     f"timers {timer_payload['promised']}; "
+    f"stream {stream_payload['fromChunks'][0]}; "
     f"path resolved {path_payload['resolved']}; "
     f"os platform {os_payload['platform']}; "
     f"url file {url_payload['filePath']}; "
