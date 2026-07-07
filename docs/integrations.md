@@ -46,6 +46,8 @@ beater-connect print mcp
 
 Runtime route actions use `defineAction` in an API route's `agent.actions` metadata. The route remains a normal form target for humans, and the dev server exposes the same action through live `/mcp tools/list` and `/mcp tools/call` with journaled execution, confirmation checks, idempotency keys, runtime `/openapi.json`, `/llms.txt`, and `/.well-known/beater.json`.
 
+Runtime route actions must declare canonical camelCase metadata, including `inputSchema`, `sideEffect`, `dryRun`, and `idempotencyRequired`. Legacy snake_case aliases are rejected. The schema is published unchanged to MCP and OpenAPI only when it is a self-contained object JSON Schema with `type: "object"` and no `$ref`; ambiguous aliases and opaque schemas are rejected before they become agent-visible contracts.
+
 ### First-Party Python
 
 Use `pyTool` for app-owned Python code:

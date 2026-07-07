@@ -85,24 +85,21 @@ pub struct RouteMeta {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteActionMeta {
     pub name: String,
     pub description: Option<String>,
     #[serde(default)]
     pub method: Option<String>,
-    #[serde(default, rename = "inputSchema", alias = "input_schema")]
+    #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
-    #[serde(default, rename = "sideEffect", alias = "side_effect")]
+    #[serde(default, rename = "sideEffect")]
     pub side_effect: Option<String>,
     #[serde(default)]
     pub confirm: bool,
-    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    #[serde(default, rename = "dryRun")]
     pub dry_run: bool,
-    #[serde(
-        default,
-        rename = "idempotencyRequired",
-        alias = "idempotency_required"
-    )]
+    #[serde(default, rename = "idempotencyRequired")]
     pub idempotency_required: bool,
     #[serde(default)]
     pub auth: serde_json::Value,
@@ -848,6 +845,35 @@ mod tests {
         deno_core::scope!(scope, runtime);
         let local = v8::Local::new(scope, global);
         deno_core::serde_v8::from_v8(scope, local).expect("test expression should return bool")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_meta_rejects_legacy_action_aliases_before_serializing() {
+        let app = TempDir::new();
+        app.write(
+            "app/routes/api/contact.ts",
+            r#"
+export const agent = {
+  actions: [{
+    name: "hello.contact",
+    inputSchema: {type: "object"},
+    idempotency_required: true,
+  }],
+};
+"#,
+        );
+        let specifier = deno_core::ModuleSpecifier::from_file_path(
+            app.path().join("app/routes/api/contact.ts"),
+        )
+        .unwrap()
+        .to_string();
+        let mut runtime = runtime_with_bootstrap();
+
+        let error = route_meta(&mut runtime, &specifier)
+            .await
+            .expect_err("legacy snake_case action metadata should fail closed");
+
+        assert!(error.contains("idempotency_required"), "{error}");
     }
 
     #[test]

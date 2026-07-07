@@ -483,6 +483,50 @@
 
   // Agent Access Layer: read a route module's optional `agent` metadata
   // export ({title, description, crawl}) for llms.txt / sitemap generation.
+  function beaterHasOwn(object, key) {
+    return Object.prototype.hasOwnProperty.call(object, key);
+  }
+
+  const beaterLegacyActionAliases = {
+    input_schema: "inputSchema",
+    side_effect: "sideEffect",
+    dry_run: "dryRun",
+    idempotency_required: "idempotencyRequired",
+  };
+
+  function beaterRejectLegacyActionAliases(action) {
+    for (const [legacy, canonical] of Object.entries(beaterLegacyActionAliases)) {
+      if (beaterHasOwn(action, legacy)) {
+        throw new Error(`route action ${action.name} uses canonical ${canonical}; ${legacy} is not accepted`);
+      }
+    }
+  }
+
+  function beaterSchemaContainsRef(value) {
+    if (Array.isArray(value)) return value.some(beaterSchemaContainsRef);
+    if (!value || typeof value !== "object") return false;
+    if (beaterHasOwn(value, "$ref")) return true;
+    return Object.values(value).some(beaterSchemaContainsRef);
+  }
+
+  function beaterActionInputSchema(action) {
+    beaterRejectLegacyActionAliases(action);
+    if (!beaterHasOwn(action, "inputSchema")) {
+      throw new Error(`route action ${action.name} requires inputSchema`);
+    }
+    const schema = action.inputSchema;
+    if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+      throw new Error(`route action ${action.name} inputSchema must be an object JSON Schema`);
+    }
+    if (schema.type !== "object") {
+      throw new Error(`route action ${action.name} inputSchema.type must be "object"`);
+    }
+    if (beaterSchemaContainsRef(schema)) {
+      throw new Error(`route action ${action.name} inputSchema must be self-contained and must not use $ref`);
+    }
+    return schema;
+  }
+
   globalThis.__beaterRouteMeta = async (specifier) => {
     const mod = await import(specifier);
     const meta = mod.agent;
@@ -494,10 +538,7 @@
             name: action.name,
             description: typeof action.description === "string" ? action.description : null,
             method: typeof action.method === "string" ? action.method.toUpperCase() : "POST",
-            inputSchema:
-              action.inputSchema && typeof action.inputSchema === "object"
-                ? action.inputSchema
-                : { type: "object", properties: {} },
+            inputSchema: beaterActionInputSchema(action),
             sideEffect: typeof action.sideEffect === "string" ? action.sideEffect : "write",
             confirm: action.confirm === true,
             dryRun: action.dryRun === true,

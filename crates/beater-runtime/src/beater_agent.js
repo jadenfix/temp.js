@@ -15,6 +15,51 @@ export function defineAgent(cfg) {
   return agent;
 }
 
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+const LEGACY_ACTION_ALIASES = {
+  input_schema: "inputSchema",
+  side_effect: "sideEffect",
+  dry_run: "dryRun",
+  idempotency_required: "idempotencyRequired",
+};
+
+function rejectLegacyActionAliases(object, context) {
+  for (const [legacy, canonical] of Object.entries(LEGACY_ACTION_ALIASES)) {
+    if (hasOwn(object, legacy)) {
+      throw new Error(`${context} uses canonical ${canonical}; ${legacy} is not accepted`);
+    }
+  }
+}
+
+function containsJsonSchemaRef(value) {
+  if (Array.isArray(value)) {
+    return value.some(containsJsonSchemaRef);
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  if (hasOwn(value, "$ref")) {
+    return true;
+  }
+  return Object.values(value).some(containsJsonSchemaRef);
+}
+
+function validateActionInputSchema(schema, actionName) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    throw new Error(`defineAction(${actionName}) inputSchema must be an object JSON Schema`);
+  }
+  if (schema.type !== "object") {
+    throw new Error(`defineAction(${actionName}) inputSchema.type must be "object"`);
+  }
+  if (containsJsonSchemaRef(schema)) {
+    throw new Error(`defineAction(${actionName}) inputSchema must be self-contained and must not use $ref`);
+  }
+  return schema;
+}
+
 export function defineAction(cfg) {
   if (!cfg || typeof cfg !== "object") {
     throw new Error("defineAction(config) requires a config object");
@@ -22,11 +67,15 @@ export function defineAction(cfg) {
   if (typeof cfg.name !== "string" || cfg.name.trim() === "") {
     throw new Error("defineAction requires config.name");
   }
+  rejectLegacyActionAliases(cfg, "defineAction");
+  if (!hasOwn(cfg, "inputSchema")) {
+    throw new Error(`defineAction(${cfg.name}) requires config.inputSchema`);
+  }
   return {
     name: cfg.name,
     description: cfg.description ?? `Call ${cfg.name}.`,
     method: cfg.method ?? "POST",
-    inputSchema: cfg.inputSchema ?? { type: "object", properties: {} },
+    inputSchema: validateActionInputSchema(cfg.inputSchema, cfg.name),
     sideEffect: cfg.sideEffect ?? "write",
     confirm: cfg.confirm === true,
     dryRun: cfg.dryRun === true,
