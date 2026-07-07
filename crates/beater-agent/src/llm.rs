@@ -16,8 +16,10 @@ use serde_json::{Value, json};
 use crate::anthropic::Anthropic;
 use crate::registry::AgentConfig;
 
+const DEFAULT_NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const SUPPORTED_PROVIDER_HINT: &str = "anthropic, openai-compatible, nvidia (OpenAI-compatible)";
 
 pub struct LlmSelection {
     pub provider: String,
@@ -37,6 +39,13 @@ impl LlmSelection {
             }
             None => config.provider.clone(),
         };
+        let provider = normalize_provider(&provider);
+        match canonical_provider(&provider) {
+            Some(_) => {}
+            None => bail!(
+                "unsupported LLM provider {provider:?}; supported providers: {SUPPORTED_PROVIDER_HINT}"
+            ),
+        };
         Ok(Self {
             provider,
             model: env_non_empty("BEATER_LLM_MODEL").unwrap_or_else(|| config.model.clone()),
@@ -51,14 +60,19 @@ pub enum LlmClient {
 
 impl LlmClient {
     pub fn from_provider(provider: &str) -> Result<Self> {
-        match normalize_provider(provider).as_str() {
-            "anthropic" => Ok(Self::Anthropic(Anthropic::from_env()?)),
-            "openai" | "openai-compatible" => {
-                Ok(Self::OpenAiCompatible(OpenAiCompatible::from_env()?))
-            }
-            other => bail!(
-                "unsupported LLM provider {other:?}; supported providers: anthropic, openai-compatible"
+        let normalized = normalize_provider(provider);
+        let canonical = match canonical_provider(&normalized) {
+            Some(provider) => provider,
+            None => bail!(
+                "unsupported LLM provider {provider:?}; supported providers: {SUPPORTED_PROVIDER_HINT}"
             ),
+        };
+        match canonical {
+            "anthropic" => Ok(Self::Anthropic(Anthropic::from_env()?)),
+            "openai-compatible" => Ok(Self::OpenAiCompatible(OpenAiCompatible::from_env(
+                &normalized,
+            )?)),
+            _ => unreachable!("canonical provider set is exhaustive"),
         }
     }
 
@@ -80,6 +94,14 @@ fn normalize_provider(provider: &str) -> String {
     provider.trim().to_ascii_lowercase().replace('_', "-")
 }
 
+fn canonical_provider(provider: &str) -> Option<&'static str> {
+    match normalize_provider(provider).as_str() {
+        "anthropic" => Some("anthropic"),
+        "openai" | "openai-compatible" | "nvidia" | "nvidia-nim" => Some("openai-compatible"),
+        _ => None,
+    }
+}
+
 fn env_non_empty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
@@ -91,26 +113,82 @@ pub struct OpenAiCompatible {
 }
 
 impl OpenAiCompatible {
-    fn from_env() -> Result<Self> {
-        let api_key = env_non_empty("BEATER_LLM_API_KEY")
-            .or_else(|| env_non_empty("BEATER_OPENAI_API_KEY"))
-            .or_else(|| env_non_empty("OPENAI_API_KEY"))
-            .context(
-                "BEATER_LLM_API_KEY, BEATER_OPENAI_API_KEY, or OPENAI_API_KEY is not set for provider openai-compatible",
-            )?;
-        let base_url = env_non_empty("BEATER_LLM_BASE_URL")
-            .or_else(|| env_non_empty("BEATER_OPENAI_BASE_URL"))
-            .or_else(|| env_non_empty("OPENAI_BASE_URL"))
-            .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
-        Self::new(api_key, &base_url, DEFAULT_REQUEST_TIMEOUT)
+    fn from_env(provider: &str) -> Result<Self> {
+        let is_nvidia = matches!(
+            normalize_provider(provider).as_str(),
+            "nvidia" | "nvidia-nim"
+        );
+        let api_key = if is_nvidia {
+            let generic = env_non_empty("BEATER_LLM_API_KEY");
+            let nvidia_specific =
+                env_non_empty("BEATER_NVIDIA_API_KEY").or_else(|| env_non_empty("NVIDIA_API_KEY"));
+            if generic.is_some() && nvidia_specific.is_some() {
+                bail!(
+                    "ambiguous NVIDIA key configuration: set either BEATER_LLM_API_KEY or BEATER_NVIDIA_API_KEY/NVIDIA_API_KEY, not both"
+                );
+            }
+            nvidia_specific.or(generic).context(
+                "BEATER_LLM_API_KEY, BEATER_NVIDIA_API_KEY, or NVIDIA_API_KEY is not set for provider nvidia",
+            )?
+        } else {
+            env_non_empty("BEATER_LLM_API_KEY")
+                .or_else(|| env_non_empty("BEATER_OPENAI_API_KEY"))
+                .or_else(|| env_non_empty("OPENAI_API_KEY"))
+                .context(
+                    "BEATER_LLM_API_KEY, BEATER_OPENAI_API_KEY, or OPENAI_API_KEY is not set for provider openai-compatible",
+                )?
+        };
+        let base_url = if is_nvidia {
+            let generic = env_non_empty("BEATER_LLM_BASE_URL");
+            let nvidia_specific = env_non_empty("BEATER_NVIDIA_BASE_URL")
+                .or_else(|| env_non_empty("NVIDIA_BASE_URL"));
+            if generic.is_some() && nvidia_specific.is_some() {
+                bail!(
+                    "ambiguous NVIDIA base URL configuration: set either BEATER_LLM_BASE_URL or BEATER_NVIDIA_BASE_URL/NVIDIA_BASE_URL, not both"
+                );
+            }
+            nvidia_specific
+                .or(generic)
+                .unwrap_or_else(|| DEFAULT_NVIDIA_BASE_URL.to_string())
+        } else {
+            env_non_empty("BEATER_LLM_BASE_URL")
+                .or_else(|| env_non_empty("BEATER_OPENAI_BASE_URL"))
+                .or_else(|| env_non_empty("OPENAI_BASE_URL"))
+                .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string())
+        };
+        let allow_custom = env_flag("BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL")
+            || (is_nvidia && env_flag("BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL"));
+        let allow_insecure_loopback = env_flag("BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK")
+            || (is_nvidia && env_flag("BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK"));
+        let trusted_https_hosts = if is_nvidia {
+            &["integrate.api.nvidia.com"][..]
+        } else {
+            &["api.openai.com"][..]
+        };
+        Self::new(
+            api_key,
+            &base_url,
+            DEFAULT_REQUEST_TIMEOUT,
+            allow_custom,
+            allow_insecure_loopback,
+            trusted_https_hosts,
+        )
     }
 
-    fn new(api_key: String, base_url: &str, request_timeout: Duration) -> Result<Self> {
+    fn new(
+        api_key: String,
+        base_url: &str,
+        request_timeout: Duration,
+        allow_custom: bool,
+        allow_insecure_loopback: bool,
+        trusted_https_hosts: &[&str],
+    ) -> Result<Self> {
         let chat_completions_url = chat_completions_url(base_url);
         validate_openai_base_url(
             &chat_completions_url,
-            env_flag("BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL"),
-            env_flag("BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK"),
+            allow_custom,
+            allow_insecure_loopback,
+            trusted_https_hosts,
         )?;
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
@@ -180,6 +258,7 @@ fn validate_openai_base_url(
     url: &str,
     allow_custom: bool,
     allow_insecure_loopback: bool,
+    trusted_https_hosts: &[&str],
 ) -> Result<()> {
     let url = reqwest::Url::parse(url).context("OpenAI-compatible base URL is invalid")?;
     if !url.username().is_empty() || url.password().is_some() {
@@ -188,7 +267,11 @@ fn validate_openai_base_url(
     let host = url
         .host_str()
         .context("OpenAI-compatible base URL must include a host")?;
-    if url.scheme() == "https" && host.eq_ignore_ascii_case("api.openai.com") {
+    if url.scheme() == "https"
+        && trusted_https_hosts
+            .iter()
+            .any(|trusted| host.eq_ignore_ascii_case(trusted))
+    {
         return Ok(());
     }
     if url.scheme() == "https" {
@@ -656,9 +739,9 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmSelection, OpenAiStreamAssembler, SseEvent, ToolNameMap, handle_openai_event,
-        openai_fallback_tool_id_prefix, openai_request_body, openai_tool_name,
-        validate_openai_base_url,
+        LlmSelection, OpenAiCompatible, OpenAiStreamAssembler, SseEvent, ToolNameMap,
+        canonical_provider, handle_openai_event, openai_fallback_tool_id_prefix,
+        openai_request_body, openai_tool_name, validate_openai_base_url,
     };
     use crate::registry::AgentConfig;
     use std::sync::Mutex;
@@ -737,6 +820,32 @@ mod tests {
         let selection = LlmSelection::from_config(&fixture_config()).unwrap();
 
         assert_eq!(selection.provider, "openai-compatible");
+        assert_eq!(selection.model, "provider-model");
+    }
+
+    #[test]
+    fn provider_aliases_canonicalize_to_protocol_adapters() {
+        assert_eq!(canonical_provider("anthropic"), Some("anthropic"));
+        assert_eq!(canonical_provider("openai"), Some("openai-compatible"));
+        assert_eq!(
+            canonical_provider("openai_compatible"),
+            Some("openai-compatible")
+        );
+        assert_eq!(canonical_provider("NVIDIA"), Some("openai-compatible"));
+        assert_eq!(canonical_provider("nvidia-nim"), Some("openai-compatible"));
+        assert_eq!(canonical_provider("messages"), None);
+    }
+
+    #[test]
+    fn generic_llm_env_accepts_nvidia_provider_alias() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _key = EnvGuard::set("BEATER_LLM_API_KEY", "fixture-key");
+        let _provider = EnvGuard::set("BEATER_LLM_PROVIDER", "nvidia");
+        let _model = EnvGuard::set("BEATER_LLM_MODEL", "provider-model");
+
+        let selection = LlmSelection::from_config(&fixture_config()).unwrap();
+
+        assert_eq!(selection.provider, "nvidia");
         assert_eq!(selection.model, "provider-model");
     }
 
@@ -948,12 +1057,25 @@ mod tests {
 
     #[test]
     fn openai_base_url_requires_secure_or_explicit_fixture_origin() {
-        validate_openai_base_url("https://api.openai.com/v1/chat/completions", false, false)
-            .unwrap();
+        validate_openai_base_url(
+            "https://api.openai.com/v1/chat/completions",
+            false,
+            false,
+            &["api.openai.com"],
+        )
+        .unwrap();
         validate_openai_base_url(
             "https://integrate.api.nvidia.com/v1/chat/completions",
             true,
             false,
+            &["api.openai.com"],
+        )
+        .unwrap();
+        validate_openai_base_url(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            false,
+            false,
+            &["integrate.api.nvidia.com"],
         )
         .unwrap();
         assert!(
@@ -961,12 +1083,109 @@ mod tests {
                 "https://integrate.api.nvidia.com/v1/chat/completions",
                 false,
                 false,
+                &["api.openai.com"],
             )
             .is_err()
         );
-        validate_openai_base_url("http://127.0.0.1:8080/v1/chat/completions", false, true).unwrap();
         assert!(
-            validate_openai_base_url("http://example.com/v1/chat/completions", true, true).is_err()
+            validate_openai_base_url(
+                "https://api.openai.com/v1/chat/completions",
+                false,
+                false,
+                &["integrate.api.nvidia.com"],
+            )
+            .is_err()
+        );
+        validate_openai_base_url(
+            "http://127.0.0.1:8080/v1/chat/completions",
+            false,
+            true,
+            &["api.openai.com"],
+        )
+        .unwrap();
+        assert!(
+            validate_openai_base_url(
+                "http://example.com/v1/chat/completions",
+                true,
+                true,
+                &["api.openai.com"],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nvidia_provider_uses_nvidia_key_alias_and_pinned_default_origin() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _generic_key = EnvGuard::unset("BEATER_LLM_API_KEY");
+        let _openai_key = EnvGuard::unset("BEATER_OPENAI_API_KEY");
+        let _openai_key_legacy = EnvGuard::unset("OPENAI_API_KEY");
+        let _nvidia_key = EnvGuard::set("BEATER_NVIDIA_API_KEY", "fixture-key");
+        let _generic_base = EnvGuard::unset("BEATER_LLM_BASE_URL");
+        let _nvidia_base = EnvGuard::unset("BEATER_NVIDIA_BASE_URL");
+        let _nvidia_base_legacy = EnvGuard::unset("NVIDIA_BASE_URL");
+        let _openai_base = EnvGuard::unset("BEATER_OPENAI_BASE_URL");
+        let _openai_base_legacy = EnvGuard::unset("OPENAI_BASE_URL");
+
+        let client = OpenAiCompatible::from_env("nvidia").unwrap();
+
+        assert_eq!(
+            client.chat_completions_url,
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn nvidia_provider_does_not_use_openai_key_aliases() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _generic_key = EnvGuard::unset("BEATER_LLM_API_KEY");
+        let _nvidia_key = EnvGuard::unset("BEATER_NVIDIA_API_KEY");
+        let _nvidia_key_legacy = EnvGuard::unset("NVIDIA_API_KEY");
+        let _openai_key = EnvGuard::set("OPENAI_API_KEY", "fixture-openai-key");
+
+        let error = match OpenAiCompatible::from_env("nvidia") {
+            Ok(_) => panic!("nvidia provider should not use OPENAI_API_KEY"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("provider nvidia"), "{error:#}");
+    }
+
+    #[test]
+    fn nvidia_provider_rejects_mixed_generic_and_specific_key_aliases() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _generic_key = EnvGuard::set("BEATER_LLM_API_KEY", "fixture-generic-key");
+        let _nvidia_key = EnvGuard::set("NVIDIA_API_KEY", "fixture-nvidia-key");
+
+        let error = match OpenAiCompatible::from_env("nvidia") {
+            Ok(_) => panic!("nvidia provider should reject ambiguous key aliases"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("ambiguous NVIDIA key"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn nvidia_provider_rejects_mixed_generic_and_specific_base_urls() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _generic_key = EnvGuard::unset("BEATER_LLM_API_KEY");
+        let _openai_key = EnvGuard::unset("BEATER_OPENAI_API_KEY");
+        let _openai_key_legacy = EnvGuard::unset("OPENAI_API_KEY");
+        let _nvidia_key = EnvGuard::set("NVIDIA_API_KEY", "fixture-nvidia-key");
+        let _generic_base = EnvGuard::set("BEATER_LLM_BASE_URL", "https://api.openai.com/v1");
+        let _nvidia_base = EnvGuard::set("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1");
+
+        let error = match OpenAiCompatible::from_env("nvidia") {
+            Ok(_) => panic!("nvidia provider should reject ambiguous base URL aliases"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("ambiguous NVIDIA base URL"),
+            "{error:#}"
         );
     }
 

@@ -46,12 +46,15 @@ Options:
 
 Configuration is read from environment variables:
   BEATER_APP, BEATER_BIN, M2_GATE_OUT
-  M2_GATE_PROVIDER or BEATER_LLM_PROVIDER
+  M2_GATE_PROVIDER or BEATER_LLM_PROVIDER (anthropic, openai-compatible, or nvidia)
   M2_GATE_MODEL or BEATER_LLM_MODEL
   BEATER_LLM_API_KEY, BEATER_LLM_BASE_URL
   ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
   BEATER_OPENAI_API_KEY or OPENAI_API_KEY
   BEATER_OPENAI_BASE_URL or OPENAI_BASE_URL
+  BEATER_NVIDIA_API_KEY or NVIDIA_API_KEY
+  BEATER_NVIDIA_BASE_URL or NVIDIA_BASE_URL
+  BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL, BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK
 EOF
 }
 
@@ -136,11 +139,14 @@ canonical_provider() {
     openai|openai-compatible)
       printf 'openai-compatible\n'
       ;;
+    nvidia|nvidia-nim)
+      printf 'nvidia\n'
+      ;;
     "")
       fail "LLM provider is empty"
       ;;
     *)
-      fail "unsupported LLM provider: $raw; use anthropic or openai-compatible"
+      fail "unsupported LLM provider: $raw; use anthropic, openai-compatible, or nvidia"
       ;;
   esac
 }
@@ -151,7 +157,9 @@ selected_provider() {
     if [[ -n "${BEATER_LLM_API_KEY:-}${BEATER_LLM_BASE_URL:-}" ]]; then
       fail "BEATER_LLM_PROVIDER is required when using BEATER_LLM_API_KEY or BEATER_LLM_BASE_URL"
     fi
-    if [[ -z "${ANTHROPIC_API_KEY:-}" && -n "${BEATER_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}" ]]; then
+    if [[ -z "${ANTHROPIC_API_KEY:-}" && -n "${BEATER_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-}}" ]]; then
+      requested="nvidia"
+    elif [[ -z "${ANTHROPIC_API_KEY:-}" && -n "${BEATER_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}" ]]; then
       requested="openai-compatible"
     else
       requested="anthropic"
@@ -253,6 +261,20 @@ validate_provider_base_url_policy() {
       fi
       fail "OpenAI-compatible base URL must use https, or http loopback with BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1"
       ;;
+    nvidia)
+      if [[ "$scheme" == "https" && "$host" == "integrate.api.nvidia.com" ]]; then
+        return 0
+      fi
+      if [[ "$scheme" == "https" ]]; then
+        env_flag BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL || env_flag BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL || fail "custom NVIDIA/OpenAI-compatible HTTPS origins require BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL=1 or BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1"
+        return 0
+      fi
+      if [[ "$scheme" == "http" ]] && is_loopback_host "$host"; then
+        env_flag BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK || env_flag BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK || fail "NVIDIA/OpenAI-compatible HTTP loopback requires BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK=1 or BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1"
+        return 0
+      fi
+      fail "NVIDIA/OpenAI-compatible base URL must use https, or http loopback with BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK=1"
+      ;;
   esac
 }
 
@@ -270,6 +292,17 @@ configure_provider() {
       [[ -n "${BEATER_LLM_API_KEY:-${BEATER_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}}" ]] || fail "BEATER_LLM_API_KEY, BEATER_OPENAI_API_KEY, or OPENAI_API_KEY is not set for provider openai-compatible"
       [[ -n "$LLM_MODEL" ]] || fail "BEATER_LLM_MODEL or M2_GATE_MODEL is required for provider openai-compatible so the Anthropic example model is not sent to a different provider"
       LLM_BASE_URL="${BEATER_LLM_BASE_URL:-${BEATER_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}}"
+      ;;
+    nvidia)
+      if [[ -n "${BEATER_LLM_API_KEY:-}" && -n "${BEATER_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-}}" ]]; then
+        fail "ambiguous NVIDIA key configuration: set either BEATER_LLM_API_KEY or BEATER_NVIDIA_API_KEY/NVIDIA_API_KEY, not both"
+      fi
+      if [[ -n "${BEATER_LLM_BASE_URL:-}" && -n "${BEATER_NVIDIA_BASE_URL:-${NVIDIA_BASE_URL:-}}" ]]; then
+        fail "ambiguous NVIDIA base URL configuration: set either BEATER_LLM_BASE_URL or BEATER_NVIDIA_BASE_URL/NVIDIA_BASE_URL, not both"
+      fi
+      [[ -n "${BEATER_LLM_API_KEY:-${BEATER_NVIDIA_API_KEY:-${NVIDIA_API_KEY:-}}}" ]] || fail "BEATER_LLM_API_KEY, BEATER_NVIDIA_API_KEY, or NVIDIA_API_KEY is not set for provider nvidia"
+      [[ -n "$LLM_MODEL" ]] || fail "BEATER_LLM_MODEL or M2_GATE_MODEL is required for provider nvidia so the Anthropic example model is not sent to an OpenAI-compatible provider"
+      LLM_BASE_URL="${BEATER_NVIDIA_BASE_URL:-${NVIDIA_BASE_URL:-${BEATER_LLM_BASE_URL:-https://integrate.api.nvidia.com/v1}}}"
       ;;
   esac
 
