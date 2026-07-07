@@ -119,6 +119,84 @@ export async function inspect() {
 }
 JS
 
+mkdir -p "$APP/node_modules/moduled"
+cat >"$APP/node_modules/moduled/package.json" <<'JSON'
+{
+  "name": "moduled",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+JSON
+
+cat >"$APP/node_modules/moduled/index.js" <<'JS'
+import moduleDefault, {
+  Module,
+  builtinModules,
+  createRequire,
+  isBuiltin,
+  syncBuiltinESMExports,
+} from "node:module";
+import bareModule from "module";
+
+function capture(callback) {
+  try {
+    callback();
+    return null;
+  } catch (error) {
+    return {
+      message: error.message,
+      name: error.name,
+    };
+  }
+}
+
+export function inspectModule() {
+  const require = createRequire(import.meta.url);
+  const absoluteRequire = createRequire("/tmp/beater/app.js");
+  const absoluteRequireError = capture(() => absoluteRequire("fs"));
+  const requireError = capture(() => require("fs"));
+  const resolveError = capture(() => require.resolve("fs"));
+  const invalidCreateRequire = capture(() => createRequire(new URL("https://example.test/app.js")));
+  const invalidMalformedFileCreateRequire = capture(() => createRequire("file://["));
+  const invalidStringCreateRequire = capture(() => createRequire("relative.js"));
+  const instance = new Module("virtual");
+  return {
+    bareDefaultMatches: bareModule.createRequire === createRequire,
+    builtinHasModule: builtinModules.includes("module"),
+    builtinHasStreamPromises: builtinModules.includes("stream/promises"),
+    builtinOmitsUnsupportedFs: !builtinModules.includes("fs"),
+    absoluteCacheFrozen: Object.isFrozen(absoluteRequire.cache),
+    absoluteRequireError,
+    cacheFrozen: Object.isFrozen(require.cache),
+    defaultStatics:
+      moduleDefault.createRequire === createRequire &&
+      moduleDefault.isBuiltin === isBuiltin &&
+      moduleDefault.builtinModules === builtinModules,
+    invalidCreateRequire,
+    invalidMalformedFileCreateRequire,
+    invalidStringCreateRequire,
+    isBuiltin: {
+      module: isBuiltin("module"),
+      nodeModule: isBuiltin("node:module"),
+      nodeStreamPromises: isBuiltin("node:stream/promises"),
+      fs: isBuiltin("fs"),
+    },
+    moduleInstance: {
+      id: instance.id,
+      loaded: instance.loaded,
+      children: instance.children,
+      paths: instance.paths,
+    },
+    moduleStatics: Module.createRequire === createRequire && Module.builtinModules === builtinModules,
+    requireError,
+    resolveError,
+    syncResult: syncBuiltinESMExports(),
+  };
+}
+JS
+
 mkdir -p "$APP/node_modules/evented"
 cat >"$APP/node_modules/evented/package.json" <<'JSON'
 {
@@ -1427,6 +1505,18 @@ export async function GET() {
 }
 TS
 
+cat >"$APP/app/routes/api/moduled.ts" <<'TS'
+import { inspectModule } from "moduled";
+
+export function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(inspectModule()),
+  };
+}
+TS
+
 mkdir -p "$(dirname "$LOG")"
 (
   unset ANTHROPIC_API_KEY
@@ -1974,6 +2064,63 @@ if process_payload != expected_process:
     sys.exit(f"unexpected /api/processed payload: {process_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("GET", "/api/moduled")
+response = conn.getresponse()
+body = response.read().decode("utf-8")
+conn.close()
+if response.status != 200:
+    sys.exit(f"expected 200 from /api/moduled, got {response.status}: {body}")
+module_payload = json.loads(body)
+expected_module = {
+    "bareDefaultMatches": True,
+    "builtinHasModule": True,
+    "builtinHasStreamPromises": True,
+    "builtinOmitsUnsupportedFs": True,
+    "absoluteCacheFrozen": True,
+    "absoluteRequireError": {
+        "message": "CommonJS require is not supported in beater.js isolates",
+        "name": "Error",
+    },
+    "cacheFrozen": True,
+    "defaultStatics": True,
+    "invalidCreateRequire": {
+        "message": "module.createRequire requires a file URL or absolute path string",
+        "name": "TypeError",
+    },
+    "invalidMalformedFileCreateRequire": {
+        "message": "module.createRequire requires a file URL or absolute path string",
+        "name": "TypeError",
+    },
+    "invalidStringCreateRequire": {
+        "message": "module.createRequire requires a file URL or absolute path string",
+        "name": "TypeError",
+    },
+    "isBuiltin": {
+        "module": True,
+        "nodeModule": True,
+        "nodeStreamPromises": True,
+        "fs": False,
+    },
+    "moduleInstance": {
+        "id": "virtual",
+        "loaded": False,
+        "children": [],
+        "paths": [],
+    },
+    "moduleStatics": True,
+    "requireError": {
+        "message": "CommonJS require is not supported in beater.js isolates",
+        "name": "Error",
+    },
+    "resolveError": {
+        "message": "CommonJS require is not supported in beater.js isolates",
+        "name": "Error",
+    },
+}
+if module_payload != expected_module:
+    sys.exit(f"unexpected /api/moduled payload: {module_payload!r}")
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/cjs-require")
 response = conn.getresponse()
 body = response.read().decode("utf-8")
@@ -1997,6 +2144,7 @@ print(
     f"url file {url_payload['filePath']}; "
     f"buffer base64 {buffer_payload['base64']}; "
     f"process env {process_payload['nodeEnv']}; "
+    f"module builtin {module_payload['isBuiltin']['module']}; "
     "require failed closed"
 )
 PY

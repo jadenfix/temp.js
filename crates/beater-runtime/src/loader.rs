@@ -56,6 +56,7 @@ fn vendor_specifier(specifier: &str) -> Option<&'static str> {
         "node:assert" | "assert" => Some("beater:vendor/node-assert"),
         "node:buffer" | "buffer" => Some("beater:vendor/node-buffer"),
         "node:events" | "events" => Some("beater:vendor/node-events"),
+        "node:module" | "module" => Some("beater:vendor/node-module"),
         "node:os" | "os" => Some("beater:vendor/node-os"),
         "node:path" | "path" => Some("beater:vendor/node-path"),
         "node:process" | "process" => Some("beater:vendor/node-process"),
@@ -87,6 +88,7 @@ fn vendor_source(specifier: &str) -> Option<&'static str> {
         }
         "beater:vendor/node-buffer" => Some(include_str!("../assets/vendor/node-buffer.mjs")),
         "beater:vendor/node-events" => Some(include_str!("../assets/vendor/node-events.mjs")),
+        "beater:vendor/node-module" => Some(include_str!("../assets/vendor/node-module.mjs")),
         "beater:vendor/node-os" => Some(include_str!("../assets/vendor/node-os.mjs")),
         "beater:vendor/node-path" => Some(include_str!("../assets/vendor/node-path.mjs")),
         "beater:vendor/node-process" => Some(include_str!("../assets/vendor/node-process.mjs")),
@@ -1496,6 +1498,23 @@ mod tests {
     }
 
     #[test]
+    fn node_module_vendor_specifiers_resolve_to_checked_in_shim() {
+        assert_eq!(
+            super::vendor_specifier("node:module"),
+            Some("beater:vendor/node-module")
+        );
+        assert_eq!(
+            super::vendor_specifier("module"),
+            Some("beater:vendor/node-module")
+        );
+
+        let source = super::vendor_source("beater:vendor/node-module").unwrap();
+        assert!(source.contains("Minimal node:module shim"));
+        assert!(source.contains("export function createRequire"));
+        assert!(source.contains("CommonJS require is not supported"));
+    }
+
+    #[test]
     fn node_os_vendor_specifiers_resolve_to_checked_in_shim() {
         assert_eq!(
             super::vendor_specifier("node:os"),
@@ -1728,6 +1747,16 @@ mod tests {
         assert!(source.contains("EventEmitter"));
         assert!(source.contains("listenerCount"));
         assert!(source.contains("default EventEmitter"));
+    }
+
+    #[test]
+    fn node_module_vendor_module_loads_from_beater_scheme() {
+        let specifier = ModuleSpecifier::parse("beater:vendor/node-module").unwrap();
+        let source = source_text(load_sync(&specifier).unwrap());
+
+        assert!(source.contains("builtinModules"));
+        assert!(source.contains("createRequire"));
+        assert!(source.contains("default module"));
     }
 
     #[test]
