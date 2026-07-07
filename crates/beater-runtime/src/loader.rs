@@ -52,6 +52,8 @@ fn vendor_specifier(specifier: &str) -> Option<&'static str> {
         "react" => Some("beater:vendor/react"),
         "react/jsx-runtime" | "react/jsx-dev-runtime" => Some("beater:vendor/react-jsx-runtime"),
         "react-dom/server" => Some("beater:vendor/react-dom-server"),
+        "node:assert/strict" | "assert/strict" => Some("beater:vendor/node-assert-strict"),
+        "node:assert" | "assert" => Some("beater:vendor/node-assert"),
         "node:buffer" | "buffer" => Some("beater:vendor/node-buffer"),
         "node:events" | "events" => Some("beater:vendor/node-events"),
         "node:os" | "os" => Some("beater:vendor/node-os"),
@@ -73,6 +75,10 @@ fn vendor_source(specifier: &str) -> Option<&'static str> {
         }
         "beater:vendor/react-dom-server" => {
             Some(include_str!("../assets/vendor/react-dom-server.mjs"))
+        }
+        "beater:vendor/node-assert" => Some(include_str!("../assets/vendor/node-assert.mjs")),
+        "beater:vendor/node-assert-strict" => {
+            Some(include_str!("../assets/vendor/node-assert-strict.mjs"))
         }
         "beater:vendor/node-buffer" => Some(include_str!("../assets/vendor/node-buffer.mjs")),
         "beater:vendor/node-events" => Some(include_str!("../assets/vendor/node-events.mjs")),
@@ -1395,6 +1401,35 @@ mod tests {
     }
 
     #[test]
+    fn node_assert_vendor_specifiers_resolve_to_checked_in_shim() {
+        assert_eq!(
+            super::vendor_specifier("node:assert"),
+            Some("beater:vendor/node-assert")
+        );
+        assert_eq!(
+            super::vendor_specifier("assert"),
+            Some("beater:vendor/node-assert")
+        );
+        assert_eq!(
+            super::vendor_specifier("node:assert/strict"),
+            Some("beater:vendor/node-assert-strict")
+        );
+        assert_eq!(
+            super::vendor_specifier("assert/strict"),
+            Some("beater:vendor/node-assert-strict")
+        );
+
+        let source = super::vendor_source("beater:vendor/node-assert").unwrap();
+        assert!(source.contains("deterministic assert shim"));
+        assert!(source.contains("export class AssertionError"));
+        assert!(source.contains("export async function rejects"));
+
+        let strict_source = super::vendor_source("beater:vendor/node-assert-strict").unwrap();
+        assert!(strict_source.contains("Strict assertion entrypoint"));
+        assert!(strict_source.contains("export const equal = strictEqual"));
+    }
+
+    #[test]
     fn node_process_vendor_specifiers_resolve_to_checked_in_shim() {
         assert_eq!(
             super::vendor_specifier("node:process"),
@@ -1511,6 +1546,22 @@ mod tests {
 
         assert!(source.contains("Buffer.from"));
         assert!(source.contains("Buffer.concat"));
+    }
+
+    #[test]
+    fn node_assert_vendor_module_loads_from_beater_scheme() {
+        let specifier = ModuleSpecifier::parse("beater:vendor/node-assert").unwrap();
+        let source = source_text(load_sync(&specifier).unwrap());
+
+        assert!(source.contains("AssertionError"));
+        assert!(source.contains("default assert"));
+        assert!(source.contains("strictEqual"));
+
+        let strict_specifier = ModuleSpecifier::parse("beater:vendor/node-assert-strict").unwrap();
+        let strict_source = source_text(load_sync(&strict_specifier).unwrap());
+
+        assert!(strict_source.contains("default strictAssert"));
+        assert!(strict_source.contains("notEqual = notStrictEqual"));
     }
 
     #[test]
