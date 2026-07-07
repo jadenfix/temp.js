@@ -39,7 +39,7 @@ python3.11 -m venv my-app/.venv                          # optional: enables thi
 BEATER_MCP_TOKEN=dev-token ./target/debug/beater dev my-app --host 0.0.0.0 --base-url https://hello.example.com
 export BEATER_LLM_PROVIDER=anthropic                    # default live agent provider
 export BEATER_LLM_API_KEY=...                           # provider key; never commit it
-# Or set BEATER_LLM_PROVIDER=openai-compatible, BEATER_LLM_MODEL, BEATER_LLM_BASE_URL, and BEATER_LLM_API_KEY for NVIDIA-style endpoints.
+# Or set BEATER_LLM_PROVIDER=nvidia, BEATER_LLM_MODEL, and BEATER_NVIDIA_API_KEY for NVIDIA's OpenAI-compatible endpoint.
 ./target/debug/beater agent run --app my-app support "summarize 3,1,4,1,5"
 ./target/debug/beater agent resume --app my-app <run_id>
 ./target/debug/beater doctor my-app                      # verify Python/venv/V8 wiring
@@ -125,30 +125,35 @@ export BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1
 export BEATER_LLM_API_KEY=...
 ```
 
-`BEATER_LLM_PROVIDER` and `BEATER_LLM_MODEL` override `agent.ts` for smoke tests and deployments. `BEATER_LLM_API_KEY` and `BEATER_LLM_BASE_URL` are read by the selected provider adapter, and `beater agent run` refuses them unless `BEATER_LLM_PROVIDER` is explicit. Provider-specific aliases remain supported: Anthropic also accepts `ANTHROPIC_API_KEY` plus optional `ANTHROPIC_BASE_URL`; OpenAI-compatible chat-completions providers also accept `BEATER_OPENAI_API_KEY` or `OPENAI_API_KEY` plus `BEATER_OPENAI_BASE_URL` or `OPENAI_BASE_URL`. Adapter-specific safety flags still apply: custom Anthropic HTTPS origins require `BEATER_ANTHROPIC_ALLOW_CUSTOM_BASE_URL=1`; custom OpenAI-compatible HTTPS origins require `BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1`; insecure HTTP is accepted only for explicit loopback fixtures.
+NVIDIA also has a first-class alias for the same OpenAI-compatible Chat Completions adapter:
+
+```sh
+export BEATER_LLM_PROVIDER=nvidia
+export BEATER_LLM_MODEL=z-ai/glm-5.2
+export BEATER_NVIDIA_API_KEY=...
+# BEATER_NVIDIA_BASE_URL is optional; default is https://integrate.api.nvidia.com/v1
+```
+
+`BEATER_LLM_PROVIDER` and `BEATER_LLM_MODEL` override `agent.ts` for smoke tests and deployments. `BEATER_LLM_API_KEY` and `BEATER_LLM_BASE_URL` are read by the selected provider adapter, and `beater agent run` refuses them unless `BEATER_LLM_PROVIDER` is explicit. Provider-specific aliases remain supported: Anthropic also accepts `ANTHROPIC_API_KEY` plus optional `ANTHROPIC_BASE_URL`; OpenAI-compatible chat-completions providers also accept `BEATER_OPENAI_API_KEY` or `OPENAI_API_KEY` plus `BEATER_OPENAI_BASE_URL` or `OPENAI_BASE_URL`; NVIDIA also accepts `BEATER_NVIDIA_API_KEY` or `NVIDIA_API_KEY` plus optional `BEATER_NVIDIA_BASE_URL` or `NVIDIA_BASE_URL`. For NVIDIA, mixed generic and NVIDIA-specific key/base-url variables are rejected as ambiguous instead of silently choosing one. Adapter-specific safety flags still apply: custom Anthropic HTTPS origins require `BEATER_ANTHROPIC_ALLOW_CUSTOM_BASE_URL=1`; custom OpenAI-compatible HTTPS origins require `BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1`; custom NVIDIA HTTPS origins require `BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL=1` or `BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1`; insecure HTTP is accepted only for explicit loopback fixtures.
 
 Run `scripts/llm-provider-conformance-gate.cjs` after `cargo build --bin beater` for the no-secret provider proof. It drives the real `beater agent run` loop through loopback Anthropic and OpenAI-compatible SSE mocks, verifies Python tool execution, checks OpenAI tool-name sanitization/fallback IDs, and asserts both providers write the same canonical journal shape.
 
 Run `scripts/llm-live-provider-smoke.cjs` only when you intentionally want to spend real provider credits. It reads keys from the environment, requires an explicit model, drives one live `beater agent run` through a Python tool, verifies the SQLite journal, redacts known key patterns from saved logs, and writes evidence under `examples/hello/.beater/live-provider-smoke/<timestamp-pid>/`.
 
 ```sh
-export BEATER_LIVE_PROVIDER=openai-compatible
+export BEATER_LIVE_PROVIDER=nvidia
 export BEATER_LLM_MODEL=z-ai/glm-5.2
-export BEATER_LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-export BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1
-export BEATER_LLM_API_KEY=...
+export BEATER_NVIDIA_API_KEY=...
 node scripts/llm-live-provider-smoke.cjs --dry-run
 node scripts/llm-live-provider-smoke.cjs
 ```
 
-The M2 crash/resume live gate uses the same provider abstraction. It defaults to Anthropic for compatibility, but `BEATER_LLM_PROVIDER=openai-compatible` plus an explicit `BEATER_LLM_MODEL` lets NVIDIA-style endpoints satisfy A3-A5 without sending OpenAI-compatible keys to Anthropic Messages:
+The M2 crash/resume live gate uses the same provider abstraction. It defaults to Anthropic for compatibility, but `BEATER_LLM_PROVIDER=nvidia` or `BEATER_LLM_PROVIDER=openai-compatible` plus an explicit `BEATER_LLM_MODEL` lets Chat Completions endpoints satisfy A3-A5 without sending OpenAI-compatible keys to Anthropic Messages:
 
 ```sh
-export BEATER_LLM_PROVIDER=openai-compatible
+export BEATER_LLM_PROVIDER=nvidia
 export BEATER_LLM_MODEL=z-ai/glm-5.2
-export BEATER_LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-export BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1
-export BEATER_LLM_API_KEY=...
+export BEATER_NVIDIA_API_KEY=...
 scripts/m2-live-gate.sh --dry-run
 scripts/m2-live-gate.sh
 ```

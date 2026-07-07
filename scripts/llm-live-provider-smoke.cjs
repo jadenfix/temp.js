@@ -16,23 +16,27 @@ const macPythonFrameworkPath =
   "/Library/Developer/CommandLineTools/Library/Frameworks";
 
 function usage() {
-  return `Usage: scripts/llm-live-provider-smoke.cjs [--provider anthropic|openai-compatible|all-configured] [--dry-run] [--out DIR]
+  return `Usage: scripts/llm-live-provider-smoke.cjs [--provider anthropic|openai-compatible|nvidia|all-configured] [--dry-run] [--out DIR]
 
 Runs one real provider smoke test through beater agent run, a Python tool, and
 the SQLite journal. Secrets are read only from environment variables and are
 redacted from saved logs.
 
 Environment:
-  BEATER_LIVE_PROVIDER=anthropic|openai-compatible|all-configured
+  BEATER_LIVE_PROVIDER=anthropic|openai-compatible|nvidia|all-configured
   BEATER_LLM_MODEL=<model>                         shared model override
   BEATER_LLM_API_KEY=...                           shared provider key
   BEATER_LLM_BASE_URL=https://...                  shared provider base URL
   BEATER_LIVE_ANTHROPIC_MODEL=<model>              Anthropic-specific model
   BEATER_LIVE_OPENAI_MODEL=<model>                 OpenAI-compatible model
+  BEATER_LIVE_NVIDIA_MODEL=<model>                 NVIDIA OpenAI-compatible model
   ANTHROPIC_API_KEY=...                            Anthropic live key
   BEATER_OPENAI_API_KEY=... or OPENAI_API_KEY=...  OpenAI-compatible live key
   BEATER_OPENAI_BASE_URL=https://.../v1            e.g. NVIDIA endpoint
+  BEATER_NVIDIA_API_KEY=... or NVIDIA_API_KEY=...  NVIDIA live key
+  BEATER_NVIDIA_BASE_URL=https://.../v1            NVIDIA-compatible base URL
   BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1            required for custom HTTPS origins
+  BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL=1            optional NVIDIA-specific custom-origin flag
 `;
 }
 
@@ -65,7 +69,9 @@ function parseArgs(argv) {
 
 function canonicalProvider(provider) {
   const value = String(provider ?? "").trim().toLowerCase().replace(/_/g, "-");
-  return value === "openai" ? "openai-compatible" : value;
+  if (value === "openai") return "openai-compatible";
+  if (value === "nvidia-nim") return "nvidia";
+  return value;
 }
 
 function envFlag(name) {
@@ -80,10 +86,23 @@ function modelFor(provider) {
   if (provider === "openai-compatible") {
     return process.env.BEATER_LIVE_OPENAI_MODEL ?? process.env.BEATER_LLM_MODEL;
   }
+  if (provider === "nvidia") {
+    return process.env.BEATER_LIVE_NVIDIA_MODEL ?? process.env.BEATER_LLM_MODEL;
+  }
   return process.env.BEATER_LLM_MODEL;
 }
 
 function keyFor(provider) {
+  if (provider === "nvidia") {
+    const generic = process.env.BEATER_LLM_API_KEY;
+    const nvidiaSpecific = process.env.BEATER_NVIDIA_API_KEY ?? process.env.NVIDIA_API_KEY;
+    if (generic && nvidiaSpecific) {
+      throw new Error(
+        "ambiguous NVIDIA key configuration: set either BEATER_LLM_API_KEY or BEATER_NVIDIA_API_KEY/NVIDIA_API_KEY, not both",
+      );
+    }
+    return nvidiaSpecific ?? generic;
+  }
   if (process.env.BEATER_LLM_API_KEY) return process.env.BEATER_LLM_API_KEY;
   if (provider === "anthropic") return process.env.ANTHROPIC_API_KEY;
   if (provider === "openai-compatible") {
@@ -93,6 +112,16 @@ function keyFor(provider) {
 }
 
 function baseUrlFor(provider) {
+  if (provider === "nvidia") {
+    const generic = process.env.BEATER_LLM_BASE_URL;
+    const nvidiaSpecific = process.env.BEATER_NVIDIA_BASE_URL ?? process.env.NVIDIA_BASE_URL;
+    if (generic && nvidiaSpecific) {
+      throw new Error(
+        "ambiguous NVIDIA base URL configuration: set either BEATER_LLM_BASE_URL or BEATER_NVIDIA_BASE_URL/NVIDIA_BASE_URL, not both",
+      );
+    }
+    return nvidiaSpecific ?? generic ?? "https://integrate.api.nvidia.com/v1";
+  }
   if (process.env.BEATER_LLM_BASE_URL) return process.env.BEATER_LLM_BASE_URL;
   if (provider === "anthropic") {
     return process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com";
@@ -164,26 +193,31 @@ function validateBaseUrl(provider, raw) {
       );
     }
   }
-  if (provider === "openai-compatible") {
+  if (provider === "openai-compatible" || provider === "nvidia") {
+    const defaultHost = provider === "nvidia" ? "integrate.api.nvidia.com" : "api.openai.com";
     if (parsed.protocol === "http:" && !isLoopback(host)) {
-      throw new Error("OpenAI-compatible live smoke refuses non-loopback HTTP base URLs");
+      throw new Error(`${provider} live smoke refuses non-loopback HTTP base URLs`);
     }
     if (
       parsed.protocol === "http:" &&
       isLoopback(host) &&
-      !envFlag("BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK")
+      !envFlag("BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK") &&
+      !(provider === "nvidia" && envFlag("BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK"))
     ) {
       throw new Error(
-        "OpenAI-compatible HTTP loopback requires BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1",
+        `${provider} HTTP loopback requires BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1` +
+          (provider === "nvidia" ? " or BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK=1" : ""),
       );
     }
     if (
       parsed.protocol === "https:" &&
-      host !== "api.openai.com" &&
-      !envFlag("BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL")
+      host !== defaultHost &&
+      !envFlag("BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL") &&
+      !(provider === "nvidia" && envFlag("BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL"))
     ) {
       throw new Error(
-        "custom OpenAI-compatible HTTPS origins require BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1",
+        `custom ${provider} HTTPS origins require BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL=1` +
+          (provider === "nvidia" ? " or BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL=1" : ""),
       );
     }
   }
@@ -191,8 +225,8 @@ function validateBaseUrl(provider, raw) {
 
 function providerConfig(provider, explicit) {
   const canonical = canonicalProvider(provider);
-  if (!["anthropic", "openai-compatible"].includes(canonical)) {
-    throw new Error(`unsupported live provider ${provider}; use anthropic or openai-compatible`);
+  if (!["anthropic", "openai-compatible", "nvidia"].includes(canonical)) {
+    throw new Error(`unsupported live provider ${provider}; use anthropic, openai-compatible, or nvidia`);
   }
   const model = modelFor(canonical);
   const key = keyFor(canonical);
@@ -202,7 +236,9 @@ function providerConfig(provider, explicit) {
     const keyName =
       canonical === "anthropic"
         ? "BEATER_LLM_API_KEY or ANTHROPIC_API_KEY"
-        : "BEATER_LLM_API_KEY, BEATER_OPENAI_API_KEY, or OPENAI_API_KEY";
+        : canonical === "nvidia"
+          ? "BEATER_LLM_API_KEY, BEATER_NVIDIA_API_KEY, or NVIDIA_API_KEY"
+          : "BEATER_LLM_API_KEY, BEATER_OPENAI_API_KEY, or OPENAI_API_KEY";
     throw new Error(`${keyName} is required for ${canonical} live smoke`);
   }
   if (!model) {
@@ -241,7 +277,7 @@ function selectedProviders(requested) {
     );
   }
   if (values.length === 0 || values.includes("all-configured")) {
-    const configured = ["anthropic", "openai-compatible"]
+    const configured = ["anthropic", "openai-compatible", "nvidia"]
       .map((provider) => providerConfig(provider, false))
       .filter(Boolean);
     if (configured.length === 0) {
@@ -260,6 +296,8 @@ function secretValues() {
     process.env.ANTHROPIC_API_KEY,
     process.env.BEATER_OPENAI_API_KEY,
     process.env.OPENAI_API_KEY,
+    process.env.BEATER_NVIDIA_API_KEY,
+    process.env.NVIDIA_API_KEY,
   ].filter((value) => value && value.length >= 6);
 }
 
@@ -383,6 +421,37 @@ function gateEnv(config) {
         process.env.BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK;
     }
   }
+  if (config.provider === "nvidia") {
+    if (!process.env.BEATER_LLM_API_KEY) {
+      if (process.env.BEATER_NVIDIA_API_KEY) {
+        env.BEATER_NVIDIA_API_KEY = process.env.BEATER_NVIDIA_API_KEY;
+      } else if (process.env.NVIDIA_API_KEY) {
+        env.NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+      }
+    }
+    if (!process.env.BEATER_LLM_BASE_URL) {
+      if (process.env.BEATER_NVIDIA_BASE_URL) {
+        env.BEATER_NVIDIA_BASE_URL = process.env.BEATER_NVIDIA_BASE_URL;
+      }
+      if (process.env.NVIDIA_BASE_URL) env.NVIDIA_BASE_URL = process.env.NVIDIA_BASE_URL;
+    }
+    if (process.env.BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL) {
+      env.BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL =
+        process.env.BEATER_NVIDIA_ALLOW_CUSTOM_BASE_URL;
+    }
+    if (process.env.BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK) {
+      env.BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK =
+        process.env.BEATER_NVIDIA_ALLOW_INSECURE_LOOPBACK;
+    }
+    if (process.env.BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL) {
+      env.BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL =
+        process.env.BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL;
+    }
+    if (process.env.BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK) {
+      env.BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK =
+        process.env.BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK;
+    }
+  }
   return env;
 }
 
@@ -401,8 +470,8 @@ port = 3000
 
 export default defineAgent({
   name: "support",
-  provider: "${config.provider}",
-  model: "${config.model}",
+  provider: ${JSON.stringify(config.provider)},
+  model: ${JSON.stringify(config.model)},
   system: "You are running a beater.js live provider smoke test. You must call summarize_numbers exactly once with the numbers [3,1,4,1,5] before answering. After the tool result, answer briefly.",
   tools: [
     pyTool("summarize_numbers", "./tools/summarize_numbers.py", {
