@@ -119,6 +119,54 @@ export async function inspect() {
 }
 JS
 
+mkdir -p "$APP/node_modules/pathed"
+cat >"$APP/node_modules/pathed/package.json" <<'JSON'
+{
+  "name": "pathed",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}
+JSON
+
+cat >"$APP/node_modules/pathed/index.js" <<'JS'
+import path, {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import { sep as bareSep } from "path";
+
+export function inspectPath() {
+  return {
+    basename: basename("/tmp/beater/app.ts"),
+    dirname: dirname("/tmp/beater/app.ts"),
+    extname: extname("index.client.tsx"),
+    joined: join("/tmp", "beater", "..", "app", "route.ts"),
+    normalized: normalize("/tmp//beater/./routes/../index.ts"),
+    relative: relative("/tmp/beater/app", "/tmp/beater/app/routes/index.ts"),
+    resolved: resolve("app", "routes", "../index.ts"),
+    parsedFile: path.parse("index.ts"),
+    parsedParent: path.parse("../index.ts"),
+    formatted: path.format({ dir: "agents", name: "support", ext: ".ts" }),
+    dotDotExt: extname(".."),
+    absolute: isAbsolute("/tmp"),
+    relativeIsAbsolute: isAbsolute("tmp"),
+    defaultJoin: path.join("agents", "support"),
+    posixSep: path.posix.sep,
+    bareSep,
+    sep,
+  };
+}
+JS
+
 cat >"$APP/app/routes/api/zod.ts" <<'TS'
 import { z } from "zod";
 
@@ -157,6 +205,18 @@ export function GET() {
     status: 200,
     headers: { "content-type": "text/plain; charset=utf-8" },
     body: String(blocked),
+  };
+}
+TS
+
+cat >"$APP/app/routes/api/pathed.ts" <<'TS'
+import { inspectPath } from "pathed";
+
+export function GET() {
+  return {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(inspectPath()),
   };
 }
 TS
@@ -248,6 +308,48 @@ if cjs_payload != {"label": "legacy-cjs", "doubled": 42}:
     sys.exit(f"unexpected /api/cjs payload: {cjs_payload!r}")
 
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("GET", "/api/pathed")
+response = conn.getresponse()
+body = response.read().decode("utf-8")
+conn.close()
+if response.status != 200:
+    sys.exit(f"expected 200 from /api/pathed, got {response.status}: {body}")
+path_payload = json.loads(body)
+expected_path = {
+    "basename": "app.ts",
+    "dirname": "/tmp/beater",
+    "extname": ".tsx",
+    "joined": "/tmp/app/route.ts",
+    "normalized": "/tmp/beater/index.ts",
+    "relative": "routes/index.ts",
+    "resolved": "/app/index.ts",
+    "parsedFile": {
+        "root": "",
+        "dir": "",
+        "base": "index.ts",
+        "ext": ".ts",
+        "name": "index",
+    },
+    "parsedParent": {
+        "root": "",
+        "dir": "..",
+        "base": "index.ts",
+        "ext": ".ts",
+        "name": "index",
+    },
+    "formatted": "agents/support.ts",
+    "dotDotExt": "",
+    "absolute": True,
+    "relativeIsAbsolute": False,
+    "defaultJoin": "agents/support",
+    "posixSep": "/",
+    "bareSep": "/",
+    "sep": "/",
+}
+if path_payload != expected_path:
+    sys.exit(f"unexpected /api/pathed payload: {path_payload!r}")
+
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
 conn.request("GET", "/api/buffered")
 response = conn.getresponse()
 body = response.read().decode("utf-8")
@@ -298,6 +400,7 @@ print(
     "npm compat passed: "
     f"zod import returned {zod_payload['value']}; "
     f"cjs doubled {cjs_payload['doubled']}; "
+    f"path resolved {path_payload['resolved']}; "
     f"buffer base64 {buffer_payload['base64']}; "
     f"process env {process_payload['nodeEnv']}; "
     "require failed closed"

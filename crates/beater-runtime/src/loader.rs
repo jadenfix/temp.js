@@ -53,6 +53,7 @@ fn vendor_specifier(specifier: &str) -> Option<&'static str> {
         "react/jsx-runtime" | "react/jsx-dev-runtime" => Some("beater:vendor/react-jsx-runtime"),
         "react-dom/server" => Some("beater:vendor/react-dom-server"),
         "node:buffer" | "buffer" => Some("beater:vendor/node-buffer"),
+        "node:path" | "path" => Some("beater:vendor/node-path"),
         "node:process" | "process" => Some("beater:vendor/node-process"),
         _ => None,
     }
@@ -69,6 +70,7 @@ fn vendor_source(specifier: &str) -> Option<&'static str> {
             Some(include_str!("../assets/vendor/react-dom-server.mjs"))
         }
         "beater:vendor/node-buffer" => Some(include_str!("../assets/vendor/node-buffer.mjs")),
+        "beater:vendor/node-path" => Some(include_str!("../assets/vendor/node-path.mjs")),
         "beater:vendor/node-process" => Some(include_str!("../assets/vendor/node-process.mjs")),
         _ => None,
     }
@@ -1397,6 +1399,23 @@ mod tests {
     }
 
     #[test]
+    fn node_path_vendor_specifiers_resolve_to_checked_in_shim() {
+        assert_eq!(
+            super::vendor_specifier("node:path"),
+            Some("beater:vendor/node-path")
+        );
+        assert_eq!(
+            super::vendor_specifier("path"),
+            Some("beater:vendor/node-path")
+        );
+
+        let source = super::vendor_source("beater:vendor/node-path").unwrap();
+        assert!(source.contains("virtual POSIX path shim"));
+        assert!(source.contains("export function join"));
+        assert!(source.contains("export function resolve"));
+    }
+
+    #[test]
     fn node_buffer_vendor_module_loads_from_beater_scheme() {
         let specifier = ModuleSpecifier::parse("beater:vendor/node-buffer").unwrap();
         let source = source_text(load_sync(&specifier).unwrap());
@@ -1412,6 +1431,16 @@ mod tests {
 
         assert!(source.contains("process.nextTick"));
         assert!(source.contains("globalThis.process"));
+    }
+
+    #[test]
+    fn node_path_vendor_module_loads_from_beater_scheme() {
+        let specifier = ModuleSpecifier::parse("beater:vendor/node-path").unwrap();
+        let source = source_text(load_sync(&specifier).unwrap());
+
+        assert!(source.contains("sep = \"/\""));
+        assert!(source.contains("default path"));
+        assert!(source.contains("posix"));
     }
 
     #[test]
