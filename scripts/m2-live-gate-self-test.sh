@@ -80,6 +80,14 @@ grep -q "OpenAI-compatible base URL must use https" "$TMP/evil-loopback.err" || 
   fail "fake loopback hostname failure did not explain the runtime policy"
 }
 
+if bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER M2_GATE_MODEL BEATER_OPENAI_ALLOW_CUSTOM_BASE_URL; export BEATER_LLM_PROVIDER=openai-compatible; export BEATER_LLM_MODEL=model-fixture; export BEATER_LLM_API_KEY=fixture-key; export BEATER_LLM_BASE_URL=http://127.0.0.08/v1; export BEATER_OPENAI_ALLOW_INSECURE_LOOPBACK=1; configure_provider' _ "$SCRIPT" >"$TMP/octal-loopback.out" 2>"$TMP/octal-loopback.err"; then
+  fail "configure_provider should reject invalid leading-zero IPv4 loopback-looking addresses"
+fi
+grep -q "OpenAI-compatible base URL must use https" "$TMP/octal-loopback.err" || {
+  cat "$TMP/octal-loopback.err" >&2
+  fail "invalid leading-zero IPv4 failure did not explain the runtime policy"
+}
+
 if bash -c 'set -euo pipefail; source "$1"; unset M2_GATE_PROVIDER BEATER_LLM_PROVIDER ANTHROPIC_API_KEY BEATER_OPENAI_API_KEY OPENAI_API_KEY; export BEATER_LLM_API_KEY=fixture-key; selected_provider' _ "$SCRIPT" >"$TMP/generic-without-provider.out" 2>"$TMP/generic-without-provider.err"; then
   fail "selected_provider should require BEATER_LLM_PROVIDER when generic key is used"
 fi

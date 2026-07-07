@@ -196,7 +196,7 @@ base_url_host() {
 
 is_loopback_host() {
   local host
-  local a b c d part
+  local a b c d part value
   host="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   if [[ "$host" == "localhost" || "$host" == "::1" ]]; then
     return 0
@@ -205,7 +205,9 @@ is_loopback_host() {
     IFS='.' read -r a b c d <<<"$host"
     for part in "$a" "$b" "$c" "$d"; do
       [[ "$part" =~ ^[0-9]+$ ]] || return 1
-      (( part >= 0 && part <= 255 )) || return 1
+      [[ "$part" == "0" || "$part" != 0* ]] || return 1
+      value=$((10#$part))
+      (( value >= 0 && value <= 255 )) || return 1
     done
     return 0
   fi
