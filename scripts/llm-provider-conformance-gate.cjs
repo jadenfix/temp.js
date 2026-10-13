@@ -308,6 +308,9 @@ function gateEnv(overrides) {
     TMP: process.env.TMP,
     TEMP: process.env.TEMP,
     RUST_BACKTRACE: process.env.RUST_BACKTRACE,
+    LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH,
+    DYLD_LIBRARY_PATH: process.env.DYLD_LIBRARY_PATH,
+    DYLD_FRAMEWORK_PATH: process.env.DYLD_FRAMEWORK_PATH,
     ...overrides,
   };
   if (process.platform === "darwin" && !env.DYLD_FRAMEWORK_PATH) {

@@ -53,6 +53,16 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build native CLI for provider conformance
+        run: cargo build --locked --bin beater
+
+      - name: Real agent loop and Python tools through local provider fixtures
+        run: node scripts/llm-provider-conformance-gate.cjs
+
       - name: Docker cold-start gate
         if: matrix.os == 'ubuntu-latest'
         env:
